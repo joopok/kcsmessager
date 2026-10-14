@@ -4,7 +4,10 @@
 import importlib.util
 import io
 import os
+import plistlib
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -292,6 +295,74 @@ class BuildTest(unittest.TestCase):
         with mock.patch('sys.stdout', out):
             self.assertEqual(self.build.main(['--dry-run']), 0)
         self.assertIn('PyInstaller', out.getvalue())
+
+    def test_mac_sign_commands(self):
+        dev = 'Developer ID Application: KCS (TEAM123)'
+        self.assertFalse(self.build.is_developer_id('-'))
+        self.assertFalse(self.build.is_developer_id('Apple Development: a@b.c (X)'))   # 배포용 아님
+        adhoc = self.build.sign_command('/x/KCS Talk.app', '-', self.build.ENTITLEMENTS, deep=True)
+        self.assertEqual(adhoc[:4], ['codesign', '--force', '--sign', '-'])
+        self.assertNotIn('runtime', adhoc)
+        signed = self.build.sign_command('/x/KCS Talk.app', dev, self.build.ENTITLEMENTS, deep=True)
+        for flag in ('--timestamp', 'runtime', '--entitlements', '--deep'):    # 공증 조건
+            self.assertIn(flag, signed)
+        self.assertTrue(os.path.exists(self.build.ENTITLEMENTS))
+
+    def test_mac_dmg_commands(self):
+        dev = 'Developer ID Application: KCS (TEAM123)'
+        tools = lambda cmds: [c[1] if c[0] == 'xcrun' else c[0] for c in cmds]
+        self.assertEqual(tools(self.build.dmg_commands('/s', '/o/a.dmg', '-', 'p')), ['hdiutil'])
+        self.assertEqual(tools(self.build.dmg_commands('/s', '/o/a.dmg', dev, None)), ['hdiutil', 'codesign'])
+        self.assertEqual(tools(self.build.dmg_commands('/s', '/o/a.dmg', dev, 'kcs-notary')),
+                         ['hdiutil', 'codesign', 'notarytool', 'stapler'])
+        self.assertRegex(self.build.dmg_name(), r'^\d{12}_kcsmessager\.dmg$')
+
+    def test_mac_dmg_staging_and_plist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = os.path.join(tmp, 'KCS Talk.app')
+            os.makedirs(os.path.join(app, 'Contents'))
+            with open(os.path.join(app, 'Contents', 'Info.plist'), 'wb') as f:
+                plistlib.dump({'CFBundleIdentifier': 'kr.co.kcs.talk'}, f)
+            self.build.patch_info_plist(app)
+            with open(os.path.join(app, 'Contents', 'Info.plist'), 'rb') as f:
+                info = plistlib.load(f)
+            self.assertIn('NSCameraUsageDescription', info)                # 페이스톡이 강제 종료되지 않게
+            self.assertEqual(info['CFBundleIdentifier'], 'kr.co.kcs.talk')
+            if shutil.which('ditto'):
+                staging = os.path.join(tmp, 'stage')
+                os.makedirs(staging)
+                self.build.stage_dmg(app, staging, notarized=False)
+                self.assertEqual(os.readlink(os.path.join(staging, 'Applications')), '/Applications')
+                with open(os.path.join(staging, '설치 안내.txt'), encoding='utf-8') as f:
+                    self.assertIn('그래도 열기', f.read())
+
+    def test_mac_installer_script(self):
+        script = self.build.installer_script('/o/202610150037_kcsmessager.dmg', 'ab' * 32, 'https://portal.example/dl')
+        self.assertTrue(script.startswith('#!/bin/bash'))
+        self.assertIn('https://portal.example/dl/202610150037_kcsmessager.dmg', script)
+        self.assertIn('SHA256="' + 'ab' * 32 + '"', script)              # 받은 파일 무결성 확인
+        self.assertIn('curl -fL', script)                                   # curl 은 다운로드 표시를 붙이지 않는다
+        self.assertIn('xattr -dr com.apple.quarantine', script)
+        self.assertIn('APP="KCS Talk.app"', script)
+        if shutil.which('bash'):
+            with tempfile.NamedTemporaryFile('w', suffix='.sh', delete=False) as f:
+                f.write(script)
+            try:
+                self.assertEqual(subprocess.call(['bash', '-n', f.name]), 0)  # 문법 오류 없음
+            finally:
+                os.unlink(f.name)
+
+    def test_dmg_only_mac_client(self):
+        err = io.StringIO()
+        with mock.patch('sys.stderr', err), mock.patch.object(self.build.osenv, 'is_mac', return_value=False):
+            self.assertEqual(self.build.main(['--dmg', '--dry-run']), 2)
+        with mock.patch('sys.stderr', err), mock.patch.object(self.build.osenv, 'is_mac', return_value=True):
+            self.assertEqual(self.build.main(['--dmg', '--server', '--dry-run']), 2)
+        out = io.StringIO()
+        with mock.patch('sys.stdout', out), mock.patch.object(self.build.osenv, 'is_mac', return_value=True):
+            self.assertEqual(self.build.main(['--dmg', '--dry-run']), 0)
+        self.assertIn('codesign', out.getvalue())
+        self.assertIn('hdiutil', out.getvalue())
 
     def test_desktop_entry(self):
         text = self.build.desktop_entry('/opt/KCS Talk/KCS Talk', '/opt/icon.png')

@@ -58,6 +58,42 @@ python3 kcs.py build --dry-run       명령만 확인
 
 만든 앱 확인: `"dist/KCS Talk.app/Contents/MacOS/KCS Talk" --self-check` (Windows: `"dist\KCS Talk\KCS Talk.exe" --self-check`)
 
+### macOS 배포용 DMG (포털 등으로 나눠 줄 때)
+
+```
+python3 kcs.py build --dmg           앱 → 서명 → dist/YYYYMMDDHHMM_kcsmessager.dmg (→ 공증 · 스테이플)
+```
+
+인터넷(포털 · 메일 · 메신저)으로 받은 앱은 macOS Gatekeeper가 **"Apple은 'KCS Talk.app'에 … 악성 코드가 없음을
+확인할 수 없습니다"** 로 막습니다. 원인은 앱이 ad-hoc 서명(Team ID 없음)이고 Apple 공증을 받지 않았기 때문입니다
+(`spctl -a -vv -t exec "KCS Talk.app"` → `rejected`). 받은 Mac에서 막히지 않게 하려면:
+
+1. Apple Developer Program(회사 계정)에서 **Developer ID Application** 인증서를 받아 빌드 Mac 키체인에 설치
+   (`Apple Development` 인증서는 배포용이 아니라 소용없습니다).
+2. 공증 자격을 한 번 저장: `xcrun notarytool store-credentials kcs-notary --apple-id <id> --team-id <TEAMID> --password <앱 암호>`
+3. 빌드:
+   ```
+   KCS_SIGN_IDENTITY="Developer ID Application: 회사명 (TEAMID)" KCS_NOTARY_PROFILE=kcs-notary python3 kcs.py build --dmg
+   ```
+   hardened runtime + `assets/macos/entitlements.plist`(Python · 카메라 · 마이크)로 서명 → DMG 서명 → 공증 → 스테이플 →
+   `spctl` 판정까지 하고 결과를 출력합니다.
+
+**인증서 없이 지금 바로 경고 없이 설치하는 방법 (권장 배포):** `--dmg` 는 DMG 옆에 `install_kcstalk.sh` 도 만듭니다.
+둘 다 포털의 같은 폴더(기본 `https://portal.kcins.co.kr/downloads/kcstalk/`, 다르면 빌드 때 `KCS_DOWNLOAD_URL`)에 올리고
+Mac 사용자에게는 터미널에 아래 한 줄을 붙여 넣으라고 안내합니다.
+
+```
+curl -fsSL https://portal.kcins.co.kr/downloads/kcstalk/install_kcstalk.sh | bash
+```
+
+Gatekeeper는 브라우저 · 메일 · 메신저로 받은 파일(다운로드 표시 `com.apple.quarantine` 가 붙은 파일)만 검사합니다.
+스크립트는 DMG를 `curl` 로 받아 SHA-256을 확인하고 `/Applications` 에 설치한 뒤 실행하므로 위 경고 창이 뜨지 않습니다
+(기존 앱은 교체, 필요하면 Mac 암호를 묻습니다).
+
+인증서가 없으면 ad-hoc 서명 DMG를 만들고 경고를 출력합니다. 브라우저로 DMG를 받은 사람은 DMG 안의 `설치 안내.txt` 대로 처음 한 번
+**시스템 설정 → 개인정보 보호 및 보안 → 'KCS Talk.app이(가) 차단되었습니다' 옆 [그래도 열기]** (또는 터미널
+`xattr -dr com.apple.quarantine "/Applications/KCS Talk.app"`)로 열어야 합니다.
+
 ## 4. OS마다 같게 맞춘 것 · 다르게 둔 것
 
 | 항목 | 처리 |
