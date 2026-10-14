@@ -20,3 +20,9 @@ dist/KCS Talk/
 dist/KCS Talk Server/
 dist/*.dmg
 dist/install_kcstalk.sh
+# 서버 실행용 가상환경 (.230)
+.venv/
+
+# 설치파일 배포본 (CI artifact 를 내려받는 곳) · 빌드 시 생성되는 번들 설정
+setupfile/
+build/deploy/

@@ -36,6 +36,48 @@ class ServerAddressFileTests(unittest.TestCase):
             f.write('{broken')
         self.assertIsNone(ksettings.load_server_address(self.dir))
 
+    def test_tls_flag_persists_and_survives_address_only_save(self):
+        """tls 는 server.json 에 함께 저장되고, 주소만 다시 저장해도 풀리지 않는다 (2026-10-14)"""
+        self.assertIs(ksettings.load_server_tls(self.dir), ksettings.DEFAULT_TLS)        # 파일 없음 → 기본값
+        ksettings.save_server_address('192.168.0.10', 6000, self.dir)                    # tls 미지정 → 키 생략
+        with open(os.path.join(self.dir, ksettings.SERVER_FILE), encoding='utf-8') as f:
+            self.assertEqual(json.load(f), {'host': '192.168.0.10', 'port': 6000})
+        ksettings.save_server_address('talk.kcins.co.kr', 9550, self.dir, tls=True)
+        self.assertTrue(ksettings.load_server_tls(self.dir))
+        with open(os.path.join(self.dir, ksettings.SERVER_FILE), encoding='utf-8') as f:
+            self.assertEqual(json.load(f), {'host': 'talk.kcins.co.kr', 'port': 9550, 'tls': True})
+        ksettings.save_server_address('talk.kcins.co.kr', 9551, self.dir)                # 더보기 → 정보: 주소만 저장
+        self.assertTrue(ksettings.load_server_tls(self.dir))                             # tls 보존
+        ksettings.save_server_address('127.0.0.1', 5555, self.dir, tls=False)
+        self.assertFalse(ksettings.load_server_tls(self.dir))
+        with open(os.path.join(self.dir, ksettings.SERVER_FILE), 'w', encoding='utf-8') as f:
+            json.dump({'host': 'x', 'port': 1, 'tls': 'yes'}, f)                        # bool 아닌 값은 무시
+        self.assertIs(ksettings.load_server_tls(self.dir), ksettings.DEFAULT_TLS)
+
+    def test_bundled_deploy_defaults_sit_between_server_json_and_code_defaults(self):
+        """kcs.py build --deploy 가 번들한 deploy.json: server.json 이 없을 때만 쓰이고, 있으면 server.json 이 이긴다"""
+        deploy = {'host': 'talk.kcins.co.kr', 'port': 9550, 'tls': True}
+        with mock.patch.object(ksettings, 'load_deploy_defaults', return_value=deploy):
+            self.assertEqual(ksettings.load_server_address(self.dir), ('talk.kcins.co.kr', 9550))
+            self.assertTrue(ksettings.load_server_tls(self.dir))
+            ksettings.save_server_address('192.168.0.10', 6000, self.dir, tls=False)   # 그룹 관리자가 이 PC 에 지정
+            self.assertEqual(ksettings.load_server_address(self.dir), ('192.168.0.10', 6000))
+            self.assertFalse(ksettings.load_server_tls(self.dir))
+        with mock.patch.object(ksettings.osenv, 'resource_path', return_value=os.path.join(self.dir, 'none.json')):
+            self.assertIsNone(ksettings.load_deploy_defaults())                       # 번들 없음(소스 실행)
+
+    def test_deploy_file_round_trip(self):
+        """build_app.write_deploy_file → load_deploy_defaults 가 같은 값을 읽는다"""
+        from scripts import build_app
+        out = os.path.join(self.dir, 'dist')
+        path = build_app.write_deploy_file(out, build_app.parse_deploy('talk.kcins.co.kr:9550'), tls=True)
+        self.assertEqual(os.path.relpath(path, self.dir), os.path.join('build', 'deploy', 'deploy.json'))
+        with mock.patch.object(ksettings.osenv, 'resource_path', return_value=path):
+            self.assertEqual(ksettings.load_deploy_defaults(), {'host': 'talk.kcins.co.kr', 'port': 9550, 'tls': True})
+        for bad in ('talk.kcins.co.kr', ':9550', 'h:0', 'h:70000', 'h:abc'):
+            with self.assertRaises(ValueError):
+                build_app.parse_deploy(bad)
+
 
 class AppAddressOrderTests(unittest.TestCase):
     """app.main 이 어떤 주소로 접속하는지 - Session 을 가짜로 바꿔 첫 접속 주소만 본다"""

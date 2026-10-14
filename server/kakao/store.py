@@ -679,10 +679,13 @@ class Store:
     REGISTER_OTHER_COMPANY = '선택한 소속에 같은 이름의 구성원이 없습니다. 소속을 다시 확인해 주세요.'
     RESET_ADMIN_BY_TOOL = '관리자 계정은 직접 재설정할 수 없습니다. 다른 그룹 관리자나 서버 PC 의 scripts/set_password.py 로 바꿔 주세요.'
     REGISTER_WRONG_EMPLOYEE_NO = '조직도에 등록된 사번과 다릅니다. 사번을 확인하거나 관리자에게 문의해 주세요.'
+    REGISTER_WRONG_EMAIL = '조직도에 등록된 이메일과 다릅니다. 회사 이메일을 확인하거나 관리자에게 문의해 주세요.'
+    REGISTER_NEEDS_ORG_EMAIL = '조직도에 이메일이 등록되지 않아 직접 등록할 수 없습니다. 관리자에게 이메일 등록을 요청해 주세요.'
     REGISTER_ADMIN_BY_TOOL = '관리자 계정은 직접 등록할 수 없습니다. 서버 PC 에서 scripts/set_password.py 로 비밀번호를 정해 주세요.'
 
     def register_user(self, username: str, company: str, email: str, password: str, employee_no: str = '') -> bool:
-        """처음 사용 등록 (명세 §4.1). 새로 만들었으면 True. 안 되면 ValueError(사용자에게 보일 사유)"""
+        """처음 사용 등록 (명세 §4.1). 새로 만들었으면 True. 안 되면 ValueError(사용자에게 보일 사유).
+        employee_no 는 선택(예전 클라이언트·관리자 도구) — 없으면 이메일이 로그인 아이디가 된다"""
         return self._register_user(username, company, email, self.hash_password(password),   # 해싱은 잠금 밖
                                    employee_no.strip())
 
@@ -701,7 +704,7 @@ class Store:
                           (email, username))
         if taken is not None:
             raise ValueError(self.REGISTER_TAKEN_EMAIL)
-        row = self._one('SELECT company, is_bot, password_hash, employee_no, is_admin FROM users WHERE username=?',
+        row = self._one('SELECT company, is_bot, password_hash, employee_no, email, is_admin FROM users WHERE username=?',
                         (username,))
         if row is None:
             self._db.execute(
@@ -716,10 +719,16 @@ class Store:
             raise ValueError(self.REGISTER_TAKEN_NAME)
         if row['company'] not in ('', GUEST_COMPANY) and row['company'] != company:
             raise ValueError(self.REGISTER_OTHER_COMPANY)
-        # 아직 등록하지 않은 조직도 계정은 이름 · 회사만 알면 누구나 가져갈 수 있었다 → 조직도의 사번이 맞아야 한다
-        if row['employee_no'] and row['employee_no'].lower() != employee_no.lower():
+        # 아직 등록하지 않은 조직도 계정은 이름 · 회사만 알면 누구나 가져갈 수 있었다 → 조직도에 적힌 값이 맞아야 한다.
+        # 2026-10-14 부터 등록 창에 사번 칸이 없어 이메일로 확인한다(조직도 이메일 = 로그인 아이디). 사번을 보낸
+        # 예전 클라이언트·도구는 사번도 맞아야 하고, 이메일이 없는 계정은 사번으로만 확인한다.
+        if row['employee_no'] and employee_no and row['employee_no'].lower() != employee_no.lower():
             raise ValueError(self.REGISTER_WRONG_EMPLOYEE_NO)
-        if row['is_admin'] and not row['employee_no']:      # 확인할 사번이 없는 관리자 계정은 서버 도구로만
+        if row['email'] and row['email'].lower() != email.lower():
+            raise ValueError(self.REGISTER_WRONG_EMAIL)
+        if row['employee_no'] and not row['email'] and not employee_no:
+            raise ValueError(self.REGISTER_NEEDS_ORG_EMAIL)
+        if row['is_admin'] and not (row['employee_no'] or row['email']):   # 확인할 값이 없는 관리자 계정은 서버 도구로만
             raise ValueError(self.REGISTER_ADMIN_BY_TOOL)
         cur = self._db.execute(
             "UPDATE users SET password_hash=?, email=?, employee_no=CASE WHEN ?<>'' THEN ? ELSE employee_no END, "

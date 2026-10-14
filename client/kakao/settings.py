@@ -50,6 +50,9 @@ _UNSAFE_FILE_CHARS = set('\\/:*?"<>|')
 # ---------------------------------------------------------------- 이 PC 의 서버 주소 (그룹 관리자만 더보기 → 정보에서 바꾼다)
 SERVER_FILE = 'server.json'
 DEFAULT_HOST, DEFAULT_PORT = '127.0.0.1', 5555
+# 기본은 평문(개발용 로컬 서버). 운영 서버(talk.kcins.co.kr:9550)는 nginx 가 TLS 를 종단하므로
+# server.json 에 "tls": true 를 넣거나 --tls 로 켠다. 배포용 빌드는 이 값을 True 로 바꿔 만든다.
+DEFAULT_TLS = False
 
 
 def parse_server_address(host, port):
@@ -66,26 +69,73 @@ def parse_server_address(host, port):
     return host, port
 
 
+DEPLOY_FILE = ('deploy', 'deploy.json')   # 빌드에 번들되는 배포 기본값 (kcs.py build --deploy …)
+
+
+def load_deploy_defaults():
+    """빌드에 들어간 배포 기본값 {host, port, tls} - 없거나 깨졌으면 None.
+    설치형 배포본이 운영 서버(talk.kcins.co.kr:9550, TLS)로 바로 붙게 하기 위한 것으로, 이 PC 의
+    server.json(그룹 관리자 설정)보다는 뒤, 코드 기본값(127.0.0.1:5555)보다는 앞 순위다.
+    소스 실행에는 보통 이 파일이 없어 개발 환경은 영향받지 않는다."""
+    path = osenv.resource_path(*DEPLOY_FILE)
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        host, port = parse_server_address(data.get('host'), data.get('port'))
+        tls = data.get('tls')
+        return {'host': host, 'port': port, 'tls': bool(tls) if isinstance(tls, bool) else DEFAULT_TLS}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
 def load_server_address(base_dir=None):
-    """저장된 (host, port) - 없거나 깨졌으면 None"""
+    """저장된 (host, port) - 이 PC 의 server.json → 번들된 deploy.json → 없으면 None"""
     path = os.path.join(base_dir or osenv.app_home(), SERVER_FILE)
     try:
         with open(path, encoding='utf-8') as f:
             data = json.load(f)
         return parse_server_address(data.get('host'), data.get('port'))
     except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    deploy = load_deploy_defaults()
+    return (deploy['host'], deploy['port']) if deploy else None
+
+
+def _saved_tls(base_dir):
+    """server.json 에 명시된 tls (bool) - 없거나 bool 이 아니면 None"""
+    try:
+        with open(os.path.join(base_dir, SERVER_FILE), encoding='utf-8') as f:
+            value = json.load(f).get('tls')
+        return value if isinstance(value, bool) else None
+    except (OSError, ValueError, TypeError, AttributeError):
         return None
 
 
-def save_server_address(host, port, base_dir=None):
-    """검사한 뒤 저장 (임시 파일 → 교체). 저장한 (host, port)"""
+def load_server_tls(base_dir=None):
+    """TLS 사용 여부: 이 PC 의 server.json → 번들된 deploy.json → DEFAULT_TLS"""
+    saved = _saved_tls(base_dir or osenv.app_home())
+    if saved is not None:
+        return saved
+    deploy = load_deploy_defaults()
+    return deploy['tls'] if deploy else DEFAULT_TLS
+
+
+def save_server_address(host, port, base_dir=None, tls=None):
+    """검사한 뒤 저장 (임시 파일 → 교체). 저장한 (host, port).
+    tls 를 넘기지 않으면 기존 파일의 tls 값을 그대로 둔다(더보기 → 정보에서 주소만 바꿔도 TLS 설정이 풀리지 않게).
+    명시한 값도 기존 값도 없으면 tls 키를 쓰지 않는다 - 파일은 {host, port} 그대로(기본값 = 생략)."""
     host, port = parse_server_address(host, port)
     base = base_dir or osenv.app_home()
+    if tls is None:
+        tls = _saved_tls(base)
     os.makedirs(base, exist_ok=True)
     path = os.path.join(base, SERVER_FILE)
+    data = {'host': host, 'port': port}
+    if tls is not None:
+        data['tls'] = bool(tls)
     tmp = path + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump({'host': host, 'port': port}, f, ensure_ascii=False)
+        json.dump(data, f, ensure_ascii=False)
     os.replace(tmp, path)
     return host, port
 

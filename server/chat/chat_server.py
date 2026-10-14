@@ -7,7 +7,7 @@ KCS Messenger 서버 진입점.
 (join / message / all_users_list / user_status_changed)와도 호환된다.
 
 사용법:
-    python server/chat/chat_server.py [--host 127.0.0.1] [--port 5555] [--db server_data/kakao.db] [--retention-days 90] [--no-portal]
+    python server/chat/chat_server.py [--host 127.0.0.1] [--port 5555] [--db server_data/kakao.db] [--retention-days 90] [--no-portal] [--proxy-protocol]
 """
 
 import argparse
@@ -36,6 +36,8 @@ def parse_args(argv=None):
                         help='사내 포털(portal.kcins.co.kr) RAG 연동 끄기 - AI 비서가 메신저 자료로만 답함')
     parser.add_argument('--portal-config', default=None,
                         help='포털 연동 설정 파일 (기본: DB 폴더의 portal.json, 없으면 기본값 + 환경변수)')
+    parser.add_argument('--proxy-protocol', action='store_true',
+                        help='연결 첫 줄을 PROXY protocol v1 로 읽어 실제 클라이언트 IP 복원 (nginx stream 뒤에서 실행할 때)')
     parser.add_argument('--retention-days', type=float, default=90,
                         help='받은 파일(첨부) 보관 기간, 일 단위 (기본: 90)')
     return parser.parse_args(argv)
@@ -54,7 +56,7 @@ def main(argv=None):
                          link_preview=False if args.no_link_preview else None,
                          retention_days=args.retention_days,
                          require_password=not args.allow_passwordless,
-                         portal=portal)
+                         portal=portal, proxy_protocol=args.proxy_protocol)
     try:
         server.start()
     except KeyboardInterrupt:
