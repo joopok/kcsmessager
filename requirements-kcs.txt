@@ -5,6 +5,7 @@
 # 필수
 PyQt5>=5.15.9          # 화면 (QtMultimedia 포함 - 보이스톡 · 음성메시지)
 cryptography>=41       # 비밀채팅 암호화 (X25519 + AES-GCM)
+certifi>=2024          # TLS 서버 인증서 검증용 CA 묶음 — PyInstaller 로 만든 macOS 앱이 OS 신뢰 저장소를 못 보는 경우 대비
 
 # 권장 (없어도 실행됨)
 numpy>=1.24            # 통화 소리 처리

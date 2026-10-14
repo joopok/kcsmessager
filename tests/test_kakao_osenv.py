@@ -366,7 +366,7 @@ class LauncherTest(unittest.TestCase):
 
 
 class LatinInputTests(unittest.TestCase):
-    """사번 칸: 포커스가 오면 한글 대신 영문 입력 (macOS 입력 소스 · Windows IME)"""
+    """아이디(이메일) 칸: 포커스가 오면 한글 대신 영문 입력 (macOS 입력 소스 · Windows IME)"""
 
     def setUp(self):
         app()
@@ -376,7 +376,7 @@ class LatinInputTests(unittest.TestCase):
         from client.kakao.login import LoginDialog
         dlg = LoginDialog(fresh=True)
         self.addCleanup(dlg.deleteLater)
-        for edit in (dlg.name_edit, dlg.reg_employee_edit, dlg.reset_id_edit):
+        for edit in (dlg.name_edit, dlg.reg_email_edit, dlg.reset_id_edit):
             self.assertTrue(edit.inputMethodHints() & Qt.ImhLatinOnly, edit.objectName())
             self.assertTrue(hasattr(edit, '_latin_filter'))
 

@@ -6,6 +6,24 @@ on:
     branches: [main, 'feature/**']
   pull_request:
   workflow_dispatch:
+    inputs:
+      deploy_host:
+        description: '설치파일에 번들할 운영 서버 호스트'
+        default: 'talk.kcins.co.kr'
+      deploy_port:
+        description: '운영 서버 포트'
+        default: '9550'
+      deploy_tls:
+        description: 'TLS 로 접속 (nginx stream 종단)'
+        type: boolean
+        default: true
+      tests:
+        description: '단위 테스트 대상 모듈 (공백 구분, 예: tests.test_kakao_shell). 비우면 전체 discover'
+        default: ''
+      build_setup:
+        description: '설치파일(setup 잡)도 만들기'
+        type: boolean
+        default: true
 
 jobs:
   check:
@@ -39,8 +57,17 @@ jobs:
       - name: kcs.py doctor
         run: python kcs.py doctor
 
-      - name: 단위 테스트 (전체)
-        run: python -X faulthandler -m unittest discover -s tests -p "test_*.py" -v
+      - name: 단위 테스트 (전체 · dispatch 시 tests 입력으로 대상 모듈만)
+        shell: bash
+        env:
+          TESTS: ${{ inputs.tests }}
+        run: |
+          if [ -n "$TESTS" ]; then
+            echo "대상 모듈만: $TESTS"
+            python -X faulthandler -m unittest -v $TESTS
+          else
+            python -X faulthandler -m unittest discover -s tests -p "test_*.py" -v
+          fi
 
       - name: 소스 실행 점검 (서버 접속 · 클라이언트 self-check)
         if: ${{ !cancelled() }}
@@ -92,3 +119,79 @@ jobs:
           name: kcs-talk-${{ runner.os }}
           path: dist/
           retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 배포용 설치파일 (2026-10-14): Windows 단일 .exe · macOS .dmg. 운영 서버 주소를 번들한다.
+  #   결과: setupfile/<YYYYMMDDHHMM>_kcsmessager.exe | .dmg  (KST 기준 시각, 두 OS 가 같은 값을 쓴다)
+  #   PyInstaller 는 교차 빌드가 없어 각 OS 러너에서 만든다. 코드 서명은 없다(사내 배포 전제 — SmartScreen /
+  #   Gatekeeper 경고는 안내로 처리). artifact 이름: kcs-talk-setup-Windows · kcs-talk-setup-macOS
+  # ───────────────────────────────────────────────────────────────────────────
+  stamp:
+    name: 설치파일 시각 스탬프 (KST)
+    if: github.event_name != 'workflow_dispatch' || inputs.build_setup
+    runs-on: ubuntu-latest
+    outputs:
+      value: ${{ steps.s.outputs.value }}
+    steps:
+      - id: s
+        run: echo "value=$(TZ=Asia/Seoul date +%Y%m%d%H%M)" >> "$GITHUB_OUTPUT"
+
+  setup:
+    name: 설치파일 ${{ matrix.os }}
+    needs: stamp
+    if: github.event_name != 'workflow_dispatch' || inputs.build_setup
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+      DEPLOY_HOST: ${{ inputs.deploy_host || 'talk.kcins.co.kr' }}
+      DEPLOY_PORT: ${{ inputs.deploy_port || '9550' }}
+      # push 트리거에서는 inputs 가 비어 ''==false 가 참으로 평가되므로 dispatch 일 때만 본다 (기본 TLS)
+      DEPLOY_PLAIN: ${{ (github.event_name == 'workflow_dispatch' && inputs.deploy_tls == false) && '--deploy-plain' || '' }}
+      STAMP: ${{ needs.stamp.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 설치 (requirements-kcs.txt + pyinstaller)
+        run: |
+          python -m pip install -r requirements-kcs.txt
+          python -m pip install pyinstaller
+
+      - name: 단일 실행 파일 빌드 (운영 서버 주소 번들)
+        run: python kcs.py build --onefile --deploy "${DEPLOY_HOST}:${DEPLOY_PORT}" ${DEPLOY_PLAIN}
+        shell: bash
+
+      - name: Windows - setupfile/<stamp>_kcsmessager.exe
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p setupfile
+          cp "dist/KCS Talk.exe" "setupfile/${STAMP}_kcsmessager.exe"
+          # 빌드한 exe 가 OS · 글꼴 · 로고 · 데이터 폴더를 찾는지 (창 없이 점검하고 종료 코드만 본다)
+          "./setupfile/${STAMP}_kcsmessager.exe" --self-check
+          ls -la setupfile
+
+      - name: macOS - setupfile/<stamp>_kcsmessager.dmg
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p setupfile
+          "dist/KCS Talk.app/Contents/MacOS/KCS Talk" --self-check
+          hdiutil create -volname "KCS Talk" -srcfolder "dist/KCS Talk.app" -ov -format UDZO \
+            "setupfile/${STAMP}_kcsmessager.dmg"
+          ls -la setupfile
+
+      - name: 설치파일 올리기
+        uses: actions/upload-artifact@v4
+        with:
+          name: kcs-talk-setup-${{ runner.os }}
+          path: setupfile/
+          retention-days: 30
+          if-no-files-found: error

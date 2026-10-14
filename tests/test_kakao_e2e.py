@@ -515,21 +515,20 @@ class LoginFlowTests(unittest.TestCase):
 
     def test_first_use_registration_then_password_login(self):
         from client.kakao.app import Session, wait_for_login
-        reg = {'company': 'KCS 물류', 'name': '처음사용', 'employee_no': 'E2026001', 'email': 'first@kcs.test',
-               'password': 'first-pw'}
+        reg = {'company': 'KCS 물류', 'name': '처음사용', 'email': 'first@kcs.test', 'password': 'first-pw'}   # 사번 없음
         s = Session('127.0.0.1', self.server.port, '', registration=reg)
         self.sessions.append(s)
         s.connect()
         self.assertEqual(wait_for_login(s.state, 5000), ('ok', ''))
         self.assertEqual(s.state.me, '처음사용')
-        self.assertEqual(s.username, 'E2026001')                        # 다음부터의 로그인 아이디 = 사번
+        self.assertEqual(s.username, 'first@kcs.test')                  # 다음부터의 로그인 아이디 = 이메일
         self.assertEqual(s.state.users['처음사용']['company'], 'KCS 물류')
         welcomes = []
         s.state.welcomed.connect(lambda: welcomes.append(1))
         self.assertTrue(s.reconnect()[0])                               # 재연결은 등록한 비밀번호로 join
         self.assertTrue(pump(lambda: welcomes))
-        # 다음 실행: 사번/비밀번호만으로 로그인
-        s2 = Session('127.0.0.1', self.server.port, 'E2026001', 'first-pw')
+        # 다음 실행: 이메일/비밀번호만으로 로그인
+        s2 = Session('127.0.0.1', self.server.port, 'first@kcs.test', 'first-pw')
         self.sessions.append(s2)
         s2.connect()
         self.assertEqual(wait_for_login(s2.state, 5000), ('ok', ''))

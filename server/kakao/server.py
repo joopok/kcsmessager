@@ -70,7 +70,7 @@ SECRET_FORBIDDEN = '비밀채팅방에서는 사용할 수 없는 기능입니�
 LOGIN_FAILED = '아이디 또는 비밀번호가 올바르지 않습니다.'
 LOGIN_TOKEN_EXPIRED = '저장된 로그인 정보가 만료되었습니다. 비밀번호를 입력해 주세요.'
 RESET_MISMATCH = '아이디 · 가입한 이메일 · 재설정 코드가 맞지 않습니다. 코드는 관리자에게 받고 30분 동안 한 번만 쓸 수 있습니다.'
-NEEDS_REGISTER = '처음 사용하는 아이디입니다. [처음 사용 등록]에서 소속 회사·이름·사번·이메일·비밀번호를 등록해 주세요.'
+NEEDS_REGISTER = '처음 사용하는 아이디입니다. [처음 사용 등록]에서 소속 회사·이름·이메일·비밀번호를 등록해 주세요.'
 
 CALL_MODES = ('voice', 'video', 'voiceroom')
 CALL_ROLES = ('host', 'speaker', 'listener')
@@ -427,8 +427,12 @@ class KakaoServer(AdminHandlers):
                  retention_days: float = 90, story_ttl_seconds: float = DEFAULT_STORY_TTL,
                  voiceroom_max_seconds: float = DEFAULT_VOICEROOM_MAX,
                  require_password: bool = False, portal: Optional[dict] = None,
-                 portal_client: Any = None) -> None:
+                 portal_client: Any = None, proxy_protocol: bool = False) -> None:
         self.host = host
+        # True 면 각 연결의 첫 줄을 PROXY protocol v1 헤더로 읽어 실제 클라이언트 IP 를 복원한다.
+        # nginx stream 이 TLS 를 종단하고 loopback 으로 넘기는 배치(.230)에서 켠다 — 안 켜면 모든
+        # 접속이 127.0.0.1 로 보여 IP 기준 로그인 스로틀(LOGIN_MAX_FAILURES['ip'])이 전 사용자에게 한 덩어리로 걸린다.
+        self.proxy_protocol = proxy_protocol
         # 사내 포털 RAG 연동 설정 (portal.load_config 결과, None 이면 메신저 자체 RAG 만 - 명세 §7.6.1)
         self.portal_config = portal
         self.portal_client = portal_client      # 테스트용 가짜 포털 클라이언트
@@ -763,9 +767,47 @@ class KakaoServer(AdminHandlers):
             payload['req_id'] = request['req_id']
         conn.send(payload)
 
+    # PROXY protocol v1 (haproxy 명세 §2.1): 'PROXY TCP4 <src> <dst> <sport> <dport>\r\n', 최대 107 바이트.
+    PROXY_V1_MAX = 107
+
+    def _read_proxy_header(self, conn: Connection) -> bytes:
+        """연결 첫 줄이 PROXY v1 헤더면 읽어서 conn.address 를 실제 클라이언트 (ip, port) 로 바꾸고,
+        헤더 뒤에 같이 도착한 나머지 바이트를 돌려준다. 헤더가 아니면(직접 접속) 읽은 바이트를 그대로 돌려준다."""
+        buf = b''
+        while b'\r\n' not in buf:
+            if len(buf) >= self.PROXY_V1_MAX:
+                return buf                     # 헤더가 아니다 — 평문 요청으로 취급
+            try:
+                chunk = conn.sock.recv(self.PROXY_V1_MAX - len(buf))
+            except socket.timeout:
+                if not conn.alive or self._stop.is_set():
+                    return buf
+                continue
+            if not chunk:
+                return buf
+            buf += chunk
+            if not b'PROXY '.startswith(buf[:6]) and not buf.startswith(b'PROXY '):
+                return buf                     # 시작부터 다르면 더 읽지 않는다
+        line, rest = buf.split(b'\r\n', 1)
+        parts = line.decode('ascii', 'replace').split(' ')
+        if len(parts) == 6 and parts[0] == 'PROXY' and parts[1] in ('TCP4', 'TCP6'):
+            try:
+                conn.address = (parts[2], int(parts[4]))
+            except ValueError:
+                pass
+        # 'PROXY UNKNOWN' 은 주소 없이 통과 (헬스체크 등)
+        return rest
+
     def _client_loop(self, conn: Connection) -> None:
         decoder = FrameDecoder()
         try:
+            if self.proxy_protocol:
+                rest = self._read_proxy_header(conn)
+                if rest:
+                    for item in decoder.feed(rest):
+                        if not conn.alive:
+                            break
+                        self._handle_item(conn, item)
             while conn.alive and not self._stop.is_set():
                 try:
                     data = conn.sock.recv(RECV_SIZE)
@@ -1007,8 +1049,8 @@ class KakaoServer(AdminHandlers):
                              remember=msg.get('remember') is True and msg.get('password') is not None)
 
     def _h_register(self, conn: Connection, msg: dict) -> None:
-        """처음 사용 등록: 소속 회사 + 이름 + 사번 + 이메일 + 비밀번호 (명세 §4.1). 성공하면 join 과 같은 welcome.
-        다음부터는 사번과 비밀번호로 로그인한다"""
+        """처음 사용 등록: 소속 회사 + 이름 + 이메일 + 비밀번호 (명세 §4.1). 성공하면 join 과 같은 welcome.
+        다음부터는 이메일과 비밀번호로 로그인한다. employee_no(사번)는 선택 — 2026-10-14 부터 클라이언트가 보내지 않는다"""
         if conn.username is not None:
             raise ProtocolError('이미 로그인된 연결입니다.')
         company = msg.get('company')
@@ -1020,9 +1062,7 @@ class KakaoServer(AdminHandlers):
         if name == BOT_USERNAME or self.store.is_bot(name):
             raise ProtocolError('봇 계정으로는 등록할 수 없습니다.')
         employee_no = msg.get('employee_no').strip() if isinstance(msg.get('employee_no'), str) else ''
-        if not employee_no:
-            raise ProtocolError('사번을 입력해 주세요.')
-        if not EMPLOYEE_NO_RE.fullmatch(employee_no):
+        if employee_no and not EMPLOYEE_NO_RE.fullmatch(employee_no):
             raise ProtocolError('사번은 영문·숫자 20자 이내로 입력해 주세요.')
         email = msg.get('email').strip() if isinstance(msg.get('email'), str) else ''
         if len(email) > 120 or not EMAIL_RE.fullmatch(email):
@@ -1036,7 +1076,7 @@ class KakaoServer(AdminHandlers):
         try:
             created = self.store.register_user(name, company.strip(), email, password, employee_no)
         except ValueError as exc:
-            self._record_login_failure(keys)   # 남의 조직도 계정 사번을 맞혀 보는 것도 로그인 실패처럼 막는다
+            self._record_login_failure(keys)   # 남의 조직도 계정 이메일·사번을 맞혀 보는 것도 로그인 실패처럼 막는다
             raise ProtocolError(str(exc)) from None
         self._complete_login(conn, msg, 'register', name, created, remember=msg.get('remember') is True)
 
@@ -1923,9 +1963,10 @@ class KakaoServer(AdminHandlers):
             room_ids = self.store.room_ids_for_user(asker)
             if getattr(self.rag, 'accepts_context', False):     # 포털 연동: 방 · 이름을 함께 넘겨 대화 저장
                 meta = self.store.room_meta(room_id) or {}
+                asker_row = self.store.get_user(asker) or {}
                 answer = self.rag.answer(question, asker, room_ids, history, room_id=room_id,
                                          asker_name=self._name_of(asker), room_name=meta.get('name') or '',
-                                         bot_name=BOT_USERNAME)
+                                         bot_name=BOT_USERNAME, asker_email=asker_row.get('email') or '')
             else:
                 answer = self.rag.answer(question, asker, room_ids, history)
         except Exception:

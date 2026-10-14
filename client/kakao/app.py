@@ -57,6 +57,11 @@ def parse_args(argv=None):
     parser.add_argument('--host', default=None,
                         help='서버 주소 (관리자 비상용 - 없으면 더보기 → 정보에서 그룹 관리자가 정한 주소, 기본 127.0.0.1)')
     parser.add_argument('--port', type=int, default=None, help='서버 포트 (기본 5555)')
+    tls_group = parser.add_mutually_exclusive_group()
+    tls_group.add_argument('--tls', dest='tls', action='store_true', default=None,
+                           help='TLS 로 접속 (talk.kcins.co.kr:9550 처럼 nginx 가 TLS 를 종단하는 서버)')
+    tls_group.add_argument('--no-tls', dest='tls', action='store_false',
+                           help='평문 TCP 로 접속 (개발용 로컬 서버)')
     parser.add_argument('--user', default='', help='로그인 아이디 (생략 시 로그인 창)')
     parser.add_argument('--password', default='', help='비밀번호 (틀리거나 필요하면 로그인 창)')
     parser.add_argument('--no-auto-login', action='store_true',
@@ -105,17 +110,19 @@ def ask_connection_failure(host, port, error):
 class Session:
     """한 번의 로그인 세션: 연결 · 설정 · 상태 · 메인 창"""
 
-    def __init__(self, host, port, username, password='', token='', remember=False, registration=None):
+    def __init__(self, host, port, username, password='', token='', remember=False, registration=None,
+                 tls=False):
         from client.kakao.net import ChatConnection
         from client.kakao.settings import LocalSettings
         from client.kakao.state import AppState
         self.host, self.port, self.username = host, port, username
+        self.tls = tls             # 운영 서버(nginx TLS 종단)면 True — 재연결에도 같은 값으로 붙는다
         self.password = password   # 자동 재연결용으로 메모리에만 둔다
         self.token = token         # 자동 로그인 토큰 (저장된 로그인)
         self.remember = remember
-        self.registration = registration   # 처음 사용 등록 {company, name, employee_no, email, password} (명세 §4.1)
-        if registration:                   # 다음부터의 로그인 아이디는 사번
-            self.username = registration.get('employee_no') or registration['name']
+        self.registration = registration   # 처음 사용 등록 {company, name, email, password[, employee_no]} (명세 §4.1)
+        if registration:                   # 다음부터의 로그인 아이디: 사번(예전 클라이언트) → 이메일 → 이름
+            self.username = registration.get('employee_no') or registration.get('email') or registration['name']
             self.password = registration['password']
         self.settings = LocalSettings(self.username)   # welcome 때 실제 사용자 이름 파일로 바뀐다
         self.conn = ChatConnection()
@@ -163,12 +170,12 @@ class Session:
     def connect(self):
         if self.registration:      # 재연결은 등록된 비밀번호로 join 한다
             self.conn.connect_to(self.host, self.port, self.username, registration=self.registration,
-                                 remember=self.remember)
+                                 remember=self.remember, tls=self.tls)
         elif self.token:
-            self.conn.connect_to(self.host, self.port, self.username, token=self.token)
+            self.conn.connect_to(self.host, self.port, self.username, token=self.token, tls=self.tls)
         else:
             self.conn.connect_to(self.host, self.port, self.username, password=self.password,
-                                 remember=self.remember)
+                                 remember=self.remember, tls=self.tls)
 
     def reconnect(self):
         """같은 host/port/user로 새 연결을 만들어 상태에 붙인다 → (성공, 메시지)
@@ -184,7 +191,7 @@ class Session:
         self.state.conn = conn
         self.state.history_requested.clear()  # 열려 있는 방은 다시 히스토리를 받는다
         try:
-            conn.connect_to(self.host, self.port, self.state.me or self.username, **self._credentials())
+            conn.connect_to(self.host, self.port, self.state.me or self.username, tls=self.tls, **self._credentials())
         except OSError as e:
             disconnect_signals((conn.event_received, self.state.handle),
                                (conn.disconnected, self.state.connection_lost))
@@ -373,12 +380,14 @@ def main(argv=None):
     apply_app_theme(None)
 
     from client.kakao import login as login_mod
-    from client.kakao.settings import load_server_address, DEFAULT_HOST, DEFAULT_PORT
+    from client.kakao.settings import load_server_address, load_server_tls, DEFAULT_HOST, DEFAULT_PORT
     # 접속 주소: 명령줄 → 이 PC 의 server.json(그룹 관리자가 정함) → 저장된 로그인 → 기본값 (명세 §4.3)
     configured = load_server_address()
     fixed = args.host is not None or args.port is not None or configured is not None
     host = args.host or (configured[0] if configured else DEFAULT_HOST)
     port = args.port or (configured[1] if configured else DEFAULT_PORT)
+    # TLS 여부도 같은 순서: --tls/--no-tls → server.json 의 tls → DEFAULT_TLS
+    tls = args.tls if args.tls is not None else load_server_tls()
     username, password = args.user.strip(), args.password
     saved = login_mod.load_saved_login() if not username else None
 
@@ -398,7 +407,7 @@ def main(argv=None):
             if saved and not args.user and not args.no_auto_login:
                 host, port = saved_address(host, port)
             # 런처(--no-auto-login)로 연 창은 처음 로그인 상태: 아이디·비밀번호를 비우고 저장된 로그인을 쓰지 않는다
-            dlg = LoginDialog(host, port, username, registration=registration,   # 등록 실패면 등록 화면 그대로
+            dlg = LoginDialog(host, port, username, registration=registration, tls=tls,   # 등록 실패면 등록 화면 그대로
                               fresh=args.no_auto_login)
             dlg.show_error(error)
             if dlg.exec_() != QDialog.Accepted:
@@ -408,7 +417,7 @@ def main(argv=None):
             remember, auto_login = dlg.remember(), dlg.auto_login()
             registration = dlg.registration()
         session = Session(host, port, username, password, token=token, remember=remember,
-                          registration=registration)
+                          registration=registration, tls=tls)
         try:
             session.connect()
         except OSError as e:

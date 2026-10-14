@@ -960,8 +960,10 @@ class DialogTests(ShellTestBase):
             self.assertTrue(dlg.register_form.isVisibleTo(dlg) and not dlg.login_form.isVisibleTo(dlg))
             self.assertEqual([dlg.company_combo.itemText(i) for i in range(dlg.company_combo.count())],
                              ['소속 회사 선택', 'KCS 홀딩스', 'KCS 물류'])
+            self.assertFalse(hasattr(dlg, 'reg_employee_edit'))          # 사번 칸 없음 (2026-10-14) — 이메일이 아이디
+            self.assertEqual(dlg.reg_email_edit.placeholderText(), '이메일 (다음부터 로그인 아이디)')
+            self.assertIn('이메일과 비밀번호만으로', dlg.register_hint.text())
             dlg.reg_name_edit.setText('도승현')
-            dlg.reg_employee_edit.setText('20261009')
             dlg.reg_email_edit.setText('do@kcs.test')
             dlg.reg_password_edit.setText('pw1234')
             self.assertFalse(dlg.login_button.isEnabled())               # 소속 회사는 반드시 선택
@@ -969,12 +971,8 @@ class DialogTests(ShellTestBase):
             self.assertNotEqual(dlg.result(), LoginDialog.Accepted)
             dlg.company_combo.setCurrentIndex(2)
             self.assertTrue(dlg.login_button.isEnabled())
-            dlg.reg_employee_edit.clear()
-            self.assertFalse(dlg.login_button.isEnabled())               # 사번도 필수
-            dlg.reg_employee_edit.setText('2026 1009')
-            dlg.accept()
-            self.assertIn('사번은 영문·숫자', dlg.error_label.text())
-            dlg.reg_employee_edit.setText('20261009')
+            dlg.reg_email_edit.clear()
+            self.assertFalse(dlg.login_button.isEnabled())               # 이메일도 필수
             dlg.reg_email_edit.setText('not-an-email')
             dlg.accept()
             self.assertIn('이메일', dlg.error_label.text())
@@ -984,9 +982,9 @@ class DialogTests(ShellTestBase):
             self.assertEqual(dlg.reg_password_edit.echoMode(), QLineEdit.Normal)
             dlg.accept()
             self.assertEqual(dlg.result(), LoginDialog.Accepted)
-            self.assertEqual(dlg.registration(), {'company': 'KCS 물류', 'name': '도승현', 'employee_no': '20261009',
-                                                  'email': 'do@kcs.test', 'password': 'pw1234'})
-            self.assertEqual(dlg.values()[0], '20261009')                # 다음부터의 로그인 아이디 = 사번
+            self.assertEqual(dlg.registration(), {'company': 'KCS 물류', 'name': '도승현',
+                                                  'email': 'do@kcs.test', 'password': 'pw1234'})   # 사번은 보내지 않는다
+            self.assertEqual(dlg.values()[0], 'do@kcs.test')             # 다음부터의 로그인 아이디 = 이메일
             self.assertEqual(dlg.saved_token(), '')
             # 등록이 거절돼 다시 띄운 창은 입력값 그대로 등록 화면
             again = LoginDialog('10.0.0.9', 6000, registration=dlg.registration())
@@ -1015,8 +1013,8 @@ class DialogTests(ShellTestBase):
 
     def test_login_dialog_asks_for_employee_no(self):
         dlg = LoginDialog(fresh=True)
-        self.assertEqual(dlg.name_edit.placeholderText(), '사번')
-        self.assertIn('사번', dlg.subtitle.text())
+        self.assertEqual(dlg.name_edit.placeholderText(), '이메일')     # 운영 로그인 아이디 = 이메일 (2026-10-14)
+        self.assertIn('이메일', dlg.subtitle.text())
         dlg.name_edit.setText('20261009')
         self.assertFalse(dlg.login_button.isEnabled())                  # 비밀번호도 있어야
         dlg.password_edit.setText('pw1234')
@@ -1028,9 +1026,15 @@ class DialogTests(ShellTestBase):
         with mock.patch.object(login, 'fetch_companies', side_effect=OSError('down')):
             new = LoginDialog(fresh=True)
             new.name_edit.setText('K-2026')
-            new.show_error('처음 사용하는 아이디입니다. [처음 사용 등록]에서 소속 회사·이름·사번·이메일·비밀번호를 등록해 주세요.')
+            new.show_error('처음 사용하는 아이디입니다. [처음 사용 등록]에서 소속 회사·이름·이메일·비밀번호를 등록해 주세요.')
         self.assertTrue(new.is_register())
-        self.assertEqual((new.reg_employee_edit.text(), new.reg_name_edit.text()), ('K-2026', ''))
+        # 사번 모양의 아이디는 옮길 칸이 없다 (이름 칸에 넣지 않는다)
+        self.assertEqual((new.reg_email_edit.text(), new.reg_name_edit.text()), ('', ''))
+        with mock.patch.object(login, 'fetch_companies', side_effect=OSError('down')):
+            by_name = LoginDialog(fresh=True)
+            by_name.name_edit.setText('홍길동')
+            by_name.show_error('처음 사용하는 아이디입니다. [처음 사용 등록]에서 소속 회사·이름·이메일·비밀번호를 등록해 주세요.')
+        self.assertEqual(by_name.reg_name_edit.text(), '홍길동')
 
     def test_login_dialog_switches_to_registration_when_server_asks(self):
         from client.kakao import login
@@ -1376,7 +1380,7 @@ class RecentIdLoginTests(unittest.TestCase):
 
 
 class SavedLoginDialogTests(unittest.TestCase):
-    """사번·비밀번호 저장 / 자동 로그인 체크 (명세 §4.1)"""
+    """이메일·비밀번호 저장 / 자동 로그인 체크 (명세 §4.1)"""
     def setUp(self):
         app()
 

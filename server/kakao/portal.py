@@ -3,6 +3,10 @@
 사내 포털(https://portal.kcins.co.kr) RAG 연동 - 'AI 비서'의 1차 두뇌 (명세 §7.6.1)
 
 - 질문: AI 비서에게 온 질문을 포털 RAG API 로 보내 답을 받는다.
+        기본 API 는 포털의 /api/chat/ask-as (2026-10-14): 공유 비밀 X-Service-Token 으로 인증하고 질문자의
+        이메일(= 포털 계정)을 함께 보내면, 포털이 그 사람 권한(내 부서 문서 + 전사 공개 문서)으로 gemma4 가
+        답하고 대화도 그 사람의 포털 대화 목록에 남긴다. 그래서 메신저가 따로 대화를 저장하지 않는다
+        (save_conversations 기본 false).
         포털에 닿지 않거나 오류면 메신저 자체 RAG(RagService)로 답한다 (답 끝에 안내 한 줄).
 - 저장: 질문·답변 한 쌍을 포털 대화 저장 API 로 보낸다. 보내기 전에 SQLite 보낼 함(outbox)에 먼저 넣고,
         실패하면 백그라운드 스레드가 다시 보낸다 (포털 장애 · 서버 재시작에도 대화 기록을 잃지 않게).
@@ -10,9 +14,10 @@
         인증 헤더 · 요청 방식(api_style)을 설정만으로 맞춘다.
 
 portal.json 예 (모든 키 생략 가능)
-  {"enabled": true, "base_url": "https://portal.kcins.co.kr", "token": "...",
+  {"enabled": true, "base_url": "http://127.0.0.1:6031", "token": "<포털 .env 의 SERVICE_TOKEN>",
    "api_style": "kcs",                      # kcs | openai (OpenAI 호환 /chat/completions)
-   "ask_path": "/api/rag/ask", "save_path": "/api/rag/conversations",
+   "ask_path": "/api/chat/ask-as", "save_path": "/api/rag/conversations",
+   "auth_header": "X-Service-Token", "auth_scheme": "",  "save_conversations": false,
    "model": "", "auth_header": "Authorization", "auth_scheme": "Bearer",
    "headers": {"X-Client": "kcs-talk"}, "timeout": 30, "verify_tls": true,
    "save_conversations": true, "retry_seconds": 60}
@@ -51,15 +56,15 @@ DEFAULTS: dict[str, Any] = {
     'base_url': DEFAULT_BASE_URL,
     'token': '',
     'api_style': 'kcs',
-    'ask_path': '/api/rag/ask',
+    'ask_path': '/api/chat/ask-as',            # 포털 kcs-rag 의 서비스 질문 API (사용자 대신 질문)
     'save_path': '/api/rag/conversations',
     'model': '',
-    'auth_header': 'Authorization',
-    'auth_scheme': 'Bearer',
+    'auth_header': 'X-Service-Token',
+    'auth_scheme': '',
     'headers': {},
-    'timeout': 30.0,
+    'timeout': 90.0,                           # 검색 + 리랭크 + gemma4 생성 (보통 5~15초, 웹 검색이 붙으면 더)
     'verify_tls': True,
-    'save_conversations': True,
+    'save_conversations': False,               # ask-as 가 포털 쪽에 대화를 남긴다
     'retry_seconds': 60.0,
 }
 
@@ -207,7 +212,7 @@ class PortalClient:
                 else '/api/chat/completions'
         else:
             payload = {'question': question, 'query': question, 'user': user['username'],
-                       'user_name': user['name'], 'room_id': user.get('room_id'),
+                       'user_name': user['name'], 'email': user.get('email') or '', 'room_id': user.get('room_id'),
                        'conversation_id': conversation_id, 'history': history[-10:], 'source': SOURCE_TAG}
             if self.config.get('model'):
                 payload['model'] = self.config['model']
@@ -333,8 +338,8 @@ class PortalRag:
 
     # 질문 -------------------------------------------------------------------------
     def answer(self, question: str, asker: str, room_ids: Any, history: list, room_id: Optional[str] = None,
-               asker_name: str = '', room_name: str = '', bot_name: str = '') -> str:
-        user = {'username': asker, 'name': asker_name or asker, 'room_id': room_id}
+               asker_name: str = '', room_name: str = '', bot_name: str = '', asker_email: str = '') -> str:
+        user = {'username': asker, 'name': asker_name or asker, 'room_id': room_id, 'email': asker_email}
         turns = _history_turns(history, bot_name)
         if turns and turns[-1]['role'] == 'user' and question.strip() in turns[-1]['content']:
             turns = turns[:-1]       # 방 기록의 마지막은 지금 질문 자체

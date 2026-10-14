@@ -26,6 +26,7 @@ Linux(Ubuntu/Debian)에서 Qt 창이 뜨지 않으면:
 ```
 python3 kcs.py                       메신저 (= kcs.py client)
 python3 kcs.py client --host 서버주소 --port 5555
+python3 kcs.py client --host talk.kcins.co.kr --port 9550 --tls   운영 서버 (TLS). server.json 에 "tls": true 로 저장해 두면 생략
 python3 kcs.py server                채팅 서버 (이 PC에서만)
 python3 kcs.py server --host 0.0.0.0 다른 PC에서 접속 허용
 python3 kcs.py doctor                이 PC 점검 (필수 패키지 · 글꼴 · 데이터 폴더)

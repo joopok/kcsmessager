@@ -120,8 +120,21 @@ class AccountSecurityTests(ServerTestBase):
         err = self.fresh(name).expect_error({'type': 'register', 'company': 'KCS 홀딩스', 'name': name,
                                               'employee_no': 'X999', 'email': f'{name}@kcs.test', 'password': 'pw-1'})
         self.assertIn('조직도에 등록된 사번과 다릅니다', err['message'])
+        # 사번 칸이 없는 클라이언트(2026-10-14): 조직도에 이메일도 없으면 확인할 값이 없어 거절
+        err = self.fresh(name).expect_error({'type': 'register', 'company': 'KCS 홀딩스', 'name': name,
+                                              'email': f'{name}@kcs.test', 'password': 'pw-1'})
+        self.assertEqual(err['message'], store.REGISTER_NEEDS_ORG_EMAIL)
         self.fresh(name).request({'type': 'register', 'company': 'KCS 홀딩스', 'name': name, 'employee_no': 'k777',
                                   'email': f'{name}@kcs.test', 'password': 'pw-1'}, 'welcome')
+        # 조직도에 사번·이메일이 모두 있으면 사번 없이 이메일만 맞아도 된다
+        both = uname('org')
+        store.member_create(both, {'company': 'KCS 홀딩스', 'employee_no': 'K778', 'email': f'{both}@kcs.test'})
+        err = self.fresh(both).expect_error({'type': 'register', 'company': 'KCS 홀딩스', 'name': both,
+                                              'email': f'not-{both}@kcs.test', 'password': 'pw-1'})
+        self.assertEqual(err['message'], store.REGISTER_WRONG_EMAIL)
+        w = self.fresh(both).request({'type': 'register', 'company': 'KCS 홀딩스', 'name': both,
+                                      'email': f'{both}@kcs.test', 'password': 'pw-1'}, 'welcome')
+        self.assertEqual(w['me']['employee_no'], 'K778')                           # 조직도 사번은 그대로
 
     def test_admin_accounts_cannot_be_claimed_or_reset_by_email(self):
         store = self.server.store

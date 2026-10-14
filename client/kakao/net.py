@@ -6,15 +6,44 @@
 
 import json
 import socket
+import ssl
 import threading
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
 
-def _request_before_login(host, port, payload, reply_type, timeout=3.0, rejected=OSError):
+def _tls_context():
+    """서버 인증서를 OS 신뢰 저장소로 검증하는 기본 컨텍스트. PyInstaller 로 만든 macOS 앱은 OS 저장소를 못 보는
+    경우가 있어 certifi 가 있으면 그 CA 묶음을 함께 신뢰한다 (requirements-kcs.txt 권장 항목)."""
+    ctx = ssl.create_default_context()
+    try:
+        import certifi
+        ctx.load_verify_locations(cafile=certifi.where())
+    except Exception:  # certifi 없음 · 파일 문제 — OS 저장소만 사용
+        pass
+    return ctx
+
+
+def open_socket(host, port, timeout=5.0, tls=False):
+    """서버 소켓 하나를 연다. tls=True 면 TLS 로 감싼다 (SNI = host, 인증서 검증 포함).
+    talk.kcins.co.kr:9550 처럼 nginx 가 TLS 를 종단하는 서버에 붙을 때 켠다. 실패는 OSError(ssl.SSLError 포함)."""
+    sock = socket.create_connection((host, port), timeout=timeout)
+    if not tls:
+        return sock
+    try:
+        return _tls_context().wrap_socket(sock, server_hostname=host)
+    except Exception:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
+
+
+def _request_before_login(host, port, payload, reply_type, timeout=3.0, rejected=OSError, tls=False):
     """로그인 전 요청 하나를 보내고 답(reply_type)을 받는다. 서버가 error 로 답하면 rejected(서버 문구),
     연결 문제는 OSError"""
-    with socket.create_connection((host, port), timeout=timeout) as sock:
+    with open_socket(host, port, timeout=timeout, tls=tls) as sock:
         sock.settimeout(timeout)
         sock.sendall((json.dumps(dict(payload, req_id=1), ensure_ascii=False) + '\n').encode('utf-8'))
         buf = b''
@@ -35,9 +64,9 @@ def _request_before_login(host, port, payload, reply_type, timeout=3.0, rejected
                     raise rejected(msg.get('message') or '요청을 처리할 수 없습니다')
 
 
-def fetch_companies(host, port, timeout=3.0):
+def fetch_companies(host, port, timeout=3.0, tls=False):
     """로그인 전에 소속 회사 목록을 받는다 (org_companies, 명세 §4.1). 실패하면 OSError"""
-    msg = _request_before_login(host, port, {'type': 'org_companies'}, 'org_companies', timeout)
+    msg = _request_before_login(host, port, {'type': 'org_companies'}, 'org_companies', timeout, tls=tls)
     return [c for c in msg.get('companies') or [] if isinstance(c, str)]
 
 
@@ -45,12 +74,12 @@ class ResetRejected(Exception):
     """서버가 비밀번호 재설정을 거절함 (아이디·이메일 불일치, 횟수 제한 등) - 사용자에게 보일 문구"""
 
 
-def reset_password(host, port, login_id, email, new_password, code='', timeout=5.0):
+def reset_password(host, port, login_id, email, new_password, code='', timeout=5.0, tls=False):
     """비밀번호 재설정 (password_reset, 명세 §4.1) → 바뀐 계정 username. code: 관리자가 발급한 일회용 재설정 코드.
     서버가 거절하면 ResetRejected(문구), 연결이 안 되면 OSError"""
     payload = {'type': 'password_reset', 'username': login_id, 'email': email, 'new_password': new_password,
                'code': code}
-    msg = _request_before_login(host, port, payload, 'password_reset_ok', timeout, rejected=ResetRejected)
+    msg = _request_before_login(host, port, payload, 'password_reset_ok', timeout, rejected=ResetRejected, tls=tls)
     return msg.get('username') or login_id
 
 
@@ -74,10 +103,10 @@ class ChatConnection(QObject):
         return self._sock is not None
 
     def connect_to(self, host, port, username, timeout=5.0, password=None, token=None, remember=False,
-                   registration=None):
+                   registration=None, tls=False):
         """연결 후 join 요청을 보낸다(password가 있으면 아이디/비밀번호 로그인). 실패 시 OSError를 그대로 올린다.
-        registration={company, name, employee_no, email, password} 이면 join 대신 처음 사용 등록(register)을 보낸다 (명세 §4.1)"""
-        sock = socket.create_connection((host, port), timeout=timeout)
+        registration={company, name, email, password[, employee_no]} 이면 join 대신 처음 사용 등록(register)을 보낸다 (명세 §4.1)"""
+        sock = open_socket(host, port, timeout=timeout, tls=tls)
         sock.settimeout(None)
         self._sock = sock
         self._closing = False

@@ -452,9 +452,34 @@ class LoginTests(ServerTestBase):
                                   'employee_no': 'kmkim' if self.server.store.resolve_login('kmkim') else name,
                                   'email': f'{other.username}@kcs.test', 'password': 'pw-1234'})
         self.assertIn('이미 등록된 사번', err['message'])
-        # 등록 안 된 사번으로 로그인하면 처음 사용 등록 안내 (소속·이름·사번·이메일·비밀번호)
+        # 등록 안 된 아이디로 로그인하면 처음 사용 등록 안내 (소속·이름·이메일·비밀번호 — 사번 칸은 없다)
         new, payload = self.join(f'N{uuid.uuid4().hex[:8]}', 'some-pass')
-        self.assertIn('사번', new.expect_error(payload)['message'])
+        message = new.expect_error(payload)['message']
+        self.assertIn('소속 회사·이름·이메일·비밀번호', message)
+        self.assertNotIn('사번', message)
+
+    def test_register_without_employee_no_then_login_by_email(self):
+        """2026-10-14: 등록 창에 사번 칸이 없다 → employee_no 없이 등록하고 이메일로 로그인"""
+        name = uname('mail')
+        email = f'{name}@kcs.test'
+        c = self.connect(name, join=False)
+        w = c.request({'type': 'register', 'company': 'KCS 홀딩스', 'name': name, 'email': email,
+                       'password': 'mail-pass'}, 'welcome')
+        self.assertEqual((w['me']['username'], w['me']['employee_no'], w['me']['email']), (name, '', email))
+        c.close()
+        by_mail, payload = self.join(email.upper(), 'mail-pass')
+        self.assertEqual(by_mail.request(payload, 'welcome')['me']['username'], name)
+        # 조직도(관리자 등록)에 이메일이 적힌 미등록 계정은 그 이메일이 맞아야 가져갈 수 있다
+        member = uname('org')
+        self.server.store.member_create(member, {'company': 'KCS 홀딩스', 'email': f'{member}@kcs.test'})
+        other = self.connect(member, join=False)
+        err = other.expect_error({'type': 'register', 'company': 'KCS 홀딩스', 'name': member,
+                                  'email': 'someone-else@kcs.test', 'password': 'pw-1234'})
+        self.assertEqual(err['message'], self.server.store.REGISTER_WRONG_EMAIL)
+        self.assertIsNone(self.server.store.password_hash(member))
+        w = other.request({'type': 'register', 'company': 'KCS 홀딩스', 'name': member,
+                           'email': f'{member}@KCS.test', 'password': 'pw-1234'}, 'welcome')   # 대소문자 무시
+        self.assertEqual(w['me']['username'], member)
 
     def test_passwordless_join_blocked_once_password_set(self):
         name = uname('pw')
@@ -538,8 +563,7 @@ class LoginTests(ServerTestBase):
                                 ({'password': '12'}, '4~64자'),
                                 ({'name': 'a@b'}, '사용할 수 없는 문자'),
                                 ({'name': BOT}, '봇'),
-                                ({'employee_no': ''}, '사번을 입력해 주세요.'),
-                                ({'employee_no': '12 34'}, '사번은 영문·숫자'),
+                                ({'employee_no': '12 34'}, '사번은 영문·숫자'),     # 보내면 규칙은 지켜야
                                 ({'employee_no': 'x' * 21}, '사번은 영문·숫자')):
             err = c.expect_error({**base, **change})
             self.assertEqual(err['req_type'], 'register')

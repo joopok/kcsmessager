@@ -52,7 +52,7 @@ class FakePortal:
                     self.send_response(503)
                     self.end_headers()
                     return
-                if self.path.endswith('/ask'):
+                if self.path.endswith(('/ask', '/ask-as')):
                     out = {'data': {'answer': f"포털 답변: {body['question']}",
                                     'sources': [{'title': '인사규정.pdf', 'url': 'https://portal.kcins.co.kr/d/1'}],
                                     'conversation_id': 'conv-42'}}
@@ -116,7 +116,9 @@ class ConfigTest(unittest.TestCase):
     def test_defaults_point_to_company_portal(self):
         config = load_config(None, env={})
         self.assertEqual(config['base_url'], 'https://portal.kcins.co.kr')
-        self.assertEqual((config['ask_path'], config['save_path']), ('/api/rag/ask', '/api/rag/conversations'))
+        self.assertEqual((config['ask_path'], config['save_path']), ('/api/chat/ask-as', '/api/rag/conversations'))
+        self.assertEqual((config['auth_header'], config['auth_scheme']), ('X-Service-Token', ''))
+        self.assertFalse(config['save_conversations'])                 # ask-as 가 포털 쪽에 대화를 남긴다
 
     def test_off_and_env_override(self):
         self.assertIsNone(load_config(None, env={'KCS_PORTAL': 'off'}))
@@ -134,7 +136,7 @@ class ConfigTest(unittest.TestCase):
                            'timeout': 'x', 'unknown': 1}, f)
             config = load_config(path, env={})
             self.assertEqual((config['base_url'], config['ask_path'], config['api_style'], config['timeout']),
-                             ('https://p.example', '/rag/query', 'kcs', 30.0))
+                             ('https://p.example', '/rag/query', 'kcs', 90.0))
             self.assertNotIn('unknown', config)
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump({'enabled': False}, f)
@@ -167,6 +169,7 @@ class PortalRagTest(unittest.TestCase):
         self.fake = FakePortal()
         self.dir = tempfile.mkdtemp()
         self.config = load_config(None, env={'KCS_PORTAL_URL': self.fake.url, 'KCS_PORTAL_TOKEN': 'secret-token'})
+        self.config['save_conversations'] = True      # 저장 흐름도 검사 (기본값은 false — ask-as 가 포털에 남김)
         self.local = LocalRag()
         self.rag = PortalRag(self.local, self.config, os.path.join(self.dir, 'outbox.db'), start_worker=False)
 
@@ -179,18 +182,20 @@ class PortalRagTest(unittest.TestCase):
         history = [{'kind': 'text', 'sender': BOT, 'content': '안녕하세요'},
                    {'kind': 'text', 'sender': 'kim', 'content': q}]
         return self.rag.answer(q, 'kim', ['r1'], history, room_id='r1', asker_name='김철수', room_name='AI 비서',
-                               bot_name=BOT)
+                               bot_name=BOT, asker_email='kim@kcs.test')
 
     def test_portal_answers_with_sources_and_token(self):
         text = self.ask()
         self.assertTrue(text.startswith('포털 답변: 연차 며칠이야?'))
         self.assertIn('📎 출처 (사내 포털)\n[1] 인사규정.pdf https://portal.kcins.co.kr/d/1', text)
         req = self.fake.requests[0]
-        self.assertEqual(req['path'], '/api/rag/ask')
-        self.assertEqual(req['headers'].get('Authorization'), 'Bearer secret-token')
+        self.assertEqual(req['path'], '/api/chat/ask-as')
+        headers = {k.lower(): v for k, v in req['headers'].items()}
+        self.assertEqual(headers.get('x-service-token'), 'secret-token')          # 공유 비밀, 스킴 없음
+        self.assertNotIn('authorization', headers)
         body = req['body']
-        self.assertEqual((body['question'], body['user'], body['user_name'], body['source']),
-                         ('연차 며칠이야?', 'kim', '김철수', 'kcs-talk'))
+        self.assertEqual((body['question'], body['user'], body['user_name'], body['email'], body['source']),
+                         ('연차 며칠이야?', 'kim', '김철수', 'kim@kcs.test', 'kcs-talk'))
         self.assertEqual(body['history'], [{'role': 'assistant', 'content': '안녕하세요'}])  # 질문 자체는 빼고
         # 포털이 준 대화 id 를 기억해 다음 질문에 넘긴다
         self.ask('그럼 반차는?')
@@ -283,6 +288,7 @@ class ServerPortalTest(unittest.TestCase):
         cls.fake = FakePortal()
         cls.tmpdir = tempfile.mkdtemp(prefix='kakao_portal_')
         config = load_config(None, env={'KCS_PORTAL_URL': cls.fake.url, 'KCS_PORTAL_TOKEN': 't'})
+        config['save_conversations'] = True
         config['retry_seconds'] = 1
         cls.server = KakaoServer(port=0, db_path=os.path.join(cls.tmpdir, 't.db'), tick_seconds=0.2,
                                  rag_factory=FakeRag, portal=config)

@@ -1,16 +1,16 @@
 {
   "enabled": true,
-  "base_url": "https://portal.kcins.co.kr",
-  "token": "",
+  "base_url": "http://127.0.0.1:6031",
+  "token": "<포털 .env 의 SERVICE_TOKEN>",
   "api_style": "kcs",
-  "ask_path": "/api/rag/ask",
+  "ask_path": "/api/chat/ask-as",
   "save_path": "/api/rag/conversations",
   "model": "",
-  "auth_header": "Authorization",
-  "auth_scheme": "Bearer",
+  "auth_header": "X-Service-Token",
+  "auth_scheme": "",
   "headers": {},
-  "timeout": 30,
+  "timeout": 90,
   "verify_tls": true,
-  "save_conversations": true,
+  "save_conversations": false,
   "retry_seconds": 60
 }
