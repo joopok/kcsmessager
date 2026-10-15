@@ -10,7 +10,7 @@
 - 단축키 표기: shortcut_text('Ctrl+Shift+Enter') → macOS '⇧⌘Enter' (Apple 순서 ⌃⌥⇧⌘), 그 밖 'Ctrl+Shift+Enter'
   (Qt 는 QKeySequence 의 Ctrl 을 macOS 에서 ⌘ 로 자동으로 바꾸므로 키 연결은 어디서나 'Ctrl+…' 로 쓴다)
 - 시작 보정: prepare_process() (QApplication 전) · configure_app(app) (QApplication 직후)
-- 다시 실행: relaunch_command(argv)
+- 다시 실행: relaunch_command(argv) (빌드한 앱은 PYINSTALLER_RESET_ENVIRONMENT=1 로 새 임시 폴더)
 - 영문 입력: prefer_latin_input(edit) - 사번 칸에 포커스가 오면 한글 대신 영문 입력 상태로
 
 함수는 부를 때마다 sys.platform 을 읽는다 (테스트에서 OS 를 바꿔 끼울 수 있게).
@@ -181,13 +181,19 @@ _UI_FONTS = {
     'linux': ['Noto Sans CJK KR', 'Noto Sans KR', 'NanumGothic', 'Nanum Gothic', 'UnDotum', 'DejaVu Sans'],
 }
 _EMOJI_FONTS = {'mac': ['Apple Color Emoji'], 'windows': ['Segoe UI Emoji'], 'linux': ['Noto Color Emoji']}
+# 앱에 든 글꼴(assets/fonts, theme.BUNDLED_FONTS) 의 글꼴 이름. 영문 · 숫자 · 기호는 Poppins(Indian Type Foundry, SIL OFL;
+# SemiBold 를 기본 굵기로, 굵은 글씨는 Bold), 한글은 KoPub World 돋움. Poppins 에 없는 글자(한글)는 Qt 가 다음 글꼴(KoPub)로
+# 내려 그린다. Windows 는 한글 이름('KoPubWorld돋움체')으로 등록될 수 있어 두 이름을 모두 둔다 (theme.installed 가 있는 것만).
+BUNDLED_LATIN_FAMILY = 'Poppins'
+BUNDLED_HANGUL_FAMILIES = ('KoPubWorldDotum', 'KoPubWorld돋움체')
+BUNDLED_FAMILIES = (BUNDLED_LATIN_FAMILY,) + BUNDLED_HANGUL_FAMILIES
 
 
 def ui_font_families():
-    """한글 UI 글꼴 순서: 앱에 든 Pretendard → 이 OS 기본 한글 글꼴 → 다른 OS 글꼴(원격 데스크톱 등 대비)"""
+    """UI 글꼴 순서: 앱에 든 Poppins(영문·숫자) → KoPub 돋움(한글) → 이 OS 기본 한글 글꼴 → 다른 OS 글꼴(원격 데스크톱 등 대비)"""
     own = _UI_FONTS[current()]
     others = [f for key, names in _UI_FONTS.items() if key != current() for f in names]
-    return list(dict.fromkeys(['Pretendard'] + own + others))
+    return list(dict.fromkeys(list(BUNDLED_FAMILIES) + own + others))
 
 
 def emoji_families():
@@ -400,9 +406,19 @@ def _x11_idle_seconds():
 
 
 # ---------------------------------------------------------------- 다시 실행
+# PyInstaller 6 단일 실행파일(onefile)은 sys.executable 로 띄운 새 복사본을 '같은 앱의 하위 프로세스'로 보고 부모가
+# 풀어 둔 임시 폴더(_MEIxxxx)를 그대로 쓰게 한다. 로그아웃 → 다시 로그인처럼 새 인스턴스를 띄우고 원래 인스턴스가
+# 종료하면 그 임시 폴더가 지워져 새 인스턴스가 "No such file or directory: ..._MEIxxxx\base_library.zip" 으로 죽는다.
+# 이 변수를 1 로 주면 부트로더가 환경을 초기화하고 자기 임시 폴더를 새로 푼다 (bootloader pyi_main.c).
+PYINSTALLER_RESET_ENV = 'PYINSTALLER_RESET_ENVIRONMENT'
+
+
 def relaunch_command(argv=None):
-    """(프로그램, 인자) - 지금 앱을 같은 방식으로 다시 띄우는 명령. 빌드한 앱이면 실행 파일 그대로"""
+    """(프로그램, 인자) - 지금 앱을 같은 방식으로 다시 띄우는 명령. 빌드한 앱이면 실행 파일 그대로.
+    빌드한 앱에서는 새 인스턴스가 독립된 임시 폴더를 쓰도록 환경 변수 PYINSTALLER_RESET_ENVIRONMENT=1 도 둔다
+    (startDetached 는 지금 프로세스 환경을 물려준다)"""
     argv = list(sys.argv if argv is None else argv)
     if getattr(sys, 'frozen', False):
+        os.environ[PYINSTALLER_RESET_ENV] = '1'
         return sys.executable, argv[1:]
     return sys.executable, [os.path.abspath(argv[0])] + argv[1:]

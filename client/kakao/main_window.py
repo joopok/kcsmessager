@@ -614,6 +614,7 @@ class MainWindow(QMainWindow):
         self.room_windows = {}
         self._last_notify_room = ''
         self._quitting = False
+        self._tray_hint_shown = False  # 창 닫기(X)로 트레이에 내려갈 때 안내 풍선은 한 번만
         self._hidden_rooms = []        # 잠금 중 숨긴 채팅방 창
         self._pending_rooms = []       # 잠금 중 열라고 요청된 방
         self.feature_tour = None
@@ -999,6 +1000,10 @@ class MainWindow(QMainWindow):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
         self.tray = QSystemTrayIcon(talk_icon(), self)
+        # 메인 창을 트레이로 내려도(모든 창이 닫혀도) 앱이 끝나지 않게. 종료는 quit_app · 로그아웃(QApplication.quit) 으로만
+        app = QApplication.instance()
+        if app is not None:
+            app.setQuitOnLastWindowClosed(False)
         menu = QMenu()
         menu.addAction('KCS Talk 열기', self.bring_to_front)
         menu.addSeparator()
@@ -1196,7 +1201,24 @@ class MainWindow(QMainWindow):
         self._quitting = True
         self.close()
 
+    def hide_to_tray(self):
+        """메인 창만 숨기고 트레이에서 계속 실행 (채팅방 별도 창은 그대로). 처음 한 번 트레이 풍선으로 알려 준다"""
+        self.hide()
+        if not self._tray_hint_shown and self.tray is not None:
+            self._tray_hint_shown = True
+            try:
+                self.tray.showMessage(APP_TITLE, 'KCS Talk 는 트레이에서 계속 실행됩니다. 트레이 아이콘을 누르면 다시 열리고,'
+                                      ' 완전히 끝내려면 트레이 메뉴의 [종료]를 누르세요.', QSystemTrayIcon.Information, 4000)
+            except Exception:
+                pass
+
     def closeEvent(self, event):
+        # 창 닫기(X) 는 종료가 아니라 트레이로 내려가기 (2026-10-15, 카카오톡과 같음). 트레이가 없는 환경이나
+        # 트레이 메뉴 [종료] · 로그아웃(quit_app → _quitting) 때만 실제로 끝낸다
+        if self.tray is not None and not self._quitting:
+            event.ignore()
+            self.hide_to_tray()
+            return
         for win in list(self.room_windows.values()):
             try:
                 win.close()

@@ -1,0 +1,10 @@
+KoPub World 서체 (KoPubWorld 돋움체 Light · Medium · Bold)
+저작권: (사)한국출판인회의 · 문화체육관광부 (https://www.kopus.org/biz-electronic-font2/)
+
+사용 조건 (한국출판인회의 KoPub World 서체 라이선스 요약)
+- 개인 · 기업 · 기관 누구나 무료로 쓸 수 있고, 인쇄물 · 영상 · 웹 · 소프트웨어 · 앱에 임베딩(embedding)해 배포할 수 있다.
+- 서체 파일을 그대로 재배포할 수 있다. 서체 파일 자체를 유료로 판매하거나, 서체를 수정 · 변형해 배포할 수 없다.
+- 서체를 쓴 결과물의 저작권은 사용자에게 있다.
+
+KCS Talk 는 원본 TTF 파일(KoPubWorld Dotum Light/Medium/Bold.ttf)을 수정 없이 파일 이름만 KoPubWorldDotum-*.ttf 로 바꿔
+assets/fonts 에 넣어 함께 배포한다 (한글 글꼴).

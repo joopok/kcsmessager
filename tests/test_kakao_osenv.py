@@ -4,7 +4,10 @@
 import importlib.util
 import io
 import os
+import plistlib
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -93,27 +96,45 @@ class PathTest(unittest.TestCase):
 
     def test_theme_and_brand_find_assets(self):
         from client.kakao import theme, brand
-        self.assertTrue(os.path.exists(os.path.join(theme.FONT_DIR, 'Pretendard-Regular.otf')))
+        self.assertTrue(os.path.exists(os.path.join(theme.FONT_DIR, 'Poppins-SemiBold.ttf')))
+        self.assertTrue(os.path.exists(os.path.join(theme.FONT_DIR, 'KoPubWorldDotum-Medium.ttf')))
         self.assertTrue(os.path.isdir(brand.BRAND_DIR))
 
-    def test_pretendard_all_weights_300_to_900(self):
-        """기본 글꼴 Pretendard: assets/fonts 에 300~900 정적 글꼴 7종 + OFL 라이선스, 굵기마다 그 파일로 그린다"""
-        from PyQt5.QtGui import QFontInfo, QFontDatabase
+    def test_bundled_fonts_poppins_and_kopub(self):
+        """앱 글꼴(2026-10-15): 영문 · 숫자 Poppins SemiBold · Bold + 한글 KoPub 돋움 세 굵기, 라이선스 파일 둘.
+        영문은 Poppins(300~600 은 SemiBold, 700~ 은 Bold)로, 한글은 KoPub 돋움으로 그린다"""
+        from PyQt5.QtGui import QFont, QFontInfo, QFontDatabase, QFontMetrics
         from client.kakao import theme
         app()
         self.assertEqual(sorted(theme.FONT_WEIGHTS), [300, 400, 500, 600, 700, 800, 900])
         for name in theme.BUNDLED_FONTS:
-            self.assertTrue(os.path.getsize(os.path.join(theme.FONT_DIR, name)) > 1_000_000, name)
-        with open(os.path.join(theme.FONT_DIR, 'Pretendard-OFL.txt'), encoding='utf-8') as f:
-            self.assertIn('SIL OPEN FONT LICENSE', f.read().upper())
+            self.assertTrue(os.path.getsize(os.path.join(theme.FONT_DIR, name)) > 100_000, name)
+        with open(os.path.join(theme.FONT_DIR, 'Poppins-OFL.txt'), encoding='utf-8') as f:
+            text = f.read()
+        self.assertIn('SIL OPEN FONT LICENSE', text.upper())
+        self.assertIn('Poppins', text)
+        with open(os.path.join(theme.FONT_DIR, 'KoPubWorld-LICENSE.txt'), encoding='utf-8') as f:
+            self.assertIn('한국출판인회의', f.read())
         theme.load_bundled_fonts()
-        self.assertEqual(set(QFontDatabase().styles('Pretendard')),
-                         {'Light', 'Regular', 'Medium', 'SemiBold', 'Bold', 'ExtraBold', 'Black'})
-        self.assertEqual(theme.font_families()[0], 'Pretendard')                  # 기본 글꼴
-        self.assertEqual(QFontInfo(theme.font()).family(), 'Pretendard')
-        for weight, style in theme.PRETENDARD_STYLES.items():
+        db = QFontDatabase()
+        self.assertEqual(set(db.styles(theme.BUNDLED_LATIN_FAMILY)), {'SemiBold', 'Bold'})
+        hangul = next((f for f in theme.BUNDLED_HANGUL_FAMILIES if db.styles(f)), None)
+        self.assertIsNotNone(hangul, '한글 글꼴 KoPub 돋움이 등록되지 않음')
+        self.assertEqual(set(db.styles(hangul)), {'Light', 'Medium', 'Bold'})
+        self.assertTrue(theme.bundled_fonts_ready())
+        fams = theme.font_families()
+        self.assertEqual(fams[0], theme.BUNDLED_LATIN_FAMILY)                     # 기본 글꼴
+        self.assertEqual(fams[1], hangul)                                          # 한글은 바로 다음
+        self.assertEqual(QFontInfo(theme.font()).family(), theme.BUNDLED_LATIN_FAMILY)
+        for weight, style in theme.BUNDLED_STYLES.items():
             self.assertEqual(QFontInfo(theme.font('body', weight=weight)).styleName(), style, weight)
         self.assertEqual(QFontInfo(theme.font(bold=True)).styleName(), 'Bold')
+        # 한글은 Poppins 에 없으니 KoPub 돋움으로 내려 그린다 (KoPub 만으로 잰 폭과 같다)
+        fm = QFontMetrics(theme.font('body'))
+        kopub = QFont(hangul)
+        kopub.setPixelSize(theme.font('body').pixelSize())
+        self.assertEqual(fm.horizontalAdvance('한글'), QFontMetrics(kopub).horizontalAdvance('한글'))
+        self.assertGreater(fm.horizontalAdvance('한글'), 0)
         with self.assertRaises(ValueError):
             theme.font(weight=450)
 
@@ -194,8 +215,9 @@ class TextTest(unittest.TestCase):
         for name, first in expect_first.items():
             with on(name):
                 fams = osenv.ui_font_families()
-                self.assertEqual(fams[0], 'Pretendard')                    # 앱에 든 글꼴이 먼저
-                self.assertEqual(fams[1], first)                           # 그 다음 이 OS 한글 글꼴
+                self.assertEqual(fams[0], osenv.BUNDLED_LATIN_FAMILY)      # 앱에 든 글꼴이 먼저 (영문 Poppins)
+                self.assertEqual(tuple(fams[1:3]), osenv.BUNDLED_HANGUL_FAMILIES)   # 한글 KoPub 돋움 (영문 · 한글 이름)
+                self.assertEqual(fams[3], first)                           # 그 다음 이 OS 한글 글꼴
                 self.assertEqual(len(fams), len(set(fams)))
                 self.assertTrue({'Apple SD Gothic Neo', '맑은 고딕', 'Noto Sans CJK KR'} <= set(fams))
 
@@ -248,9 +270,13 @@ class StartupTest(unittest.TestCase):
             prog, args = osenv.relaunch_command(['client/kakao/app.py', '--port', '5555'])
             self.assertEqual(prog, sys.executable)
             self.assertEqual(args, [os.path.abspath('client/kakao/app.py'), '--port', '5555'])
-        with mock.patch.object(sys, 'frozen', True, create=True):
+        with mock.patch.object(sys, 'frozen', True, create=True), mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(osenv.PYINSTALLER_RESET_ENV, None)
             prog, args = osenv.relaunch_command(['/Applications/KCS Talk.app/Contents/MacOS/KCS Talk', '--port', '1'])
             self.assertEqual((prog, args), (sys.executable, ['--port', '1']))   # 빌드한 앱은 실행 파일 그대로
+            # onefile 새 인스턴스가 부모의 _MEI 임시 폴더를 물려받지 않도록 (로그아웃 → 재로그인 때 base_library.zip 없음 오류)
+            self.assertEqual(os.environ.get(osenv.PYINSTALLER_RESET_ENV), '1')
+        self.assertNotIn(osenv.PYINSTALLER_RESET_ENV, os.environ)              # 소스 실행에서는 건드리지 않는다
 
     def test_server_data_next_to_frozen_executable(self):
         import importlib
@@ -292,6 +318,74 @@ class BuildTest(unittest.TestCase):
         with mock.patch('sys.stdout', out):
             self.assertEqual(self.build.main(['--dry-run']), 0)
         self.assertIn('PyInstaller', out.getvalue())
+
+    def test_mac_sign_commands(self):
+        dev = 'Developer ID Application: KCS (TEAM123)'
+        self.assertFalse(self.build.is_developer_id('-'))
+        self.assertFalse(self.build.is_developer_id('Apple Development: a@b.c (X)'))   # 배포용 아님
+        adhoc = self.build.sign_command('/x/KCS Talk.app', '-', self.build.ENTITLEMENTS, deep=True)
+        self.assertEqual(adhoc[:4], ['codesign', '--force', '--sign', '-'])
+        self.assertNotIn('runtime', adhoc)
+        signed = self.build.sign_command('/x/KCS Talk.app', dev, self.build.ENTITLEMENTS, deep=True)
+        for flag in ('--timestamp', 'runtime', '--entitlements', '--deep'):    # 공증 조건
+            self.assertIn(flag, signed)
+        self.assertTrue(os.path.exists(self.build.ENTITLEMENTS))
+
+    def test_mac_dmg_commands(self):
+        dev = 'Developer ID Application: KCS (TEAM123)'
+        tools = lambda cmds: [c[1] if c[0] == 'xcrun' else c[0] for c in cmds]
+        self.assertEqual(tools(self.build.dmg_commands('/s', '/o/a.dmg', '-', 'p')), ['hdiutil'])
+        self.assertEqual(tools(self.build.dmg_commands('/s', '/o/a.dmg', dev, None)), ['hdiutil', 'codesign'])
+        self.assertEqual(tools(self.build.dmg_commands('/s', '/o/a.dmg', dev, 'kcs-notary')),
+                         ['hdiutil', 'codesign', 'notarytool', 'stapler'])
+        self.assertRegex(self.build.dmg_name(), r'^\d{12}_kcsmessager\.dmg$')
+
+    def test_mac_dmg_staging_and_plist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = os.path.join(tmp, 'KCS Talk.app')
+            os.makedirs(os.path.join(app, 'Contents'))
+            with open(os.path.join(app, 'Contents', 'Info.plist'), 'wb') as f:
+                plistlib.dump({'CFBundleIdentifier': 'kr.co.kcs.talk'}, f)
+            self.build.patch_info_plist(app)
+            with open(os.path.join(app, 'Contents', 'Info.plist'), 'rb') as f:
+                info = plistlib.load(f)
+            self.assertIn('NSCameraUsageDescription', info)                # 페이스톡이 강제 종료되지 않게
+            self.assertEqual(info['CFBundleIdentifier'], 'kr.co.kcs.talk')
+            if shutil.which('ditto'):
+                staging = os.path.join(tmp, 'stage')
+                os.makedirs(staging)
+                self.build.stage_dmg(app, staging, notarized=False)
+                self.assertEqual(os.readlink(os.path.join(staging, 'Applications')), '/Applications')
+                with open(os.path.join(staging, '설치 안내.txt'), encoding='utf-8') as f:
+                    self.assertIn('그래도 열기', f.read())
+
+    def test_mac_installer_script(self):
+        script = self.build.installer_script('/o/202610150037_kcsmessager.dmg', 'ab' * 32, 'https://portal.example/dl')
+        self.assertTrue(script.startswith('#!/bin/bash'))
+        self.assertIn('https://portal.example/dl/202610150037_kcsmessager.dmg', script)
+        self.assertIn('SHA256="' + 'ab' * 32 + '"', script)              # 받은 파일 무결성 확인
+        self.assertIn('curl -fL', script)                                   # curl 은 다운로드 표시를 붙이지 않는다
+        self.assertIn('xattr -dr com.apple.quarantine', script)
+        self.assertIn('APP="KCS Talk.app"', script)
+        if shutil.which('bash'):
+            with tempfile.NamedTemporaryFile('w', suffix='.sh', delete=False) as f:
+                f.write(script)
+            try:
+                self.assertEqual(subprocess.call(['bash', '-n', f.name]), 0)  # 문법 오류 없음
+            finally:
+                os.unlink(f.name)
+
+    def test_dmg_only_mac_client(self):
+        err = io.StringIO()
+        with mock.patch('sys.stderr', err), mock.patch.object(self.build.osenv, 'is_mac', return_value=False):
+            self.assertEqual(self.build.main(['--dmg', '--dry-run']), 2)
+        with mock.patch('sys.stderr', err), mock.patch.object(self.build.osenv, 'is_mac', return_value=True):
+            self.assertEqual(self.build.main(['--dmg', '--server', '--dry-run']), 2)
+        out = io.StringIO()
+        with mock.patch('sys.stdout', out), mock.patch.object(self.build.osenv, 'is_mac', return_value=True):
+            self.assertEqual(self.build.main(['--dmg', '--dry-run']), 0)
+        self.assertIn('codesign', out.getvalue())
+        self.assertIn('hdiutil', out.getvalue())
 
     def test_desktop_entry(self):
         text = self.build.desktop_entry('/opt/KCS Talk/KCS Talk', '/opt/icon.png')
@@ -336,7 +430,7 @@ class LauncherTest(unittest.TestCase):
     def test_doctor_ok_here(self):
         lines = []
         self.assertEqual(self.kcs.doctor(out=lines.append), 0)
-        self.assertTrue(any('Pretendard 7/7' in line for line in lines))        # 300~900 일곱 굵기
+        self.assertTrue(any('Poppins · KoPub 돋움 5/5' in line for line in lines))   # 영문 2 + 한글 3
 
     def test_command_routing(self):
         calls = []

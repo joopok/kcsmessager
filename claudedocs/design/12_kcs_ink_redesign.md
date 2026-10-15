@@ -22,7 +22,9 @@ CI 네이비 #2A386C 고정. 그래서 "카카오톡 복제" 느낌을 벗고 **
 
 ## 서체
 
-Pretendard v1.3.9 정적 글꼴 300~900 일곱 굵기(Light · Regular · Medium · SemiBold · Bold · ExtraBold · Black, SIL OFL 1.1, `assets/fonts/`, 라이선스 `Pretendard-OFL.txt`, 2026-10-10 300 · 500 · 800 · 900 추가)를 앱 글꼴로 등록해 기본 글꼴로 가장 먼저 쓴다. 코드에서는 `theme.font(size, weight=300~900)`(Qt5 가 ExtraBold 파일을 Black 과 같은 굵기로 읽어 스타일 이름으로 고른다), QSS 에서는 `font-weight: 300~700`.
+앱 글꼴(2026-10-15, Pretendard 대체): 영문 · 숫자 · 기호는 **Poppins**(Indian Type Foundry, SIL OFL 1.1, Google Fonts 배포본, `assets/fonts/Poppins-OFL.txt`) — 영문은 **SemiBold** 한 굵기로 보이도록 SemiBold · Bold 두 파일만 넣어 300~600 은 SemiBold, 700~900 은 Bold 가 된다. 한글 · 한자는 **KoPub World 돋움**(Light · Medium · Bold, 한국출판인회의 무료 배포 · 임베딩 허용, `KoPubWorld-LICENSE.txt`). Poppins 에 한글이 없어 Qt 가 한글만 KoPub 돋움으로 내려 그린다(`osenv.ui_font_families()` 순서). 모두 TrueType 이라 Windows ClearType 힌팅이 그대로 살아 Pretendard(CFF OTF)보다 작은 글자가 또렷하다. 코드에서는 `theme.font(size, weight=300~900)`(글꼴마다 가장 가까운 굵기 파일), QSS 에서는 `font-weight: 300~700`.
+
+이전: Pretendard v1.3.9 정적 글꼴 300~900 일곱 굵기(2026-10-10 ~ 10-14) → JetBrains Mono 파생 KCS Talk Mono(2026-10-15 오전, 같은 날 Poppins 로 교체).
 
 입력 컨트롤(2026-10-10): 콤보박스 화살표 칸과 시간 · 날짜 · 숫자 칸의 위아래 단추는 테두리 없는 쉐브론(`widgets.input_controls_qss()`, 앱 전역). 콤보 목록은 칸을 덮지 않고 바로 아래 같은 너비로 열리며, 줄 높이 30px · 둥근 선택 줄 · 연한 테두리를 쓰고 macOS 진한 창 윤곽선은 끈다(`widgets.install_input_controls()`).
 
