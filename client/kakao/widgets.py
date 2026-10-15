@@ -309,6 +309,19 @@ class IconButton(QPushButton):
         self.setIconSize(QSize(self._icon_size, self._icon_size))
 
 
+# ---------------------------------------------------------------- 보이기/숨기기
+def set_shown(widget, shown):
+    """setVisible() 대신 쓴다 (2026-10-15). 부모가 아직 없는 위젯(레이아웃에 넣기 전, 생성자 안)에 setVisible(True) 를
+    부르면 Qt 가 그 위젯을 최상위 창으로 띄워 Windows 에서 작은 창들이 번쩍였다가 사라진다(친구 목록 상태메시지 칩 ·
+    안 읽은 배지 · 조직도 인원 알약). 부모가 없으면 숨기기만 바로 적용하고, 보이기는 '명시적 숨김' 표시만 지워
+    레이아웃에 들어가 부모가 보일 때 함께 보이게 둔다."""
+    if shown and widget.parent() is None:
+        if widget.testAttribute(Qt.WA_WState_ExplicitShowHide):
+            widget.setAttribute(Qt.WA_WState_ExplicitShowHide, False)   # 새로 만든 위젯과 같은 상태로 되돌린다
+        return
+    widget.setVisible(shown)
+
+
 # ---------------------------------------------------------------- 줄바꿈 배치 (칩 목록)
 class FlowWidget(QWidget):
     """자식 위젯을 줄바꿈하며 배치하는 간단한 흐름 레이아웃"""
@@ -846,7 +859,7 @@ class Badge(QWidget):
         h = theme.px(18)
         w = max(h, theme.px(8) * len(self.text) + theme.px(10))
         self.setFixedSize(w, h)
-        self.setVisible(self.count > 0)
+        set_shown(self, self.count > 0)   # 생성자에서 setVisible(True) 를 부르면 최상위 창으로 번쩍인다
         self.update()
 
     def paintEvent(self, event):

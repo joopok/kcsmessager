@@ -65,7 +65,7 @@ def doctor(_args=None, out=print):
     from client.kakao.theme import BUNDLED_FONTS
     fonts = [f for f in BUNDLED_FONTS if os.path.exists(osenv.resource_path('assets', 'fonts', f))]
     total = len(BUNDLED_FONTS)
-    out(f"  {'✓' if len(fonts) == total else '✗'} 앱 글꼴 Pretendard {len(fonts)}/{total} (300~900)")
+    out(f"  {'✓' if len(fonts) == total else '✗'} 앱 글꼴 Poppins · KoPub 돋움 {len(fonts)}/{total}")
     ok = ok and len(fonts) == total
     home = osenv.app_home()
     try:

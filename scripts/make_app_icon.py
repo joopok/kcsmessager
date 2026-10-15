@@ -5,7 +5,7 @@ KCS Talk 앱 아이콘 생성 - client/kakao/brand.paint_app_icon 으로 그려�
 출력:
   assets/icon/app_icon_{16..1024}.png   크기별 PNG
   assets/icon.ico                       Windows exe 아이콘 (kakaotalk_launcher_windows.spec 가 사용)
-  assets/icon.icns                      macOS 앱 아이콘 (iconutil 이 있을 때)
+  assets/icon.icns                      macOS 앱 아이콘 (iconutil 이 없으면 Pillow 로)
 
 사용: python scripts/make_app_icon.py
 """
@@ -58,8 +58,13 @@ def main():
     frames[-1].save(ico, format='ICO', sizes=[(s, s) for s in ICO_SIZES], append_images=frames[:-1])
     print(f'ICO → {os.path.relpath(ico, ROOT)}')
 
-    if shutil.which('iconutil'):
-        icns = os.path.join(ROOT, 'assets', 'icon.icns')
+    icns = os.path.join(ROOT, 'assets', 'icon.icns')
+    if not shutil.which('iconutil'):
+        # macOS 가 아니면 Pillow 로 ICNS 를 쓴다 (16~1024 전 크기, PNG 압축)
+        Image.open(paths[1024]).convert('RGBA').save(icns, format='ICNS', append_images=[
+            Image.open(paths[s]).convert('RGBA') for s in (16, 32, 64, 128, 256, 512)])
+        print(f'ICNS (Pillow) → {os.path.relpath(icns, ROOT)}')
+    else:
         with tempfile.TemporaryDirectory() as tmp:
             iconset = os.path.join(tmp, 'app.iconset')
             os.makedirs(iconset)

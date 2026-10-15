@@ -19,7 +19,7 @@ from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QLi
 from client.kakao import theme
 from client.kakao.state import parse_dt, BOT_NAME
 from client.kakao.widgets import (IconButton, Avatar, Badge, make_icon, avatar_pixmap, underline_tabs_qss,
-                                  check_box_qss)
+                                  check_box_qss, set_shown)
 
 
 # ================================================================ 공용 위젯
@@ -97,7 +97,7 @@ class StatusPill(QWidget):
         fm = QFontMetrics(self._font())
         self.setFixedHeight(fm.height() + theme.px(10))
         self.setMaximumWidth(theme.px(170))
-        self.setVisible(bool(self._text))
+        set_shown(self, bool(self._text))   # 부모 없는 상태에서 setVisible(True) 는 최상위 창으로 번쩍인다
         self.updateGeometry()
         self.update()
 

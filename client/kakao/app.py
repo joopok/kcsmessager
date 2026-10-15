@@ -78,7 +78,7 @@ def self_check(out=print):
     checks = [
         ('OS', True, f'{osenv.os_label()} ({osenv.current()})'),
         ('글꼴 폴더', os.path.isdir(theme.FONT_DIR), theme.FONT_DIR),
-        ('Pretendard 등록', 'Pretendard' in families, ', '.join(families[:3])),
+        ('앱 글꼴 등록 (Poppins · KoPub 돋움)', theme.bundled_fonts_ready(), ', '.join(families[:3])),
         ('회사 로고', brand.has_logo(), brand.BRAND_DIR),
         ('데이터 폴더', os.access(os.path.dirname(osenv.app_home()) or '.', os.W_OK), osenv.app_home()),
     ]

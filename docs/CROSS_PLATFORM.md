@@ -99,8 +99,8 @@ Gatekeeper는 브라우저 · 메일 · 메신저로 받은 파일(다운로드 
 
 | 항목 | 처리 |
 |---|---|
-| 화면 모양 | Qt `Fusion` 스타일 + 앱에 든 Pretendard 글꼴 → 세 OS 같은 모양 |
-| 한글 글꼴 예비 순서 | Pretendard → macOS Apple SD Gothic Neo / Windows 맑은 고딕 / Linux Noto Sans CJK KR |
+| 화면 모양 | Qt `Fusion` 스타일 + 앱에 든 글꼴(영문 · 숫자 Poppins SemiBold, 한글 KoPub 돋움) → 세 OS 같은 모양 |
+| 한글 글꼴 예비 순서 | Poppins → KoPub 돋움 → macOS Apple SD Gothic Neo / Windows 맑은 고딕 / Linux Noto Sans CJK KR |
 | 이모지 | macOS Apple Color Emoji / Windows Segoe UI Emoji / Linux Noto Color Emoji |
 | 사용자 데이터 | 모든 OS `~/.kcs_messenger` (예전 설치와 같은 폴더). `KCS_MESSENGER_HOME`으로 바꿀 수 있음 |
 | 다운로드 · 문서 · 사진 폴더 | OS가 알려 주는 위치 (한글 이름 폴더 포함), 없으면 홈 |
@@ -109,7 +109,7 @@ Gatekeeper는 브라우저 · 메일 · 메신저로 받은 파일(다운로드 
 | 앱 이름 표시 | macOS: Dock · 메뉴 막대 이름 (소스 실행은 데이터 폴더의 `KCS Talk.app` 번들에서 다시 실행) / Windows: 작업 표시줄 묶음(AppUserModelID) / Linux: `.desktop` 연결 |
 | 받은 파일 이름 | 다른 OS에서 온 이름도 저장되게 `osenv.safe_filename` (Windows 금지 글자 `: * ? " < > \|` → `_`, CON · NUL 같은 예약 이름 피하기, 경로 떼기) |
 | 비밀 파일 권한 | macOS · Linux 600, Windows는 사용자 프로필 폴더 권한 |
-| 다시 실행(로그아웃) | 소스 실행이면 파이썬 + 스크립트, 빌드한 앱이면 실행 파일 그대로 |
+| 다시 실행(로그아웃) | 소스 실행이면 파이썬 + 스크립트, 빌드한 앱이면 실행 파일 그대로. 단일 실행파일(onefile)은 `PYINSTALLER_RESET_ENVIRONMENT=1` 로 새 인스턴스가 자기 임시 폴더를 따로 풀게 한다(안 그러면 원래 인스턴스가 끝날 때 임시 폴더가 지워져 `base_library.zip 없음` 으로 죽는다) |
 
 ## 5. 개발 규칙
 

@@ -1141,13 +1141,16 @@ class FriendsTab(QWidget):
                   and u['username'] not in team]
         social = bool(self.settings and self.settings.get('social_features'))
         birthdays = [u['username'] for u in state.birthday_friends() if self._matches(u, query)] if social else []
+        # '온라인' 은 지금 접속해 있는 모든 친구 (내 부서 · 즐겨찾기 · 내가 추가한 친구에도 있는 사람 포함 - 헤더의
+        # '온라인 n명' 과 같은 사람들). 2026-10-15 전에는 다른 구역에 든 사람을 빼서 같은 부서 동료가 접속해도
+        # '온라인' 에 보이지 않았다. '오프라인' 은 다른 구역에 없는 사람만
         return {
             'bot': bots,
             'team': team,
             'birthday': birthdays,
             'favorites': favorites,
             'registered': registered,
-            'online': [u['username'] for u in others if presence_of(state, u['username']) != 'offline'],
+            'online': [u['username'] for u in friends if presence_of(state, u['username']) != 'offline'],
             'offline': [u['username'] for u in others if presence_of(state, u['username']) == 'offline'],
         }
 

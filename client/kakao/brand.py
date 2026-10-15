@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 회사 CI(㈜케이씨에스) 로고 - assets/brand/ci_horizontal.png, ci_vertical.png
+(2026-10-15: CI 원본 ci_horizontal.ai · ci_vertical.ai 를 288dpi(4배)로 렌더한 투명 PNG 2079x649 · 1647x921.
+ 예전 521x163 · 413x231 팔레트 PNG 는 큰 로고(로그인 · 배경)에서 뭉개졌다)
 - logo_pixmap('horizontal'|'vertical'|'mark', height, color): 원본/단색(흰색 등) 버전, HiDPI
 - app_icon_pixmap(size): 네이비 둥근 사각형 + 흰 말풍선 안 KCS 마크 (창·트레이·exe 아이콘)
 - paint_app_icon(painter, size): 같은 아이콘을 임의 크기로 그리기 (scripts/make_app_icon.py)
@@ -19,8 +21,9 @@ from client.kakao import osenv  # noqa: E402
 ROOT = osenv.ROOT
 BRAND_DIR = osenv.resource_path('assets', 'brand')   # 빌드한 앱에서도 찾도록
 COMPANY_NAME = '(주)케이씨에스'
-# 세로형 로고에서 'KCS' 심볼 마크가 차지하는 영역(원본 413x231 기준, 가로형보다 2배 해상도)
-MARK_RECT = QRect(76, 27, 248, 123)
+# 세로형 로고에서 'KCS' 심볼 마크가 차지하는 영역 - 그림 크기에 대한 비율 (x, y, w, h). 해상도가 바뀌어도 같은 자리
+MARK_FRACTION = (76 / 413, 27 / 231, 248 / 413, 123 / 231)
+TRIM_SCAN_WIDTH = 260   # 투명 여백을 찾을 때 이 너비로 줄여 훑는다 (4배 PNG 를 픽셀마다 읽으면 수 초 걸린다)
 
 _cache = {}
 
@@ -31,25 +34,35 @@ def _source(kind):
         name = 'ci_vertical.png' if kind in ('vertical', 'mark') else 'ci_horizontal.png'
         img = QImage(os.path.join(BRAND_DIR, name))
         if not img.isNull() and kind == 'mark':
-            img = img.copy(MARK_RECT)
+            img = img.copy(mark_rect(img))
         if not img.isNull():
             img = _trim(img.convertToFormat(QImage.Format_ARGB32))
         _cache[key] = img
     return _cache[key]
 
 
+def mark_rect(img):
+    """세로형 로고 그림에서 심볼 마크 영역"""
+    fx, fy, fw, fh = MARK_FRACTION
+    return QRect(round(img.width() * fx), round(img.height() * fy), round(img.width() * fw), round(img.height() * fh))
+
+
 def _trim(img):
-    """투명 여백 제거"""
+    """투명 여백 제거. 큰 그림은 TRIM_SCAN_WIDTH 로 줄인 사본에서 경계를 찾고 원본 좌표로 되돌린다(축소 단위만큼 여유)"""
     w, h = img.width(), img.height()
+    step = max(1, -(-w // TRIM_SCAN_WIDTH))   # 올림 나눗셈: 축소 배율
+    probe = img if step == 1 else img.scaled(-(-w // step), -(-h // step), Qt.IgnoreAspectRatio, Qt.FastTransformation)
     xs, ys = [], []
-    for y in range(0, h, 1):
-        for x in range(0, w, 2):
-            if img.pixelColor(x, y).alpha() > 24:
+    for y in range(probe.height()):
+        for x in range(probe.width()):
+            if probe.pixelColor(x, y).alpha() > 24:
                 xs.append(x)
                 ys.append(y)
     if not xs:
         return img
-    return img.copy(QRect(min(xs), min(ys), max(xs) - min(xs) + 2, max(ys) - min(ys) + 1))
+    x0, y0 = max(0, min(xs) * step - step), max(0, min(ys) * step - step)
+    x1, y1 = min(w, (max(xs) + 2) * step), min(h, (max(ys) + 2) * step)
+    return img.copy(QRect(x0, y0, x1 - x0, y1 - y0))
 
 
 def has_logo():

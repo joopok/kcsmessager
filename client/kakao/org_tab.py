@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel, QMenu, Q
                              QPushButton)
 
 from client.kakao import theme
-from client.kakao.widgets import Avatar
+from client.kakao.widgets import Avatar, set_shown
 from client.kakao.chats_tab import (ElidedLabel, RowList, TabHeader, make_search_edit, search_box_qss, InviteToRoomDialog,
                                     user_pixmap, presence_of, connect_avatar_changed, PRESENCE_LABELS,
                                     PRESENCE_COLORS)
@@ -119,7 +119,7 @@ def count_pill(text):
     label.setStyleSheet(f"color: {theme.c('text_sub')}; background: {theme.c('bg_alt')}; border-radius: 8px;"
                         f" padding: 1px 7px; font-size: {theme.fs('meta')}px; font-weight: bold;")
     label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-    label.setVisible(bool(text))
+    set_shown(label, bool(text))   # 부모 없는 상태에서 setVisible(True) 는 최상위 창으로 번쩍인다
     return label
 
 

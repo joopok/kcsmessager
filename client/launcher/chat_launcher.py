@@ -58,8 +58,10 @@ class ChatLauncher(QMainWindow):
         if not logo_pixmap.isNull():
             logo = QLabel()
             ratio = self.devicePixelRatioF()
-            # PNG 위아래 투명 여백이 커서(로고는 높이의 약 1/3) 넉넉히 키운 뒤 여백을 잘라낸다
-            logo_pixmap = logo_pixmap.copy(0, 40, logo_pixmap.width(), 80)
+            # PNG 위아래 투명 여백이 커서(로고는 높이의 약 1/3, 전체 높이의 25%~74% 띠) 그 띠만 잘라 쓴다.
+            # 그림 해상도가 바뀌어도(2026-10-15 4배 렌더) 같은 자리를 자르도록 비율로 계산한다
+            h = logo_pixmap.height()
+            logo_pixmap = logo_pixmap.copy(0, round(h * 40 / 163), logo_pixmap.width(), round(h * 80 / 163))
             scaled = logo_pixmap.scaledToHeight(int(48 * ratio), Qt.SmoothTransformation)
             scaled.setDevicePixelRatio(ratio)
             logo.setPixmap(scaled)
