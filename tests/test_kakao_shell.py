@@ -316,6 +316,7 @@ class FriendsTabTests(ShellTestBase):
 
     def test_bot_section_on_top(self):
         add_org(self.state, self.conn)
+        self.tab._users_relay.flush()        # 연달아 온 구성원 변경은 묶어서 한 번 더 그린다
         self.assertEqual(self.tab.section_members('bot'), ['AI 비서'])
         data = rows(self.tab.list)
         self.assertEqual(data[1], ('section', 'bot'))
@@ -324,6 +325,7 @@ class FriendsTabTests(ShellTestBase):
 
     def test_company_chip_for_other_company(self):
         add_org(self.state, self.conn)
+        self.tab._users_relay.flush()
         widgets = {}
         for i in range(self.tab.list.count()):
             w = self.tab.list.itemWidget(self.tab.list.item(i))
@@ -657,10 +659,10 @@ class ChatFolderTests(ShellTestBase):
 
     def test_chips_match_folders(self):
         self.assertEqual([c.folder for c in self.tab.folder_bar.chips], ['전체', '안읽음', '즐겨찾기', '통화'])
-        self.assertEqual(self.tab.folder_bar.labels(), ['전체', '안읽음 2', '즐겨찾기 0', '통화'])
+        self.assertEqual(self.tab.folder_bar.labels(), ['전체', '안읽음 2', '즐겨찾기', '통화'])
         self.assertTrue(self.tab.folder_bar.chip('전체').isChecked())
         self.assertIsNone(self.state.save_chat_folder('회사', ['r1']))
-        self.assertEqual(self.tab.folder_bar.labels(), ['전체', '안읽음 2', '즐겨찾기 0', '통화', '회사 1'])
+        self.assertEqual(self.tab.folder_bar.labels(), ['전체', '안읽음 2', '즐겨찾기', '통화', '회사 1'])
 
     def test_select_unread_and_favorites(self):
         self.tab.folder_bar.chip('안읽음').click()
@@ -965,7 +967,7 @@ class DialogTests(ShellTestBase):
             self.assertIn('이메일과 비밀번호만으로', dlg.register_hint.text())
             dlg.reg_name_edit.setText('도승현')
             dlg.reg_email_edit.setText('do@kcs.test')
-            dlg.reg_password_edit.setText('pw1234')
+            dlg.reg_password_edit.setText('pw123456')                    # 새 비밀번호는 8자 이상
             self.assertFalse(dlg.login_button.isEnabled())               # 소속 회사는 반드시 선택
             dlg.accept()
             self.assertNotEqual(dlg.result(), LoginDialog.Accepted)
@@ -983,7 +985,7 @@ class DialogTests(ShellTestBase):
             dlg.accept()
             self.assertEqual(dlg.result(), LoginDialog.Accepted)
             self.assertEqual(dlg.registration(), {'company': 'KCS 물류', 'name': '도승현',
-                                                  'email': 'do@kcs.test', 'password': 'pw1234'})   # 사번은 보내지 않는다
+                                                  'email': 'do@kcs.test', 'password': 'pw123456'})   # 사번은 보내지 않는다
             self.assertEqual(dlg.values()[0], 'do@kcs.test')             # 다음부터의 로그인 아이디 = 이메일
             self.assertEqual(dlg.saved_token(), '')
             # 등록이 거절돼 다시 띄운 창은 입력값 그대로 등록 화면
@@ -1169,7 +1171,7 @@ class DialogTests(ShellTestBase):
             self.assertEqual(dlg.login_button.text(), '비밀번호 바꾸기')
             self.assertFalse(dlg.login_button.isEnabled())
             dlg.reset_email_edit.setText('not-email')
-            dlg.reset_password_edit.setText('new-pw')
+            dlg.reset_password_edit.setText('new-pw-12')
             self.assertFalse(dlg.login_button.isEnabled())                       # 재설정 코드가 있어야
             dlg.reset_code_edit.setText('ABCD-EF23')
             self.assertTrue(dlg.login_button.isEnabled())
@@ -1179,7 +1181,7 @@ class DialogTests(ShellTestBase):
             dlg.reset_email_edit.setText('kms@kcs.test')
             self.assertEqual(dlg.reset_password_edit.echoMode(), QLineEdit.Password)   # 눈 아이콘 있는 칸
             dlg.accept()
-            reset.assert_called_once_with('10.0.0.9', 6000, 'kms', 'kms@kcs.test', 'new-pw', code='ABCD-EF23')
+            reset.assert_called_once_with('10.0.0.9', 6000, 'kms', 'kms@kcs.test', 'new-pw-12', code='ABCD-EF23')
             self.assertEqual(dlg.reset_code_edit.text(), '')                      # 쓴 코드는 지운다
             self.assertEqual(dlg._mode, 'login')                                  # 로그인 화면으로 돌아옴
             self.assertEqual((dlg.name_edit.text(), dlg.password_edit.text()), ('kms', ''))
@@ -1190,7 +1192,7 @@ class DialogTests(ShellTestBase):
             dlg.set_mode('reset')
             dlg.reset_code_edit.setText('ABCD-EF23')
             dlg.reset_email_edit.setText('x@kcs.test')
-            dlg.reset_password_edit.setText('new-pw')
+            dlg.reset_password_edit.setText('new-pw-12')
             dlg.accept()
             self.assertTrue(dlg.is_reset())
             self.assertEqual(dlg.error_label.property('tone'), 'error')

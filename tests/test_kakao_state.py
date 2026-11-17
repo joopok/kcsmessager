@@ -133,7 +133,7 @@ class AppStateTest(unittest.TestCase):
         d = tempfile.mkdtemp()
         small = os.path.join(d, '사진.png')
         with open(small, 'wb') as f:
-            f.write(b'\x89PNG' + b'0' * 100)
+            f.write(b'\x89PNG\r\n\x1a\n' + b'0' * 100)          # 사진인지는 내용 머리말로 본다
         self.assertIsNone(s.send_file('r1', small))
         p = self.conn.last('send')
         self.assertEqual(p['kind'], 'image')

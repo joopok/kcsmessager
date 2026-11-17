@@ -430,6 +430,45 @@ class _AvatarRelay(QObject):
             self._slot()
 
 
+class _BurstRelay(QObject):
+    """목록을 통째로 다시 만드는 slot 앞에 둔다: 첫 알림은 바로 부르고, 이어서 WINDOW_MS 안에 몰려오는 알림은
+    모아 두었다가 끝에 한 번만 더 부른다 (출근 시간처럼 접속 상태가 줄줄이 바뀔 때 목록을 매번 다시 만들지 않게).
+    주인(parent)이 사라지면 함께 사라진다"""
+
+    WINDOW_MS = 150
+
+    def __init__(self, slot, parent=None):
+        super().__init__(parent)
+        self._slot = slot
+        self._pending = False
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(self.WINDOW_MS)
+        self._timer.timeout.connect(self.flush)
+
+    @pyqtSlot()
+    def fire(self):
+        if self._timer.isActive():
+            self._pending = True
+            return
+        self._timer.start()
+        self._slot()
+
+    def flush(self):
+        """모아 둔 갱신이 있으면 지금 (타이머 · 테스트용)"""
+        if self._pending:
+            self._pending = False
+            self._timer.start()
+            self._slot()
+
+
+def connect_users_changed(state, slot):
+    """구성원 정보 · 접속 상태가 바뀌면 slot() - 몰려오는 변경은 _BurstRelay 로 묶는다. 묶는 객체를 돌려준다"""
+    relay = _BurstRelay(slot, getattr(slot, '__self__', None))
+    state.users_changed.connect(relay.fire)
+    return relay
+
+
 def connect_avatar_changed(state, slot):
     sig = getattr(state, 'avatar_changed', None)
     if sig is None:
@@ -632,8 +671,9 @@ FOLDER_ALL = '전체'
 
 
 def folder_chip_label(name, count):
-    """'전체'는 개수 없이, 나머지는 '이름 N' (안읽음은 안 읽은 채팅방 수, 통화는 부재중이 있을 때만 그 수)"""
-    if name == FOLDER_ALL or (name == '통화' and not count):
+    """'전체'는 개수 없이, 나머지는 '이름 N' (안읽음은 안 읽은 채팅방 수, 통화는 부재중이 있을 때만 그 수).
+    0 은 쓰지 않는다 - '즐겨찾기 0' 같은 빈 숫자는 정보가 아니라 잡음 (2026-11-13)"""
+    if name == FOLDER_ALL or not count:
         return name
     return f'{name} {count}'
 
@@ -764,9 +804,8 @@ def sparkle_path(cx, cy, r):
 
 
 def ai_icon_color():
-    """어두운 강조색(브랜드 네이비 등)이면 강조색, 밝은 강조색(카카오 옐로)이면 보조 글자색"""
-    accent = QColor(theme.c('yellow'))
-    return theme.c('yellow') if accent.lightness() < 170 else theme.c('text_sub')
+    """헤더의 다른 아이콘(검색 · 새 채팅 · 더보기)과 같은 보조 글자색. 강조색은 주 동작과 선택에만 쓴다 (2026-11-13)"""
+    return theme.c('text_sub')
 
 
 def make_ai_icon(size=22, color=None):
@@ -897,6 +936,7 @@ class OpenRoomCard(QFrame):
         top = QHBoxLayout()
         top.setSpacing(6)
         self.name_label = QLabel(info.get('name') or '(이름 없음)')
+        self.name_label.setTextFormat(Qt.PlainText)
         self.name_label.setObjectName('cardTitle')
         top.addWidget(self.name_label, 1)
         self.count_label = QLabel(f"{int(info.get('member_count') or 0)}명")
@@ -910,6 +950,7 @@ class OpenRoomCard(QFrame):
         col.addWidget(self.desc_label)
         tags = info.get('tags') or []
         self.tags_label = QLabel('  '.join(f'#{t}' for t in tags))
+        self.tags_label.setTextFormat(Qt.PlainText)
         self.tags_label.setObjectName('cardTags')
         self.tags_label.setVisible(bool(tags))
         col.addWidget(self.tags_label)
@@ -1171,7 +1212,7 @@ class ChatsTab(QWidget):
         self._fresh_row = None   # (room_id, 방 스냅샷): room_changed 로 막 새로 만든 행
         state.rooms_changed.connect(self._on_rooms_changed)
         state.room_changed.connect(self._on_room_changed)
-        state.users_changed.connect(self.refresh)
+        self._users_relay = connect_users_changed(state, self.refresh)
         state.call_history_changed.connect(self.refresh)
         settings.changed.connect(self._on_setting)
         connect_avatar_changed(state, self.refresh)
@@ -1640,6 +1681,7 @@ class InviteToRoomDialog(QDialog):
         layout.setContentsMargins(18, 18, 18, 16)
         layout.setSpacing(10)
         title = QLabel(f"{state.display_name(username)}님을 초대할 채팅방")
+        title.setTextFormat(Qt.PlainText)
         title.setWordWrap(True)
         title.setStyleSheet(f"font-size: {theme.fs('title')}px; font-weight: bold;")
         layout.addWidget(title)

@@ -13,10 +13,10 @@ from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel, QMenu, Q
                              QMessageBox, QFrame, QGridLayout, QAbstractButton, QScrollArea, QApplication)
 
 from client.kakao import theme
-from client.kakao.widgets import Avatar, make_icon
+from client.kakao.widgets import Avatar, make_icon, ContentScrollArea, fit_dialog_to_screen
 from client.kakao.chats_tab import (ElidedLabel, StatusPill, RowList, TabHeader, CreateGroupDialog,
                                     make_search_edit, search_box_qss, user_pixmap, InviteToRoomDialog, presence_of,
-                                    set_presence, foreign_company, CompanyChip, connect_avatar_changed,
+                                    set_presence, foreign_company, CompanyChip, connect_avatar_changed, connect_users_changed,
                                     presence_dot_pixmap, PRESENCE_CHOICES, PRESENCE_LABELS,
                                     PRESENCE_COLORS)
 
@@ -347,8 +347,13 @@ class ProfileEditDialog(QDialog):
         self.setWindowTitle('프로필 편집')
         self.setMinimumWidth(theme.px(400))
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 22, 24, 18)
+        # 본문은 스크롤 영역 안, 오류 문구 · 단추는 밖: 낮은 화면(노트북 · 확대 표시)에서도 [저장]이 화면 안에 남는다
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(24, 22, 24, 8)
         layout.setSpacing(12)
 
         # 맨 위: 사번 (로그인 아이디 - 보기만, 바꾸려면 관리자)
@@ -395,6 +400,9 @@ class ProfileEditDialog(QDialog):
         form.setVerticalSpacing(10)
         self.name_edit = QLineEdit(me.get('display_name') or state.me)
         self.name_edit.setMaxLength(20)
+        if not state.display_name_editable():      # 이름을 실명으로 고정한 서버: 보기만 한다
+            self.name_edit.setReadOnly(True)
+            self.name_edit.setToolTip('이름은 조직도에 등록된 이름으로 고정되어 바꿀 수 없습니다.')
         self.status_edit = QLineEdit(me.get('status_message') or '')
         self.status_edit.setMaxLength(60)
         self.status_edit.setPlaceholderText('상태메시지를 입력해 주세요')
@@ -422,6 +430,16 @@ class ProfileEditDialog(QDialog):
         self.email_edit.setMaxLength(120)
         form.addRow('전화번호', self.mobile_edit)
         form.addRow('이메일', self.email_edit)
+        # 서버가 이메일 변경을 막았으면(이메일이 로그인 아이디인 운영 서버) 보기만 하고 안내를 붙인다
+        self.email_hint = QLabel('이메일은 로그인 아이디라 직접 바꿀 수 없습니다. 관리자에게 변경을 요청해 주세요.')
+        self.email_hint.setWordWrap(True)
+        self.email_hint.setStyleSheet(f"color: {theme.c('text_hint')}; font-size: {theme.fs('caption')}px;")
+        email_locked = not state.email_editable()
+        self.email_edit.setReadOnly(email_locked)
+        if email_locked:
+            form.addRow('', self.email_hint)
+        else:
+            self.email_hint.hide()
         from client.kakao.deputies import DeputyEditor
         self.deputy_editor = DeputyEditor(state, me.get('deputies') or [])
         form.addRow('대직자', self.deputy_editor)
@@ -430,12 +448,16 @@ class ProfileEditDialog(QDialog):
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {theme.c('text_hint')}; font-size: {theme.fs('caption')}px;")
         layout.addWidget(hint)
+        outer.addWidget(ContentScrollArea(body), 1)
 
+        footer = QVBoxLayout()
+        footer.setContentsMargins(24, 4, 24, 18)
+        footer.setSpacing(12)
         self.error_label = QLabel('')
         self.error_label.setStyleSheet(f"color: {theme.c('danger_text')}; font-size: {theme.fs('meta')}px;")
         self.error_label.setWordWrap(True)
         self.error_label.hide()
-        layout.addWidget(self.error_label)
+        footer.addWidget(self.error_label)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
@@ -445,7 +467,8 @@ class ProfileEditDialog(QDialog):
         self.ok_button.setDefault(True)
         buttons.addWidget(cancel)
         buttons.addWidget(self.ok_button)
-        layout.addLayout(buttons)
+        footer.addLayout(buttons)
+        outer.addLayout(footer)
 
         cancel.clicked.connect(self.reject)
         self.ok_button.clicked.connect(self.accept)
@@ -453,6 +476,7 @@ class ProfileEditDialog(QDialog):
         self.clear_photo_button.clicked.connect(self.clear_photo)
         connect_avatar_changed(state, self._refresh_avatar)
         self._refresh_avatar()
+        fit_dialog_to_screen(self)
         if self.birthday_hint.isVisibleTo(self):
             self.birthday_edit.setFocus()
             QTimer.singleShot(0, self._caret_before_birthday)   # 창이 뜬 뒤 (포커스가 글자를 전체 선택하므로)
@@ -511,6 +535,8 @@ class ProfileEditDialog(QDialog):
         me = self.state.user(self.state.me)
         out = {}
         for key, edit in (('mobile', self.mobile_edit), ('email', self.email_edit)):
+            if edit.isReadOnly():           # 바꿀 수 없는 칸은 보내지 않는다
+                continue
             value = edit.text().strip()
             if value != (me.get(key) or ''):
                 out[key] = value
@@ -687,7 +713,7 @@ class AddFriendDialog(QDialog):
         org = self.state.org_text(user['username'])
         self.card_sub.setText(org or user.get('status_message') or '')
         self.card.show()
-        self._show_message('이미 친구로 등록되어 있어요.' if already else '친구로 추가했어요! 🎉')
+        self._show_message('이미 친구로 등록되어 있어요' if already else '친구로 추가했어요')
 
     def _on_error(self, text):
         if self.isVisible() or self.message.text() == '찾는 중…':
@@ -720,6 +746,7 @@ class ProfileDialog(QDialog):
         layout.addSpacing(6)
 
         name = QLabel(state.display_name(username))
+        name.setTextFormat(Qt.PlainText)
         name.setAlignment(Qt.AlignCenter)
         name.setStyleSheet(f"font-size: {theme.fs('headline')}px; font-weight: bold;")
         layout.addWidget(name)
@@ -738,6 +765,7 @@ class ProfileDialog(QDialog):
         layout.addWidget(info)
 
         status = QLabel(user.get('status_message') or '상태메시지가 없습니다')
+        status.setTextFormat(Qt.PlainText)
         status.setAlignment(Qt.AlignCenter)
         status.setWordWrap(True)
         status.setStyleSheet(f"color: {theme.c('text') if user.get('status_message') else theme.c('text_hint')};"
@@ -746,7 +774,7 @@ class ProfileDialog(QDialog):
 
         self.birthday_label = None
         if user.get('birthday'):
-            bday = self.birthday_label = QLabel(f"🎂 {birthday_text(user['birthday'])}")
+            bday = self.birthday_label = QLabel(birthday_text(user['birthday']))
             bday.setAlignment(Qt.AlignCenter)
             bday.setStyleSheet(f"color: {theme.c('text_sub')}; font-size: {theme.fs('meta')}px;")
             layout.addWidget(bday)
@@ -951,7 +979,7 @@ class FriendRow(QWidget):
             if text:
                 self.sub = ElidedLabel(text, 'meta', 'text_sub')
         elif kind == 'birthday':
-            self.sub = ElidedLabel('🎂 오늘 생일이에요', 'meta', 'text_sub')
+            self.sub = ElidedLabel('오늘 생일이에요', 'meta', 'text_sub')
         if self.sub is not None:
             sub_row.addWidget(self.sub, 1)
         else:
@@ -1108,8 +1136,7 @@ class FriendsTab(QWidget):
         self.list.itemClicked.connect(self._clicked)
         self.list.customContextMenuRequested.connect(self._show_context_menu)
 
-        state.users_changed.connect(self.refresh)
-        state.user_changed.connect(lambda _u: self.refresh())
+        self._users_relay = connect_users_changed(state, self.refresh)   # user_changed 는 늘 users_changed 와 함께 온다
         settings.changed.connect(self._on_setting)
         connect_avatar_changed(state, self.refresh)
         self.apply_theme()

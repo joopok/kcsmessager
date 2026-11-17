@@ -8,6 +8,7 @@
 """
 
 import base64
+import hashlib
 import json
 import os
 
@@ -93,3 +94,61 @@ class SecretKeyring:
             return json.loads(plain.decode('utf-8')).get('text', '')
         except (InvalidTag, ValueError, TypeError, KeyError):
             return None
+
+
+def fingerprint(key_a_b64, key_b_b64):
+    """두 사람의 공개키로 만든 확인 번호 (5자리 × 6묶음). 두 사람 화면에 같은 번호가 보이고, 어느 한쪽 키가 바뀌면 달라진다.
+    전화처럼 메신저 밖의 방법으로 서로 읽어 맞춰 보는 용도"""
+    first, second = sorted([base64.b64decode(key_a_b64), base64.b64decode(key_b_b64)])
+    digest = hashlib.sha256(b'kcs-secret-check-v1' + first + second).digest()
+    number = str(int.from_bytes(digest, 'big') % 10 ** 30).zfill(30)
+    return ' '.join(number[i:i + 5] for i in range(0, 30, 5))
+
+
+class PeerKeys:
+    """상대 공개키 기억 (이 PC, keys/<username>.peers.json).
+    처음 본 키는 그대로 믿고, 그 뒤 서버가 다른 키를 알려 주면 사용자가 확인할 때까지 그 키로 보내지 않는다.
+    확인했던 예전 키도 남겨 두어 그 키로 받은 지난 메시지를 계속 읽는다"""
+
+    def __init__(self, username, directory=None):
+        self.path = os.path.join(directory or key_dir(), f'{username}.peers.json')
+        self._keys = self._load()          # {상대: [예전에 믿은 키 …, 지금 믿는 키]}
+
+    def _load(self):
+        try:
+            with open(self.path, encoding='utf-8') as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(peer): [k for k in keys if isinstance(k, str) and k]
+                for peer, keys in data.items() if isinstance(keys, list)}
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + '.tmp'
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(self._keys, f, ensure_ascii=False)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass                           # 저장하지 못해도 이번 실행 동안은 기억한다
+
+    def trusted(self, peer):
+        """믿는 키들 (오래된 것부터, 마지막이 지금 믿는 키)"""
+        return list(self._keys.get(peer) or [])
+
+    def status(self, peer, key_b64):
+        """'new' (처음 보는 상대) / 'same' (지금 믿는 키) / 'changed' (믿는 키와 다르다)"""
+        keys = self._keys.get(peer)
+        if not keys:
+            return 'new'
+        return 'same' if keys[-1] == key_b64 else 'changed'
+
+    def remember(self, peer, key_b64):
+        """이 키를 지금 믿는 키로 (예전 키는 읽기용으로 남긴다)"""
+        keys = [k for k in self._keys.get(peer) or [] if k != key_b64]
+        self._keys[peer] = keys[-9:] + [key_b64]
+        self._save()

@@ -4,13 +4,15 @@
 아이콘은 24x24 좌표계의 선(stroke) 아이콘이며 어떤 크기·색상으로도 렌더링된다.
 """
 
+import gc
 import hashlib
 import math
 
-from PyQt5.QtCore import Qt, QRectF, QPoint, QPointF, QSize, QEvent, QObject, QTimer, pyqtSignal
-from PyQt5.QtGui import (QPainter, QPainterPath, QPen, QColor, QIcon, QPixmap, QBrush, QLinearGradient)
+from PyQt5.QtCore import (Qt, QRectF, QPoint, QPointF, QSize, QEvent, QObject, QTimer, QBuffer, QByteArray, QIODevice,
+                          pyqtSignal)
+from PyQt5.QtGui import (QPainter, QPainterPath, QPen, QColor, QIcon, QPixmap, QBrush, QLinearGradient, QImageReader)
 from PyQt5.QtWidgets import (QWidget, QPushButton, QLabel, QSizePolicy, QAbstractButton, QComboBox,
-                             QStyledItemDelegate, QDialog, QApplication)
+                             QStyledItemDelegate, QDialog, QApplication, QScrollArea, QFrame, QStyle)
 
 from client.kakao import theme
 
@@ -215,6 +217,26 @@ def _icon_path(name):
         p.cubicTo(9, 3, 5, 6, 8.5, 9)
         p.moveTo(12, 9)
         p.cubicTo(15, 3, 19, 6, 15.5, 9)
+    elif name == 'cake':
+        # 생일: 케이크 몸통 + 크림 물결 + 초 + 불꽃 (이모지 🎂 대신, 2026-11-13)
+        p.addRoundedRect(QRectF(4.5, 11.5, 15, 9), 2, 2)
+        p.moveTo(4.5, 15.5)
+        p.quadTo(8.25, 17.5, 12, 15.5)
+        p.quadTo(15.75, 13.5, 19.5, 15.5)
+        p.moveTo(12, 11.5)
+        p.lineTo(12, 8)
+        p.moveTo(12, 3.5)
+        p.cubicTo(13.4, 4.9, 13.4, 6.2, 12, 6.2)
+        p.cubicTo(10.6, 6.2, 10.6, 4.9, 12, 3.5)
+    elif name == 'location':
+        # 장소: 물방울 핀 + 가운데 원 (이모지 📍 대신, 2026-11-13)
+        p.moveTo(12, 21)
+        p.cubicTo(8, 16.5, 5.5, 13, 5.5, 9.5)
+        p.cubicTo(5.5, 5.9, 8.4, 3, 12, 3)
+        p.cubicTo(15.6, 3, 18.5, 5.9, 18.5, 9.5)
+        p.cubicTo(18.5, 13, 16, 16.5, 12, 21)
+        p.closeSubpath()
+        p.addEllipse(QRectF(9.5, 7, 5, 5))
     elif name == 'star':
         for i in range(10):
             r = 9 if i % 2 == 0 else 4
@@ -389,6 +411,135 @@ def install_focus_visible(app):
         return
     app._focus_visible_filter = FocusVisibleFilter(app)
     app.installEventFilter(app._focus_visible_filter)
+
+
+# ---------------------------------------------------------------- 받은 글자는 서식으로 해석하지 않는다
+def plain(label):
+    """라벨을 일반 글자 전용으로 - 이름 · 상태메시지 · 방 이름 · 파일 이름에 꺾쇠가 있어도 글자 그대로 보인다.
+    라벨을 그대로 돌려준다: name = plain(QLabel(text))"""
+    label.setTextFormat(Qt.PlainText)
+    return label
+
+
+class TextGuard(QObject):
+    """앱의 모든 라벨 · 툴팁 · 알림 상자 글자는 기본이 일반 글자다.
+    Qt 라벨은 글자가 서식처럼 생겼으면 알아서 서식으로 해석하는데(자동 판별), 화면에 처음 그려지기 전에 그 자동 판별을 끈다.
+    서식이 필요한 라벨은 setTextFormat(Qt.RichText) 로 직접 밝히고, 넣는 글자는 html.escape 로 감싼다.
+    툴팁(Qt 가 라벨로 그린다) · QMessageBox · QInputDialog 안의 라벨도 같은 규칙을 따른다"""
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Polish and isinstance(obj, QLabel) and obj.textFormat() == Qt.AutoText:
+            obj.setTextFormat(Qt.PlainText)
+        return False
+
+
+def install_text_guard(app):
+    """앱 전체에 한 번만 설치 (다시 불러도 그대로)"""
+    if app is None or getattr(app, '_text_guard', None) is not None:
+        return
+    app._text_guard = TextGuard(app)
+    app.installEventFilter(app._text_guard)
+
+
+# ---------------------------------------------------------------- 메모리 정리(GC)는 화면 스레드에서만
+class SafeGarbageCollector(QObject):
+    """파이썬의 순환 참조 정리(GC)를 화면 스레드의 이벤트와 이벤트 사이에서만 돌린다.
+    자동 GC 는 객체를 만드는 아무 순간에 돈다 - 읽기 · 쓰기 스레드 안에서, 또는 Qt 가 위젯을 다루는 도중(이벤트 필터 ·
+    스타일 다시 입히기)에. 그때 부모 없는 Qt 위젯이 함께 지워지면 앱이 죽는다 (가끔만 나서 찾기 어려운 종료).
+    그래서 자동 GC 를 끄고, 타이머가 울릴 때(= 이벤트 처리 사이) 여기서 대신 돌린다. 참조 수가 0 이 되어 바로 지워지는
+    대부분의 객체는 전과 같다"""
+
+    INTERVAL_MS = 2000
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.thresholds = gc.get_threshold()
+        gc.disable()
+        self.timer = QTimer(self)
+        self.timer.setInterval(self.INTERVAL_MS)
+        self.timer.timeout.connect(self.collect)
+        self.timer.start()
+
+    def collect(self, force=False):
+        """쌓인 만큼만 정리 (자동 GC 와 같은 기준). force=True 면 전부"""
+        if force:
+            gc.collect()
+            return
+        counts = gc.get_count()
+        for generation in (2, 1, 0):
+            if counts[generation] > self.thresholds[generation]:
+                gc.collect(generation)
+                return
+
+
+def install_safe_gc(app):
+    """앱 전체에 한 번만 설치 (다시 불러도 그대로)"""
+    if app is None or getattr(app, '_safe_gc', None) is not None:
+        return
+    app._safe_gc = SafeGarbageCollector(app)
+
+
+# ---------------------------------------------------------------- 세로로 긴 대화상자
+class ContentScrollArea(QScrollArea):
+    """내용 크기를 그대로 권장 크기로 내놓는 스크롤 영역 (세로로 긴 대화상자의 본문용).
+    화면이 넉넉하면 스크롤 없이 다 보이고, 창이 내용보다 작아질 때만 본문이 스크롤된다 - 단추는 영역 밖에 둔다"""
+
+    def __init__(self, content, parent=None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setWidget(content)
+        self.viewport().setAutoFillBackground(False)     # 대화상자 바탕색이 그대로 보이게
+        content.setAutoFillBackground(False)
+
+    def sizeHint(self):
+        return self.widget().sizeHint()
+
+    def minimumSizeHint(self):
+        hint = self.widget().minimumSizeHint()
+        return QSize(hint.width(), min(hint.height(), theme.px(160)))
+
+
+def fit_dialog_to_screen(dialog):
+    """대화상자를 내용이 다 보이는 크기로 하되 화면보다 크지 않게 (넘치는 본문은 ContentScrollArea 가 스크롤한다)"""
+    hint = dialog.sizeHint()
+    height = hint.height()
+    screen = QApplication.primaryScreen()
+    if screen is not None:
+        chrome = dialog.style().pixelMetric(QStyle.PM_TitleBarHeight) + theme.px(16)    # 제목 표시줄 + 여유
+        height = min(height, screen.availableGeometry().height() - chrome)
+    dialog.resize(max(hint.width(), dialog.minimumWidth()), height)
+
+
+# ---------------------------------------------------------------- 받은 사진 풀기
+IMAGE_FORMATS = ('png', 'jpeg', 'gif', 'bmp', 'webp')      # 점으로 된 사진만 (벡터 · 문서형 이미지는 풀지 않는다)
+MAX_IMAGE_PIXELS = 50 * 1000 * 1000                         # 가로×세로 상한 (풀면 한 점에 4바이트)
+
+
+def decode_image(data, max_pixels=MAX_IMAGE_PIXELS, formats=IMAGE_FORMATS):
+    """받은 사진 바이트 → QImage. 내용으로 형식을 확인해 허용한 형식만, 크기를 먼저 읽어 상한 안일 때만 푼다.
+    형식이 다르거나 너무 크거나 깨졌으면 None"""
+    if not data:
+        return None
+    buf = QBuffer()
+    buf.setData(QByteArray(bytes(data)))
+    if not buf.open(QIODevice.ReadOnly):
+        return None
+    reader = QImageReader(buf)
+    if bytes(reader.format()).decode('ascii', 'replace').lower() not in formats:
+        return None
+    size = reader.size()
+    if not size.isValid() or size.width() * size.height() > max_pixels:
+        return None
+    image = reader.read()
+    return None if image.isNull() else image
+
+
+def decode_pixmap(data, max_pixels=MAX_IMAGE_PIXELS, formats=IMAGE_FORMATS):
+    """decode_image 와 같은 규칙으로 QPixmap (실패 시 None)"""
+    image = decode_image(data, max_pixels, formats)
+    return None if image is None else QPixmap.fromImage(image)
 
 
 # ---------------------------------------------------------------- 공용 도우미
@@ -741,9 +892,8 @@ def _dot(p, size, color):
 
 def photo_avatar_pixmap(data, size):
     """사진 바이트 → 가운데 정사각형으로 잘라 squircle 마스크 적용. 실패 시 None"""
-    from PyQt5.QtGui import QImage
-    image = QImage()
-    if not image.loadFromData(data):
+    image = decode_image(data)
+    if image is None:
         return None
     side = min(image.width(), image.height())
     image = image.copy((image.width() - side) // 2, (image.height() - side) // 2, side, side)

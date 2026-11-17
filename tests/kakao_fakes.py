@@ -34,6 +34,10 @@ def app():
     """QApplication 싱글턴 (참조를 보관해 GC로 사라지지 않게 함)"""
     if not _APP:
         _APP.append(QApplication.instance() or QApplication(sys.argv[:1]))
+        # 실제 앱(app.main)과 같게: 메모리 정리(GC)는 화면 스레드의 이벤트 사이에서만 돌린다.
+        # 자동 GC 가 Qt 가 위젯을 다루는 도중에 앞 테스트의 위젯을 지우면 테스트 프로세스가 죽는다 (가끔만 나는 세그폴트)
+        from client.kakao.widgets import install_safe_gc
+        install_safe_gc(_APP[0])
     return _APP[0]
 
 

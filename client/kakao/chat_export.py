@@ -165,7 +165,10 @@ class AttachmentCollector(QObject):
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(timeout_ms or ATTACHMENT_TIMEOUT_MS)
-        self._timer.timeout.connect(lambda: self._skip('받지 못함(응답 없음)'))
+        self._timer.timeout.connect(self._on_timeout)     # 람다가 아니라 메서드: 수집기가 사라지면 연결도 사라진다
+
+    def _on_timeout(self):
+        self._skip('받지 못함(응답 없음)')
 
     def start(self):
         self.state.quiet_attachment_errors = True

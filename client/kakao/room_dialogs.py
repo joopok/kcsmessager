@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (QWidget, QFrame, QLabel, QVBoxLayout, QHBoxLayout, 
 from client.kakao import theme, osenv
 
 from client.kakao.state import (parse_dt)
-from client.kakao.widgets import (paint_icon, user_avatar_pixmap, make_icon,
+from client.kakao.widgets import (paint_icon, user_avatar_pixmap, make_icon, decode_pixmap,
                                   human_size)
 from client.kakao.room_base import (APP_NAME, AV, fmt_time, event_when, _label, icon_pixmap, _Dialog, dialog_qss, _buttons)
 
@@ -283,8 +283,7 @@ class ImageViewer(_Dialog):
         v = QVBoxLayout(self)
         lab = QLabel(self)
         lab.setAlignment(Qt.AlignCenter)
-        pm = QPixmap()
-        pm.loadFromData(data)
+        pm = decode_pixmap(data) or QPixmap()
         screen = QApplication.primaryScreen()
         avail = screen.availableGeometry() if screen else None
         mw = int(avail.width() * 0.8) if avail else 900
@@ -419,8 +418,8 @@ class DrawerDialog(_Dialog):
         return w
 
     def _set_photo(self, aid, data):
-        pm = QPixmap()
-        if pm.loadFromData(data):
+        pm = decode_pixmap(data)
+        if pm is not None:
             pm = pm.scaled(100, 100, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
             for item in self._photo_items.get(aid, []):
                 item.setIcon(QIcon(pm))

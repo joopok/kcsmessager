@@ -39,7 +39,7 @@ from PyQt5.QtWidgets import (QWidget, QLabel, QVBoxLayout, QHBoxLayout, QGridLay
                              QSizePolicy, QListView)
 
 from client.kakao import theme
-from client.kakao.widgets import user_avatar_pixmap
+from client.kakao.widgets import user_avatar_pixmap, decode_image
 
 try:  # QtMultimedia 는 선택 사항
     from PyQt5.QtMultimedia import (QAudioFormat, QAudioDeviceInfo, QAudioInput, QAudioOutput, QAudio,
@@ -56,6 +56,8 @@ SAMPLE_RATE = 16000
 FRAME_MS = 40
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000          # 640
 FRAME_BYTES = FRAME_SAMPLES * 2                         # 1280
+MAX_AUDIO_FRAME_BYTES = FRAME_BYTES * 25                # 받은 음성 한 조각의 상한 (1초 분량, 보내는 쪽은 40ms 씩)
+MAX_FRAME_PIXELS = 3840 * 2160                          # 받은 영상 · 화면 공유 한 장의 상한
 JITTER_FRAMES = 3                                       # 약 120ms 미리 채운 뒤 재생
 MAX_QUEUE_FRAMES = 25                                   # 보낸 사람별 최대 1초 지연
 VIDEO_SIZE = (320, 240)
@@ -86,11 +88,16 @@ def encode_audio(pcm_bytes):
 
 def decode_audio(data_b64, codec='pcm'):
     """(base64, codec) → PCM bytes. 깨진 데이터는 b''"""
+    data_b64 = data_b64 or ''
+    if len(data_b64) > MAX_AUDIO_FRAME_BYTES * 2:           # base64 는 4/3 배 - 그보다 훨씬 길면 풀지 않는다
+        return b''
     try:
-        raw = base64.b64decode(data_b64 or '')
-        if codec == 'zpcm':
-            raw = zlib.decompress(raw)
+        raw = base64.b64decode(data_b64)
+        if codec == 'zpcm':                                 # 풀린 크기가 상한을 넘는지 볼 만큼만 푼다
+            raw = zlib.decompressobj().decompress(raw, MAX_AUDIO_FRAME_BYTES + 1)
     except Exception:
+        return b''
+    if len(raw) > MAX_AUDIO_FRAME_BYTES:
         return b''
     if len(raw) % 2:
         raw = raw[:-1]
@@ -246,12 +253,11 @@ def jpeg_encode(image, quality=VIDEO_QUALITY):
 
 def jpeg_decode(data_b64):
     """JPEG base64 → QImage (실패 시 null QImage)"""
-    img = QImage()
     try:
-        img.loadFromData(base64.b64decode(data_b64 or ''), 'JPEG')
+        img = decode_image(base64.b64decode(data_b64 or ''), MAX_FRAME_PIXELS, ('jpeg',))
     except Exception:
         return QImage()
-    return img
+    return img if img is not None else QImage()
 
 
 def fit_frame(image, width=VIDEO_SIZE[0], height=VIDEO_SIZE[1]):
@@ -1374,6 +1380,7 @@ class CallWindow(QWidget):
         state.calls_changed.connect(self._on_calls_changed)
         state.call_ended.connect(self._on_call_ended)
         state.call_media.connect(self._on_media)
+        state.connection_lost.connect(self._on_connection_lost)
 
         self._refresh()
         self._tick_second()
@@ -1623,6 +1630,13 @@ class CallWindow(QWidget):
                                             parts.get(u, {}).get('role') != 'host',
                                             self.state.display_name(u)))
 
+    def _on_connection_lost(self, *_):
+        """서버 연결이 끊기면 통화도 이어지지 않는다 - 통화 중 화면으로 남지 않게 끝낸다"""
+        if self.closed or self.ended:
+            return
+        self._left = True       # 서버는 끊긴 사람을 통화에서 이미 뺐다 - 다시 연결된 뒤 나가기를 또 보내지 않는다
+        self._finish('서버 연결이 끊어져 통화가 종료되었습니다')
+
     def _on_calls_changed(self):
         if self.closed or self.ended:
             return
@@ -1848,6 +1862,7 @@ class CallWindow(QWidget):
         text = self.state.member_name(self.room_id, user)
         sub = ('✋ 손 들었음' if info.get('hand') else '') if role == 'listener' else ROLE_LABELS.get(role, '')
         name = QLabel(f'<b>{_html(text)}</b>  <span style="color:{pal("sub")}">{_html(sub)}</span>')
+        name.setTextFormat(Qt.RichText)      # 넣는 글자는 _html 로 감쌌다
         lay.addWidget(name, 1)
 
         def add(role_name, label, primary=False, enabled=True):
@@ -2210,7 +2225,8 @@ class CallWindow(QWidget):
                 t.stop()
             for sig, slot in ((self.state.calls_changed, self._on_calls_changed),
                               (self.state.call_ended, self._on_call_ended),
-                              (self.state.call_media, self._on_media)):
+                              (self.state.call_media, self._on_media),
+                              (self.state.connection_lost, self._on_connection_lost)):
                 try:
                     sig.disconnect(slot)
                 except (TypeError, RuntimeError):

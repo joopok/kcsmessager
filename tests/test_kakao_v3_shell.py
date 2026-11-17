@@ -99,7 +99,7 @@ class LockPinTests(V3TestBase):
         self.assertTrue(lock.has_pin(self.settings))
         salt = self.settings.get('lock_salt')
         self.assertTrue(salt)
-        self.assertEqual(self.settings.get('lock_pin_hash'), lock.hash_pin('1234', salt))
+        self.assertEqual(self.settings.get('lock_pin_hash'), lock.slow_hash_pin('1234', salt))   # 느린 해시로 저장
         self.assertTrue(lock.verify_pin(self.settings, '1234'))
         self.assertFalse(lock.verify_pin(self.settings, '1235'))
         self.assertFalse(lock.verify_pin(self.settings, ''))

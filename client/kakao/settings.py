@@ -39,6 +39,8 @@ DEFAULTS = {
     'bubble_style': 'basic',
     'lock_pin_hash': '',
     'lock_salt': '',
+    'lock_fail_count': 0,         # 잠금 PIN 을 연달아 틀린 횟수
+    'lock_blocked_until': 0,      # 이 시각(epoch 초)까지는 PIN 입력을 받지 않는다
     'lock_minutes': 5,
     'call_auto_record': False,   # 보이스톡 자동 녹음 (카카오톡 2025-11)
     'social_features': False,    # 펑·생일·선물하기 (회사 메신저는 기본 끔 - 업무 우선)
@@ -53,6 +55,15 @@ DEFAULT_HOST, DEFAULT_PORT = '127.0.0.1', 5555
 # 기본은 평문(개발용 로컬 서버). 운영 서버(talk.kcins.co.kr:9550)는 nginx 가 TLS 를 종단하므로
 # server.json 에 "tls": true 를 넣거나 --tls 로 켠다. 배포용 빌드는 이 값을 True 로 바꿔 만든다.
 DEFAULT_TLS = False
+
+
+LOCAL_HOSTS = ('127.0.0.1', 'localhost', '::1')
+
+
+def is_plain_remote(host, tls):
+    """다른 컴퓨터의 서버에 암호화 없이(평문) 붙는가 - 이 PC 안의 개발용 서버는 해당하지 않는다"""
+    host = str(host or '').strip().lower()
+    return bool(host) and not tls and host not in LOCAL_HOSTS
 
 
 def parse_server_address(host, port):

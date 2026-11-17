@@ -64,7 +64,7 @@ class CalendarTabTest(unittest.TestCase):
         self.tab.select_date(self.today)
         titles = self.tab.agenda_titles()
         self.assertIn('치과 예약', titles)
-        self.assertIn('🎂 김철수님 생일', titles)
+        self.assertIn('김철수님 생일', titles)
         self.assertNotIn('주간 회의', titles)
 
         self.tab.select_date(self.today + timedelta(days=1))

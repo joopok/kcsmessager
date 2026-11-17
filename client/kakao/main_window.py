@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QV
 from client.kakao import theme
 from client.kakao import osenv
 from client.kakao.widgets import (paint_icon, Badge, install_focus_visible, input_controls_qss, install_input_controls,
-                                  install_dialog_title_bars)
+                                  install_dialog_title_bars, install_text_guard)
 from client.kakao.login import talk_icon, talk_icon_pixmap
 from client.kakao import brand, macos
 from client.kakao.chats_tab import presence_of, set_presence, user_pixmap, connect_avatar_changed
@@ -63,6 +63,7 @@ def apply_app_theme(settings=None):
     install_focus_visible(app)        # 포커스 테두리는 키보드로 옮겼을 때만
     install_input_controls(app)       # 콤보 목록이 QSS 줄 높이 · 선택 색을 따르도록
     install_dialog_title_bars(app)    # 팝업 제목 표시줄을 본문과 같은 색으로 (macOS)
+    install_text_guard(app)           # 라벨 · 툴팁 · 알림 상자 글자는 서식으로 해석하지 않는다
 
 
 # ================================================================ 사이드바
@@ -324,6 +325,7 @@ class Toast(QLabel):
 
     def __init__(self, parent):
         super().__init__(parent)
+        self.setTextFormat(Qt.PlainText)   # 안내 글에는 이름 · 파일 이름이 들어간다
         self.setWordWrap(True)
         self.setAlignment(Qt.AlignCenter)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
@@ -736,6 +738,22 @@ class MainWindow(QMainWindow):
                     dlg.hide()
             except RuntimeError:
                 self.feature_tour = None
+        # 그 밖에 떠 있는 창(통화 · 서랍 · 프로필 · 관리자 …)도 잠금 중에는 보이지 않게 한다.
+        # 답을 기다리던 창은 취소로 닫고, 나머지는 숨겼다가 잠금을 풀면 다시 보여 준다
+        self._hidden_windows = []
+        for w in QApplication.topLevelWidgets():
+            try:
+                if w is self or not w.isVisible():
+                    continue
+                if w.windowType() in (Qt.Popup, Qt.ToolTip):
+                    w.close()
+                elif isinstance(w, QDialog) and w.isModal():
+                    w.reject()
+                else:
+                    w.hide()
+                    self._hidden_windows.append(w)
+            except RuntimeError:
+                pass
         self.toast.hide()
         self.lock_screen.show_over()
         return True
@@ -745,6 +763,11 @@ class MainWindow(QMainWindow):
         self.state.locked = False
         self.lock_screen.hide()
         self.idle_watcher.activity()
+        for w in self.__dict__.pop('_hidden_windows', []):
+            try:
+                w.show()
+            except RuntimeError:        # 잠긴 동안 사라진 창
+                pass
         hidden, self._hidden_rooms = self._hidden_rooms, []
         for rid in hidden:
             win = self.room_windows.get(rid)

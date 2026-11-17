@@ -118,7 +118,8 @@ class AdminDialog(QDialog):
         actions = QHBoxLayout()
         self.reset_button = QPushButton('비밀번호 재설정…')
         self.code_button = QPushButton('재설정 코드 발급')
-        self.code_button.setToolTip('본인 확인 후 코드를 알려 주면, 본인이 로그인 창의 [비밀번호 재설정]에서 직접 새 비밀번호를 정합니다')
+        self.code_button.setToolTip('본인 확인 후 코드를 알려 주면, 본인이 로그인 창에서 직접 비밀번호를 정합니다 '
+                                    '(등록한 사람: [비밀번호 재설정] · 아직 등록하지 않은 사람: [처음 사용 등록])')
         self.clear_button = QPushButton('등록 초기화')
         self.disable_button = QPushButton('사용 중지')
         self.admin_button = QPushButton('관리자 지정')
@@ -230,6 +231,7 @@ class AdminDialog(QDialog):
             btn.setEnabled(u is not None)
         if u is None:
             self.delete_button.setText('삭제')
+            self.code_button.setText('재설정 코드 발급')
             return
         self.delete_button.setText('복원' if u.get('removed') else '삭제')
         self.delete_button.setEnabled(bool(u.get('removed')) or u['username'] != self.state.me)
@@ -237,7 +239,9 @@ class AdminDialog(QDialog):
             for btn in (self.reset_button, self.code_button, self.clear_button, self.disable_button, self.admin_button):
                 btn.setEnabled(False)
             return
-        self.code_button.setEnabled(bool(u.get('registered')) and not u.get('is_admin'))
+        # 코드 발급: 등록한 사람에게는 비밀번호 재설정 코드, 아직 등록하지 않은 사람에게는 등록 코드 (관리자 계정은 제외)
+        self.code_button.setEnabled(not u.get('is_admin'))
+        self.code_button.setText('재설정 코드 발급' if u.get('registered') else '등록 코드 발급')
         self.disable_button.setText('사용 중지 해제' if u.get('disabled') else '사용 중지')
         self.disable_button.setEnabled(bool(u.get('disabled')) or u['username'] != self.state.me)
         self.admin_button.setText('관리자 해제' if u.get('is_admin') else '관리자 지정')
@@ -250,7 +254,7 @@ class AdminDialog(QDialog):
 
     def ask_new_password(self, username):
         """새 비밀번호를 두 번 받는다 → 문자열 또는 None"""
-        first, ok = QInputDialog.getText(self, '비밀번호 재설정', f'{username} 님의 새 비밀번호 (4~64자)',
+        first, ok = QInputDialog.getText(self, '비밀번호 재설정', f'{username} 님의 새 비밀번호 (8~64자)',
                                          QLineEdit.Password)
         if not ok:
             return None
@@ -260,8 +264,8 @@ class AdminDialog(QDialog):
         if first != second:
             self.show_status('두 비밀번호가 다릅니다.', error=True)
             return None
-        if not 4 <= len(first) <= 64:
-            self.show_status('비밀번호는 4~64자로 입력해 주세요.', error=True)
+        if not 8 <= len(first) <= 64:
+            self.show_status('비밀번호는 8~64자로 입력해 주세요.', error=True)
             return None
         return first
 
@@ -342,7 +346,8 @@ class AdminDialog(QDialog):
         if u is None:
             return
         if u.get('removed'):
-            if self.confirm('구성원 복원', f"{u['username']} 님을 복원합니다. 다시 로그인하고 조직도에 나옵니다."):
+            if self.confirm('구성원 복원', f"{u['username']} 님을 복원합니다. 다시 로그인하고 조직도에 나옵니다.\n"
+                                           '관리자였던 사람도 일반 구성원으로 돌아옵니다 - 관리자 권한은 다시 지정해야 합니다.'):
                 self.state.admin_member_restore(u['username'])
             return
         if self.confirm('구성원 삭제', f"{u['username']} 님을 삭제합니다.\n조직도·친구 목록에서 빠지고 로그인할 수 없습니다. "
@@ -366,10 +371,12 @@ class AdminDialog(QDialog):
 
     # ---- 결과 ----
     DONE_TEXT = {'reset_password': '{username} 님의 비밀번호를 바꿨습니다. 저장된 자동 로그인은 해제되었습니다.',
-                 'clear_password': '{username} 님의 등록을 초기화했습니다. 처음 사용 등록부터 다시 하면 됩니다.',
+                 'clear_password': '{username} 님의 등록을 초기화했습니다. 처음 사용 등록부터 다시 하면 됩니다 '
+                                   '(등록이 닫힌 서버에서는 [등록 코드 발급]으로 코드를 만들어 알려 주세요).',
                  'notice': '전체 공지를 {delivered}명에게 보냈습니다.'}
 
-    MEMBER_DONE = {'member_create': '{username} 님을 등록했습니다. 처음 사용 등록으로 비밀번호를 정하면 로그인할 수 있습니다.',
+    MEMBER_DONE = {'member_create': '{username} 님을 등록했습니다. 본인이 [처음 사용 등록]으로 비밀번호(8자 이상)를 정하면 로그인할 수 '
+                                    '있습니다. 등록이 닫힌 서버에서는 [등록 코드 발급]으로 코드를 만들어 알려 주세요.',
                    'member_update': '{username} 님의 정보를 고쳤습니다.',
                    'member_delete': '{username} 님을 삭제했습니다. [삭제한 구성원 보기]에서 복원할 수 있습니다.',
                    'member_restore': '{username} 님을 복원했습니다.'}
@@ -382,8 +389,12 @@ class AdminDialog(QDialog):
             text = f"{p.get('username')} 님을 {'회사 관리자(' + p['company'] + ')' if p.get('company') else '그룹 관리자'}로 지정했습니다."
         elif action == 'reset_code':
             until = (p.get('expires_at') or '').replace('T', ' ')[11:16]
-            text = (f"{p.get('username')} 님의 재설정 코드: {p.get('code')} ({until}까지 · 한 번만). "
-                    '본인 확인 후 알려 주세요. 로그인 창의 [비밀번호 재설정]에서 이메일과 함께 넣으면 됩니다.')
+            if p.get('registered') is False:       # 아직 등록하지 않은 사람: 등록 코드 (예전 서버는 이 값을 주지 않는다)
+                text = (f"{p.get('username')} 님의 등록 코드: {p.get('code')} ({until}까지 · 한 번만). "
+                        '본인 확인 후 알려 주세요. 로그인 창의 [처음 사용 등록](또는 [비밀번호 재설정])에서 넣으면 됩니다.')
+            else:
+                text = (f"{p.get('username')} 님의 재설정 코드: {p.get('code')} ({until}까지 · 한 번만). "
+                        '본인 확인 후 알려 주세요. 로그인 창의 [비밀번호 재설정]에서 이메일과 함께 넣으면 됩니다.')
         elif action == 'set_disabled':
             text = f"{p.get('username')} 님을 {'사용 중지했습니다' if p.get('disabled') else '다시 사용하게 했습니다'}."
         elif action == 'set_admin':

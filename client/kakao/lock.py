@@ -10,7 +10,9 @@
 
 import hashlib
 import hmac
+import math
 import secrets
+import time
 
 from PyQt5.QtCore import (Qt, QRectF, QEvent, QTimer, pyqtSignal, pyqtProperty, QPropertyAnimation,
                           QEasingCurve)
@@ -38,24 +40,92 @@ def has_pin(settings):
     return bool(settings is not None and settings.get('lock_pin_hash') and settings.get('lock_salt'))
 
 
+PIN_ROUNDS = 200000
+SLOW_PREFIX = 'pbkdf2:'
+
+
+def slow_hash_pin(pin, salt, rounds=PIN_ROUNDS):
+    """저장용 해시 'pbkdf2:<반복 횟수>:<16진>' - 한 번 맞춰 보는 데 시간이 걸리게 한다"""
+    digest = hashlib.pbkdf2_hmac('sha256', str(pin).encode('utf-8'), str(salt).encode('utf-8'), int(rounds))
+    return f'{SLOW_PREFIX}{int(rounds)}:{digest.hex()}'
+
+
 def set_pin(settings, pin):
     """새 PIN 저장. 4자리 숫자가 아니면 ValueError. 디스크에 저장하지 못하면 False"""
     if not is_valid_pin(pin):
         raise ValueError('비밀번호는 숫자 4자리로 입력해 주세요.')
     salt = secrets.token_hex(8)
     ok = settings.set('lock_salt', salt) is not False
-    return settings.set('lock_pin_hash', hash_pin(pin, salt)) is not False and ok
+    clear_failures(settings)
+    return settings.set('lock_pin_hash', slow_hash_pin(pin, salt)) is not False and ok
 
 
 def clear_pin(settings):
     settings.set('lock_pin_hash', '')
     settings.set('lock_salt', '')
+    clear_failures(settings)
 
 
 def verify_pin(settings, pin):
     if not has_pin(settings) or not is_valid_pin(pin):
         return False
-    return hmac.compare_digest(hash_pin(pin, settings.get('lock_salt')), settings.get('lock_pin_hash'))
+    salt, stored = settings.get('lock_salt'), str(settings.get('lock_pin_hash'))
+    if stored.startswith(SLOW_PREFIX):
+        try:
+            rounds = int(stored.split(':')[1])
+        except (IndexError, ValueError):
+            return False
+        return hmac.compare_digest(slow_hash_pin(pin, salt, rounds), stored)
+    if hmac.compare_digest(hash_pin(pin, salt), stored):       # 예전 버전이 저장한 PIN: 맞으면 새 방식으로 바꿔 둔다
+        settings.set('lock_pin_hash', slow_hash_pin(pin, salt))
+        return True
+    return False
+
+
+# ---- 틀린 횟수 제한: 네 번까지는 바로 다시, 다섯 번째부터 30초 · 1분 · 2분 … (최대 10분) 기다려야 한다.
+#      횟수와 기다릴 시각은 설정 파일에 남겨 앱을 껐다 켜도 이어진다
+FREE_ATTEMPTS = 4
+BASE_WAIT_SECONDS = 30
+MAX_WAIT_SECONDS = 600
+
+
+def failed_attempts(settings):
+    try:
+        return max(0, int(settings.get('lock_fail_count') or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def blocked_seconds(settings, now=None):
+    """다시 입력할 수 있을 때까지 남은 초 (지금 입력할 수 있으면 0)"""
+    now = time.time() if now is None else now
+    try:
+        until = float(settings.get('lock_blocked_until') or 0)
+    except (TypeError, ValueError):
+        until = 0
+    return int(min(MAX_WAIT_SECONDS, max(0, math.ceil(until - now))))
+
+
+def record_failure(settings, now=None):
+    """틀린 입력 한 번을 기록 → 이번에 기다려야 하는 초 (아직 기다리지 않아도 되면 0)"""
+    now = time.time() if now is None else now
+    count = failed_attempts(settings) + 1
+    settings.set('lock_fail_count', count)
+    if count <= FREE_ATTEMPTS:
+        return 0
+    wait = int(min(MAX_WAIT_SECONDS, BASE_WAIT_SECONDS * 2 ** min(count - FREE_ATTEMPTS - 1, 10)))
+    settings.set('lock_blocked_until', now + wait)
+    return wait
+
+
+def clear_failures(settings):
+    if settings.get('lock_fail_count') or settings.get('lock_blocked_until'):
+        settings.set('lock_fail_count', 0)
+        settings.set('lock_blocked_until', 0)
+
+
+def wait_text(seconds):
+    return f'{int(seconds)}초' if seconds < 60 else f'{math.ceil(seconds / 60)}분'
 
 
 def lock_minutes(settings):
@@ -256,7 +326,11 @@ class LockScreen(QWidget):
         """부모 전체를 덮고 앞으로 가져와 키 입력을 받는다"""
         self.entered = ''
         self.dots.set_count(0)
-        self._set_hint('비밀번호 4자리를 입력해 주세요')
+        wait = blocked_seconds(self.settings)
+        if wait:
+            self._set_hint(f'여러 번 틀렸습니다. {wait_text(wait)} 뒤에 다시 입력해 주세요', error=True)
+        else:
+            self._set_hint('비밀번호 4자리를 입력해 주세요')
         parent = self.parentWidget()
         if parent is not None:
             self.setGeometry(parent.rect())
@@ -286,6 +360,12 @@ class LockScreen(QWidget):
             self._reset_after_error()
         if len(self.entered) >= PIN_LENGTH or not str(digit).isdigit():
             return
+        wait = blocked_seconds(self.settings)
+        if wait:                         # 여러 번 틀린 뒤: 기다리는 동안은 입력을 받지 않는다
+            self.entered = ''
+            self.dots.set_count(0)
+            self._set_hint(f'{wait_text(wait)} 뒤에 다시 입력해 주세요', error=True)
+            return
         self.entered += str(digit)
         self.dots.set_count(len(self.entered))
         if len(self.entered) == PIN_LENGTH:
@@ -300,6 +380,7 @@ class LockScreen(QWidget):
 
     def _submit(self):
         if verify_pin(self.settings, self.entered):
+            clear_failures(self.settings)
             self.entered = ''
             self.attempts = 0
             self.dots.set_count(0)
@@ -307,8 +388,10 @@ class LockScreen(QWidget):
             self.unlocked.emit()
             return
         self.attempts += 1
+        wait = record_failure(self.settings)
         self.dots.set_count(PIN_LENGTH, error=True)
-        self._set_hint('비밀번호가 일치하지 않습니다', error=True)
+        self._set_hint(f'여러 번 틀렸습니다. {wait_text(wait)} 뒤에 다시 입력해 주세요' if wait
+                       else '비밀번호가 일치하지 않습니다', error=True)
         self.shake()
         self.failed.emit()
         self._clear_timer.start(650)

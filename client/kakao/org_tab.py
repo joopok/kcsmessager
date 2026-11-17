@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel, QMenu, Q
 from client.kakao import theme
 from client.kakao.widgets import Avatar, set_shown
 from client.kakao.chats_tab import (ElidedLabel, RowList, TabHeader, make_search_edit, search_box_qss, InviteToRoomDialog,
-                                    user_pixmap, presence_of, connect_avatar_changed, PRESENCE_LABELS,
+                                    user_pixmap, presence_of, connect_avatar_changed, connect_users_changed, PRESENCE_LABELS,
                                     PRESENCE_COLORS)
 
 GUEST_COMPANY = '게스트'
@@ -783,8 +783,7 @@ class OrgTab(QWidget):
         self.list.row_activated.connect(self._activate)
         self.list.itemClicked.connect(self._clicked)
         self.list.customContextMenuRequested.connect(self._show_context_menu)
-        state.users_changed.connect(self.refresh)
-        state.user_changed.connect(lambda _u: self.refresh())
+        self._users_relay = connect_users_changed(state, self.refresh)   # user_changed 는 늘 users_changed 와 함께 온다
         if hasattr(state, 'org_changed'):
             state.org_changed.connect(self.refresh)
         connect_avatar_changed(state, self.refresh)

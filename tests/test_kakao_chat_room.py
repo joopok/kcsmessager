@@ -1168,7 +1168,7 @@ class BoardTests(ChatRoomTestBase):
     def test_board_card_opens_post_and_menu(self):
         self.conn.push('msg_new', message=new_message(90, '김철수', '자료 모음', kind='board', post_id=2))
         card = self.win.rows[90].card
-        self.assertIn('📌 자료 모음', card.title.text())
+        self.assertEqual(card.title.text(), '자료 모음')   # 머리에 게시판 아이콘이 있어 제목에 이모지를 붙이지 않는다
         opened = []
         self.win.open_board = lambda post_id=None: opened.append(post_id)
         card.clicked.emit()

@@ -36,7 +36,8 @@ def recent_path():
 def saved_path():
     return SAVED_PATH or _home_file('saved_login.json')
 MAX_RECENT = 6
-PASSWORD_MIN, PASSWORD_MAX = 4, 64   # 서버와 같은 규칙 (명세 §4.1)
+PASSWORD_MIN, PASSWORD_MAX = 4, 64   # 로그인할 때: 예전에 정한 4자 이상 비밀번호도 그대로 들어온다 (명세 §4.1)
+NEW_PASSWORD_MIN = 8                 # 새로 정하는 비밀번호(등록 · 재설정 · 변경)는 8자 이상
 NAME_MAX, LOGIN_ID_MAX, EMAIL_MAX = 20, 120, 120
 EMAIL_RE = re.compile(r'[^@\s]+@[^@\s]+\.[^@\s]+')
 EMPLOYEE_NO_RE = re.compile(r'[0-9A-Za-z][0-9A-Za-z_-]{0,19}')   # 서버와 같은 규칙
@@ -93,6 +94,15 @@ def save_saved_login(login_id, token, auto_login, host, port, path=None):
         osenv.secure_file(path)              # POSIX 600 (Windows 는 사용자 프로필 권한)
     except OSError:
         pass
+
+
+def replace_saved_token(token, path=None):
+    """저장된 로그인의 토큰만 바꾼다 (비밀번호를 바꿔 서버가 새 토큰을 줬을 때). 저장된 로그인이 없으면 만들지 않고 False"""
+    saved = load_saved_login(path)
+    if not saved or not token:
+        return False
+    save_saved_login(saved['login_id'], token, saved['auto_login'], saved['host'], saved['port'], path=path)
+    return True
 
 
 def clear_saved_login(path=None):
@@ -335,8 +345,21 @@ class LoginDialog(QDialog):
         self.reg_email_edit.setMaxLength(EMAIL_MAX)
         reg_layout.addWidget(self.reg_email_edit)
         reg_layout.addWidget(_divider())
-        self.reg_password_edit = self._password_field(f'비밀번호 ({PASSWORD_MIN}~{PASSWORD_MAX}자)')
+        self.reg_password_edit = self._password_field(f'비밀번호 ({NEW_PASSWORD_MIN}~{PASSWORD_MAX}자)')
         reg_layout.addWidget(self.reg_password_edit)
+        # 등록 코드: 등록이 닫힌 서버에서만 보인다 (관리자가 발급한 코드가 있어야 등록된다, 명세 §4.1)
+        self.reg_code_divider = _divider()
+        reg_layout.addWidget(self.reg_code_divider)
+        self.reg_code_edit = QLineEdit()
+        self.reg_code_edit.setObjectName('idEdit')
+        self.reg_code_edit.setPlaceholderText('관리자에게 받은 등록 코드 (예: ABCD-EF23)')
+        self.reg_code_edit.setAccessibleName('등록 코드')
+        self.reg_code_edit.setMaxLength(20)
+        osenv.prefer_latin_input(self.reg_code_edit)
+        reg_layout.addWidget(self.reg_code_edit)
+        self.open_registration = None      # True 열림 / False 닫힘(등록 코드 필요) / None 예전 서버 · 아직 모름
+        self.reg_code_divider.hide()
+        self.reg_code_edit.hide()
         root.addWidget(self.register_form)
         self.register_hint = QLabel('한 번만 등록하면 다음부터는 이메일과 비밀번호만으로 로그인합니다.')
         self.register_hint.setObjectName('loginHint')
@@ -371,7 +394,7 @@ class LoginDialog(QDialog):
         self.reset_code_edit.setMaxLength(20)
         reset_layout.addWidget(self.reset_code_edit)
         reset_layout.addWidget(_divider())
-        self.reset_password_edit = self._password_field(f'새 비밀번호 ({PASSWORD_MIN}~{PASSWORD_MAX}자)')
+        self.reset_password_edit = self._password_field(f'새 비밀번호 ({NEW_PASSWORD_MIN}~{PASSWORD_MAX}자)')
         reset_layout.addWidget(self.reset_password_edit)
         root.addWidget(self.reset_form)
         self.reset_hint = QLabel('관리자에게 본인 확인을 받고 재설정 코드(30분 동안 한 번)를 받아 가입 이메일과 함께 넣습니다. '
@@ -436,6 +459,14 @@ class LoginDialog(QDialog):
         self.tls = bool(tls)   # 로그인 전 요청(회사 목록 · 비밀번호 재설정)도 본 연결과 같은 방식으로 붙는다
         # TLS 가 켜졌을 때만 tls= 를 넘긴다 - 평문(기본) 경로의 호출 형태를 바꾸지 않는다
         self._net_kwargs = {'tls': True} if self.tls else {}
+        # 다른 컴퓨터의 서버에 암호화 없이 붙는 설정이면 알린다 (비밀번호와 대화가 암호화되지 않고 오간다)
+        from client.kakao.settings import is_plain_remote
+        self.plain_notice = QLabel('이 서버와의 연결은 암호화되지 않습니다. 사내망 밖에서는 사용하지 마세요.')
+        self.plain_notice.setObjectName('plainNotice')
+        self.plain_notice.setWordWrap(True)
+        self.plain_notice.setAlignment(Qt.AlignHCenter)
+        root.addWidget(self.plain_notice)
+        self.plain_notice.setVisible(is_plain_remote(self.host, self.tls))
         root.addSpacing(36)
         footer = QLabel(f'KCS Talk v2.0 · {brand.COMPANY_NAME}')
         footer.setObjectName('loginFooter')
@@ -557,9 +588,21 @@ class LoginDialog(QDialog):
             return False
         self._companies_loaded = bool(names)
         self._set_companies(names)
+        self._set_open_registration(getattr(names, 'open_registration', None))
         if not names:
             self.show_error('서버에 등록된 소속 회사가 없습니다. 관리자에게 문의해 주세요.')
         return bool(names)
+
+    REGISTER_HINT = '한 번만 등록하면 다음부터는 이메일과 비밀번호만으로 로그인합니다.'
+
+    def _set_open_registration(self, flag):
+        """서버의 등록 방식에 맞춰 등록 코드 칸을 보이거나 숨긴다 (닫힌 서버만 코드가 필요하다)"""
+        self.open_registration = flag
+        closed = flag is False
+        self.reg_code_divider.setVisible(closed)
+        self.reg_code_edit.setVisible(closed)
+        self.register_hint.setText('이 서버는 관리자에게 받은 등록 코드가 있어야 등록됩니다. ' + self.REGISTER_HINT
+                                   if closed else self.REGISTER_HINT)
 
     def _refresh_combo_placeholder(self):
         self.company_combo.setProperty('placeholder', self.company_combo.currentIndex() <= 0)
@@ -570,8 +613,11 @@ class LoginDialog(QDialog):
         """처음 사용 등록 입력값 {company, name, email, password} - 로그인 화면이면 None (사번은 보내지 않는다)"""
         if not self.is_register():
             return None
-        return {'company': self.company_combo.currentData() or '', 'name': self.reg_name_edit.text().strip(),
-                'email': self.reg_email_edit.text().strip(), 'password': self.reg_password_edit.text()}
+        fields = {'company': self.company_combo.currentData() or '', 'name': self.reg_name_edit.text().strip(),
+                  'email': self.reg_email_edit.text().strip(), 'password': self.reg_password_edit.text()}
+        if self.open_registration is False:        # 닫힌 서버에만 code 를 싣는다 (예전 서버로 가는 요청은 그대로)
+            fields['code'] = self.reg_code_edit.text().strip()
+        return fields
 
     def _apply_style(self):
         # 다크 모드와 무관하게 회사 CI 색(네이비)으로 고정한다
@@ -584,6 +630,7 @@ class LoginDialog(QDialog):
             QLabel#loginSubtitle {{ font-size: 13px; color: rgba(255,255,255,0.72); }}
             QLabel#loginFooter {{ font-size: 11px; color: rgba(255,255,255,0.5); }}
             QLabel#loginError {{ font-size: 12px; color: #FFB4A8; padding: 0 2px 8px 2px; }}
+            QLabel#plainNotice {{ font-size: 12px; color: #FFD9A0; padding: 8px 2px 0 2px; }}
             QLabel#loginError[tone="notice"] {{ color: #B9F0CF; }}
             QPushButton#resetLink {{ background: transparent; color: rgba(255,255,255,0.72); border: none;
                          padding: 2px 8px; font-size: 12px; }}
@@ -702,9 +749,12 @@ class LoginDialog(QDialog):
         if not EMAIL_RE.fullmatch(self.reg_email_edit.text().strip()):
             self.reg_email_edit.setFocus()
             return '이메일 주소 형식이 올바르지 않습니다.'
-        if not PASSWORD_MIN <= len(self.reg_password_edit.text()) <= PASSWORD_MAX:
+        if not NEW_PASSWORD_MIN <= len(self.reg_password_edit.text()) <= PASSWORD_MAX:
             self.reg_password_edit.setFocus()
-            return f'비밀번호는 {PASSWORD_MIN}~{PASSWORD_MAX}자로 입력해 주세요.'
+            return f'비밀번호는 {NEW_PASSWORD_MIN}~{PASSWORD_MAX}자로 입력해 주세요.'
+        if self.open_registration is False and not self.reg_code_edit.text().strip():
+            self.reg_code_edit.setFocus()
+            return '관리자에게 받은 등록 코드를 입력해 주세요.'
         return ''
 
     def _submit_reset(self, host, port):
@@ -716,7 +766,7 @@ class LoginDialog(QDialog):
             self.reset_email_edit.setFocus()
             self.show_error('이메일 주소 형식이 올바르지 않습니다.')
             return
-        if not PASSWORD_MIN <= len(new_password) <= PASSWORD_MAX:
+        if not NEW_PASSWORD_MIN <= len(new_password) <= PASSWORD_MAX:
             self.reset_password_edit.setFocus()
             self.show_error(f'비밀번호는 {PASSWORD_MIN}~{PASSWORD_MAX}자로 입력해 주세요.')
             return

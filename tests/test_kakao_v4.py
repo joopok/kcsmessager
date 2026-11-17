@@ -1105,7 +1105,9 @@ class AutoReconnectTest(unittest.TestCase):
         for _ in range(3):
             s._auto_reconnect()
         self.assertEqual(delays, [1, 2, 4])            # 실패할수록 간격이 늘어남
-        self.assertEqual(s._retry, 0)                   # 붙으면 처음부터
+        self.assertEqual(s._retry, 3)                   # 연결만 된 것으로는 줄지 않는다 (앞단만 살아 있을 수 있다)
+        s.state.welcomed.emit()
+        self.assertEqual(s._retry, 0)                   # 서버가 welcome 으로 답하면 처음부터
         s.close()
         delays.clear()
         s._schedule_reconnect('끊김')

@@ -32,6 +32,46 @@ OTHER = '기타'
 # (테스트 id 정규식 'module.Class.method', 기능 key) - 위에서부터 먼저 맞는 것
 MAPPING = [
     (r'test_kakao_portal\.', 'ai_chat'),          # 사내 포털 RAG 연동 (명세 §7.6.1)
+    (r'test_kakao_registration', 'login'),        # 등록 방식 - 열림/닫힘 · 등록 코드 (명세 §4.1)
+    (r'test_kakao_login_throttle', 'login'),      # 로그인 실패 제한 · 오류 구분 코드 (명세 §4.1)
+    (r'test_kakao_relay_rules\.(Preview)', 'link_preview'),           # 미리보기 작업 · 태그 읽기
+    (r'test_kakao_relay_rules\.ApprovalDelivery', 'file_security'),   # 승인한 파일을 못 보냈을 때
+    (r'test_kakao_relay_rules', 'platforms'),     # 요청 값 공통 규칙 (명세 §4.5)
+    (r'test_kakao_connection_limits', 'platforms'),   # 연결 한도 · 하트비트 · 요청 빈도 (명세 §2)
+    (r'test_kakao_final_rules\.ArchiveCheck', 'file_security'),      # 압축 파일 검사 보강 (§10.10)
+    (r'test_kakao_final_rules\.PreviewAddress', 'link_preview'),     # 미리보기 접속 주소
+    (r'test_kakao_final_rules\.AiScope', 'ai_chat'),                 # AI 비서 근거 범위 (§7.6)
+    (r'test_kakao_final_rules\.(PasswordRule|OpenServerPassword)', 'login'),   # 비밀번호 길이 · 변경 (§4.1)
+    (r'test_kakao_final_rules', 'platforms'),     # 이름 · 파일 이름 · 첨부 정리 · 용량 (§4.5)
+    (r'test_kakao_decided_rules\.(LateJoiner|RagScope)', 'group'),   # 나중에 들어온 사람이 보는 범위 (§4.5)
+    (r'test_kakao_decided_rules\.(FixedName|OpenServerName)', 'profile_edit'),   # 표시 이름은 실명으로 고정 (§4.5)
+    (r'test_kakao_decided_rules\.PreviewPublicOnly', 'link_preview'),      # 미리보기는 공인 주소만 (§4.5)
+    (r'test_kakao_login_ids\.(RemovedAdmin|SeedAdminOnce)', 'admin'),   # 삭제한 관리자 · org.json admins (§4.2 · §4.3)
+    (r'test_kakao_login_ids', 'login'),           # 로그인 아이디 중복 금지 · 이메일 관리 (명세 §4.1)
+    # 서버 규칙 개정(2026-11-17)에 맞춘 클라이언트 동작 (test_kakao_server_sync)
+    (r'test_kakao_server_sync\.(AdminCode)', 'admin'),
+    (r'test_kakao_server_sync\.ServerPolicy', 'profile_edit'),
+    (r'test_kakao_server_sync\.UnreadCount', 'read_count'),
+    (r'test_kakao_server_sync\.AttachmentKind', 'attach'),
+    (r'test_kakao_server_sync\.', 'login'),
+    # 전체 점검(2026-11-17) 뒤 고친 클라이언트 안정성 문제 (test_kakao_stability)
+    (r'test_kakao_stability\.(ReconnectBackoff|HistoryAfterReconnect|ReconnectHistoryOrder|ResponsiveConnection|SingleInstance)', 'login'),
+    (r'test_kakao_stability\.ActiveRoom', 'notifications'),
+    (r'test_kakao_stability\.(ExportParts|ExportTimeoutWatch|AttachmentCollectorTimeout)', 'chat_export'),
+    (r'test_kakao_stability\.TabRefresh', 'friends'),
+    (r'test_kakao_stability\.(ImageThumb|AttachmentCache|PastedImage)', 'attach'),
+    (r'test_kakao_stability\.CallDisconnect', 'voice_call'),
+    (r'test_kakao_stability\.ProfileEditSize', 'profile_edit'),
+    (r'test_kakao_stability\.LockHides', 'lock'),
+    # 전체 점검(2026-11-17) 뒤 강화한 클라이언트 규칙 (test_kakao_hardening)
+    (r'test_kakao_hardening\.ImageDecode', 'attach'),
+    (r'test_kakao_hardening\.AudioDecode', 'voice_call'),
+    (r'test_kakao_hardening\.(ReadLoop|BeforeLogin|PlainConnectionNotice)', 'login'),
+    (r'test_kakao_hardening\.LockPin', 'lock'),
+    (r'test_kakao_hardening\.SecretPeerKey', 'secret'),
+    (r'test_kakao_hardening\.CsvExport', 'chat_export'),
+    (r'test_kakao_hardening\.(PlainTextGuard|ScreensShow)', 'platforms'),
+    (r'test_kakao_hardening\.', 'file_security'),
     (r'test_kakao_file_security|test_kakao_bugfixes\.FilePolicyBypass', 'file_security'),
     (r'test_kakao_bugfixes\.(ServerInput|StoreRollback|CrashGuard)', 'platforms'),
     (r'test_kakao_bugfixes\.(Connection|SessionReconnect|AccountSecurity)', 'login'),

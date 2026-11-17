@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdi
                              QFrame)
 
 from client.kakao import theme, osenv
-from client.kakao.widgets import human_size, disconnect_signals, underline_tabs_qss, check_box_qss
+from client.kakao.widgets import human_size, disconnect_signals, underline_tabs_qss, check_box_qss, plain
 
 FILE_BLOCKED = '보안 정책으로 막힌 파일입니다.'
 REASON_MAX = 300
@@ -109,11 +109,11 @@ class FileBlockedDialog(QDialog):
         card_col = QVBoxLayout(card)
         card_col.setContentsMargins(theme.sp('m'), theme.sp('s'), theme.sp('m'), theme.sp('s'))
         card_col.setSpacing(2)
-        self.name_label = QLabel(self.info.get('name', ''))
+        self.name_label = plain(QLabel(self.info.get('name', '')))
         self.name_label.setWordWrap(True)
         self.name_label.setStyleSheet(f"font-weight: bold; color: {theme.c('text')};")
         card_col.addWidget(self.name_label)
-        self.detail_label = QLabel(f"{self.info.get('detail', '')} · {human_size(self.info.get('size'))}")
+        self.detail_label = plain(QLabel(f"{self.info.get('detail', '')} · {human_size(self.info.get('size'))}"))
         self.detail_label.setWordWrap(True)
         self.detail_label.setStyleSheet(f"color: {theme.c('danger_text')}; font-size: {theme.fs('meta')}px;")
         card_col.addWidget(self.detail_label)
@@ -271,7 +271,7 @@ class RequestsTab(QWidget):
         header.setSectionResizeMode(3, QHeaderView.Stretch)
         self.table.setTextElideMode(Qt.ElideMiddle)
         col.addWidget(self.table, 1)
-        self.reason_label = QLabel('')
+        self.reason_label = plain(QLabel(''))
         self.reason_label.setWordWrap(True)
         self.reason_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         col.addWidget(self.reason_label)
@@ -391,7 +391,7 @@ class RequestsTab(QWidget):
             return None
         if path is None:
             path, _ = QFileDialog.getSaveFileName(self, '요청 파일 저장',
-                                                  os.path.join(osenv.user_dir('downloads'), r.get('name') or 'file'))
+                                                  os.path.join(osenv.user_dir('downloads'), osenv.safe_filename(r.get('name'))))
             if not path:
                 return None
         self._saving[r['attachment_id']] = path

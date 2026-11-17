@@ -327,6 +327,7 @@ class SessionReconnectTests(ServerTestBase):
         ok, _ = s.reconnect()
         self.assertTrue(ok)
         self.assertFalse(s._retry_timer.isActive())
+        self.assertEqual(wait_for_login(s.state, 5000)[0], 'ok')              # 재시도 간격은 서버가 welcome 으로 답해야 처음으로
         self.assertEqual(s._retry, 0)
         self.assertIs(s.state.conn, s.conn)
         with mock.patch.object(s, 'reconnect') as again:
