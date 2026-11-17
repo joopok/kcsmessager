@@ -33,11 +33,18 @@ OTHER = '기타'
 MAPPING = [
     (r'test_kakao_portal\.', 'ai_chat'),          # 사내 포털 RAG 연동 (명세 §7.6.1)
     (r'test_kakao_registration', 'login'),        # 등록 방식 - 열림/닫힘 · 등록 코드 (명세 §4.1)
+    (r'test_kakao_admin_tools', 'admin'),         # 관리자 도구는 가동 중인 DB 의 구조 · 시드를 건드리지 않는다 (§4.2)
+    (r'test_kakao_deploy_tools', 'platforms'),    # 배포 전 점검 · 백업 (docs/DEPLOY_CHECKLIST.md)
     (r'test_kakao_login_throttle', 'login'),      # 로그인 실패 제한 · 오류 구분 코드 (명세 §4.1)
     (r'test_kakao_relay_rules\.(Preview)', 'link_preview'),           # 미리보기 작업 · 태그 읽기
     (r'test_kakao_relay_rules\.ApprovalDelivery', 'file_security'),   # 승인한 파일을 못 보냈을 때
     (r'test_kakao_relay_rules', 'platforms'),     # 요청 값 공통 규칙 (명세 §4.5)
     (r'test_kakao_connection_limits', 'platforms'),   # 연결 한도 · 하트비트 · 요청 빈도 (명세 §2)
+    (r'test_kakao_send_queue', 'platforms'),      # 연결별 보내기 대기열 (명세 §2)
+    (r'test_kakao_read_connection', 'search'),    # 무거운 조회는 읽기 전용 두 번째 연결에서 (명세 §5)
+    (r'test_kakao_room_list\.RoomList', 'room_list'),      # 방 목록 묶음 조회
+    (r'test_kakao_room_list\.ReminderScan', 'calendar'),   # 일정 알림 검사 범위 · 색인
+    (r'test_kakao_rag_workers', 'ai_chat'),       # AI 비서 작업 처리 (명세 §4.5)
     (r'test_kakao_final_rules\.ArchiveCheck', 'file_security'),      # 압축 파일 검사 보강 (§10.10)
     (r'test_kakao_final_rules\.PreviewAddress', 'link_preview'),     # 미리보기 접속 주소
     (r'test_kakao_final_rules\.AiScope', 'ai_chat'),                 # AI 비서 근거 범위 (§7.6)
@@ -58,11 +65,15 @@ MAPPING = [
     (r'test_kakao_stability\.(ReconnectBackoff|HistoryAfterReconnect|ReconnectHistoryOrder|ResponsiveConnection|SingleInstance)', 'login'),
     (r'test_kakao_stability\.ActiveRoom', 'notifications'),
     (r'test_kakao_stability\.(ExportParts|ExportTimeoutWatch|AttachmentCollectorTimeout)', 'chat_export'),
-    (r'test_kakao_stability\.TabRefresh', 'friends'),
+    (r'test_kakao_stability\.(TabRefresh|FriendsRowUpdate|HiddenTab)', 'friends'),
+    (r'test_kakao_stability\.(RowListSync|ChatsRowUpdate)', 'room_list'),
+    (r'test_kakao_stability\.OrgRowUpdate', 'org_chart'),
+    (r'test_kakao_stability\.MessageBoxWithoutScreen', 'platforms'),
     (r'test_kakao_stability\.(ImageThumb|AttachmentCache|PastedImage)', 'attach'),
     (r'test_kakao_stability\.CallDisconnect', 'voice_call'),
     (r'test_kakao_stability\.ProfileEditSize', 'profile_edit'),
     (r'test_kakao_stability\.LockHides', 'lock'),
+    (r'test_kakao_stability\.SafeGarbageCollection', 'platforms'),   # 메모리 정리(GC)는 이벤트 사이에서만
     # 전체 점검(2026-11-17) 뒤 강화한 클라이언트 규칙 (test_kakao_hardening)
     (r'test_kakao_hardening\.ImageDecode', 'attach'),
     (r'test_kakao_hardening\.AudioDecode', 'voice_call'),

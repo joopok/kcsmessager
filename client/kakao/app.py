@@ -356,7 +356,7 @@ def wait_for_login(state, timeout_ms=10000):
     """join 결과를 기다린다 → ('ok'|'failed'|'lost'|'timeout', 사유)
     중첩 QEventLoop 대신 이벤트를 직접 돌린다(앞서 quit()가 불렸으면 QEventLoop.exec_는 바로 끝난다)"""
     import time
-    from PyQt5.QtCore import QEventLoop
+    from client.kakao.widgets import pump_events
     result = []
     hooks = ((state.welcomed, lambda: result or result.append(('ok', ''))),
              (state.login_failed, lambda reason: result or result.append(('failed', reason))),
@@ -364,9 +364,8 @@ def wait_for_login(state, timeout_ms=10000):
     for signal, slot in hooks:
         signal.connect(slot)
     deadline = time.monotonic() + timeout_ms / 1000
-    app = QCoreApplication.instance()
     while not result and time.monotonic() < deadline:
-        app.processEvents(QEventLoop.AllEvents, 50)
+        pump_events(50)
         time.sleep(0.01)
     for signal, slot in hooks:
         signal.disconnect(slot)

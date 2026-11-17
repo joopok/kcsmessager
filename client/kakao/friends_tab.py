@@ -16,7 +16,7 @@ from client.kakao import theme
 from client.kakao.widgets import Avatar, make_icon, ContentScrollArea, fit_dialog_to_screen
 from client.kakao.chats_tab import (ElidedLabel, StatusPill, RowList, TabHeader, CreateGroupDialog,
                                     make_search_edit, search_box_qss, user_pixmap, InviteToRoomDialog, presence_of,
-                                    set_presence, foreign_company, CompanyChip, connect_avatar_changed, connect_users_changed,
+                                    set_presence, foreign_company, CompanyChip, connect_avatar_changed, connect_users_changed, RefreshWhenVisible,
                                     presence_dot_pixmap, PRESENCE_CHOICES, PRESENCE_LABELS,
                                     PRESENCE_COLORS)
 
@@ -1061,7 +1061,7 @@ def _pts(points):
 
 
 # ================================================================ 친구 탭
-class FriendsTab(QWidget):
+class FriendsTab(RefreshWhenVisible, QWidget):
     def __init__(self, state, settings, parent=None):
         super().__init__(parent)
         self.state = state
@@ -1130,16 +1130,21 @@ class FriendsTab(QWidget):
         # clicked 는 checked(False)를 넘기므로 감싸서 부른다 (그대로 연결하면 exec_=False 가 되어 창이 안 뜬다)
         self.add_friend_button.clicked.connect(lambda _checked=False: self.show_add_friend())
         if hasattr(state, 'my_friends_changed'):
-            state.my_friends_changed.connect(self.refresh)
+            state.my_friends_changed.connect(self.refresh_when_visible)
         self.search_edit.textChanged.connect(lambda _t: self.refresh())
         self.list.row_activated.connect(self._activate)
         self.list.itemClicked.connect(self._clicked)
         self.list.customContextMenuRequested.connect(self._show_context_menu)
 
-        self._users_relay = connect_users_changed(state, self.refresh)   # user_changed 는 늘 users_changed 와 함께 온다
+        # 바뀐 것은 refresh() 가 행 단위로 맞춘다 (RowList.sync_rows). 다른 탭 뒤에 가려져 있으면 보일 때까지 미룬다
+        self._users_relay = connect_users_changed(state, self.refresh_when_visible)
         settings.changed.connect(self._on_setting)
-        connect_avatar_changed(state, self.refresh)
+        connect_avatar_changed(state, self.refresh_when_visible)
         self.apply_theme()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh_if_stale()
 
     # ---- 데이터 ----
     def _matches(self, user, query):
@@ -1199,36 +1204,53 @@ class FriendsTab(QWidget):
             self.collapsed.add(key)
         self.refresh()
 
-    def refresh(self):
+    def refresh(self, full=False):
+        """목록을 지금 상태에 맞춘다. 달라진 행만 다시 만든다 (한 사람의 접속 상태가 바뀌면 그 사람의 행과 구역 머리글만).
+        full=True: 색 · 글자 크기 · 설정처럼 모든 행의 모양이 바뀔 때 전부 다시 만든다"""
         if not self.state.me:
             return
+        self._stale = False
         friends = self.state.friends()
         online = sum(1 for f in friends if self.state.is_online(f['username']))
         self.header.set_subtitle(f'친구 {len(friends)}명 · 온라인 {online}명')
         scroll = self.list.verticalScrollBar().value()
-        self.list.clear()
+        if full:
+            self.list.clear()
         query = self.search_edit.text().strip()
         self.sections = self.build_sections(query)
+        rows = []
         if not query:
-            self.list.add_row(MyProfileRow(self.state), ('me', self.state.me))
+            rows.append((('me', self.state.me), self._row_signature(self.state.me, 'me'),
+                         lambda: MyProfileRow(self.state), True))
         for key in ('bot', 'team', 'favorites', 'registered', 'birthday', 'online', 'offline'):
             members = self.sections[key]
             if not members and (query or key in ('bot', 'team', 'birthday', 'favorites', 'registered')):
                 continue
             collapsed = key in self.collapsed and not query
-            self.list.add_row(SectionHeader(SECTION_TITLES[key], len(members), collapsed),
-                              ('section', key), selectable=False)
+            rows.append((('section', key), (SECTION_TITLES[key], len(members), collapsed),
+                         lambda k=key, n=len(members), c=collapsed: SectionHeader(SECTION_TITLES[k], n, c), False))
             if collapsed:
                 continue
             kind = {'bot': 'bot', 'birthday': 'birthday', 'team': 'team'}.get(key, 'friend')
             for name in members:
-                self.list.add_row(FriendRow(self.state, name, kind, on_gift=self.send_gift),
-                                  ('friend', name, key))
+                rows.append((('friend', name, key), self._row_signature(name, kind),
+                             lambda n=name, k=kind: FriendRow(self.state, n, k, on_gift=self.send_gift), True))
+        self.list.sync_rows(rows)
         self.list.verticalScrollBar().setValue(scroll)
         # 친구가 아니게 된 사람은 고른 목록에서 뺀다 (검색으로 가려진 사람은 그대로 둔다)
         friends_now = {f['username'] for f in friends}
         self.picked = {n: True for n in self.picked if n in friends_now}
         self._apply_picks()
+
+    def _row_signature(self, name, kind):
+        """친구 행이 보여 주는 것 전부 (이름 · 상태 · 접속 · 사진 · 소속 · 진행 중인 일정) - 같으면 그 행은 다시 만들지 않는다"""
+        state = self.state
+        avatar = (getattr(state, 'avatars', {}).get(name) or (None,))[0]
+        event = None
+        if kind == 'team' and hasattr(state, 'current_event_of'):
+            current = state.current_event_of(name) or {}
+            event = (current.get('event_id'), current.get('end'))
+        return (kind, repr(state.user(name)), presence_of(state, name), avatar, foreign_company(state, name), event)
 
     # ---- 여러 명 골라 대화방 만들기 (Shift+클릭 · Shift+끌기) ----
     @staticmethod
@@ -1382,10 +1404,10 @@ class FriendsTab(QWidget):
     # ---- 동작 ----
     def _on_setting(self, key):
         if key == 'favorites':
-            self.refresh()
+            self.refresh(full=True)
         elif key == 'social_features':
             self.story_bar.setVisible(bool(self.settings.get('social_features')))
-            self.refresh()
+            self.refresh(full=True)
 
     def _clicked(self, item):
         data = item.data(Qt.UserRole)
@@ -1502,7 +1524,7 @@ class FriendsTab(QWidget):
             + theme.button_qss('pickChat', 'primary', size='meta', pad='6px 12px'))
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet(f"FriendsTab {{ background: {theme.c('bg')}; }}")
-        self.refresh()
+        self.refresh(full=True)      # 색 · 글자 크기가 바뀌었다 → 행을 전부 다시 만든다
 
 
 def _supports_bots(state):

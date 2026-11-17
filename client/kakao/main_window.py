@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QV
 from client.kakao import theme
 from client.kakao import osenv
 from client.kakao.widgets import (paint_icon, Badge, install_focus_visible, input_controls_qss, install_input_controls,
-                                  install_dialog_title_bars, install_text_guard)
+                                  install_dialog_title_bars, install_text_guard, pump_events)
 from client.kakao.login import talk_icon, talk_icon_pixmap
 from client.kakao import brand, macos
 from client.kakao.chats_tab import presence_of, set_presence, user_pixmap, connect_avatar_changed
@@ -1149,7 +1149,7 @@ class MainWindow(QMainWindow):
             return
         self.banner.button.setEnabled(False)
         self.banner.label.setText('재연결 중…')
-        QApplication.processEvents()
+        pump_events()
         try:
             result = self.reconnect_cb()
         except Exception as e:  # 재연결 콜백 오류도 배너로 보여준다

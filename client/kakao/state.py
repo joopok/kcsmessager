@@ -156,6 +156,7 @@ class AppState(QObject):
     password_change_failed = pyqtSignal(str, str)   # (문구, 구분 코드)
     connection_lost = pyqtSignal(str)
     users_changed = pyqtSignal()
+    presence_changed = pyqtSignal(str)       # 접속 상태만 바뀐 사람 (users_changed 바로 앞에 나간다 - 목록이 그 사람 행만 다시 그리게)
     user_changed = pyqtSignal(str)
     rooms_changed = pyqtSignal()
     room_changed = pyqtSignal(str)
@@ -349,6 +350,7 @@ class AppState(QObject):
         user = self.users.get(p['username'])
         if user is not None:
             user['online'] = p['status'] == 'online'
+            self.presence_changed.emit(p['username'])
             self.user_changed.emit(p['username'])
             self.users_changed.emit()
 

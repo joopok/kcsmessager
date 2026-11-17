@@ -56,8 +56,9 @@ class AvatarBurstTest(unittest.TestCase):
         self.assertLess(emit_ms, 200)                             # 알림을 받는 동안 화면을 붙잡지 않는다
         for name in ('OrgTab', 'FriendsTab', 'MoreTab'):
             per_screen = [n for (cls, _id), n in counts.items() if cls == name]
-            self.assertTrue(per_screen, name)
-            self.assertEqual(set(per_screen), {1}, (name, counts))   # 몰려온 알림은 화면마다 한 번에 반영
+            if name != 'OrgTab':                                  # 다른 탭 뒤에 가려진 조직도는 다시 보일 때 그린다
+                self.assertTrue(per_screen, name)
+            self.assertLessEqual(set(per_screen), {1}, (name, counts))   # 몰려온 알림은 화면마다 한 번에 반영
 
     def test_relay_flush_and_single_change_still_applies(self):
         calls = []

@@ -38,7 +38,28 @@ def app():
         # 자동 GC 가 Qt 가 위젯을 다루는 도중에 앞 테스트의 위젯을 지우면 테스트 프로세스가 죽는다 (가끔만 나는 세그폴트)
         from client.kakao.widgets import install_safe_gc
         install_safe_gc(_APP[0])
+        from client.kakao import osenv
+        if osenv.is_windows() and _APP[0].platformName() == 'offscreen':
+            skip_message_box_system_menu()
     return _APP[0]
+
+
+def skip_message_box_system_menu():
+    """Windows 에서 화면 없이(offscreen) 테스트할 때만 쓴다 → 되돌리는 함수.
+    Qt 5.15 의 알림 상자(QMessageBox)는 보이는 순간 창의 시스템 메뉴(닫기 항목)를 고치려고 OS 창 핸들을 찾는데,
+    offscreen 에는 그 통로가 없어 프로세스가 죽는다 (CI 에서 QMessageBox.open() 한 줄에 테스트 전체가 끝났다).
+    실제 Windows 화면에서는 일어나지 않는다. 그 단계가 든 QMessageBox.showEvent 대신 QDialog 의 것을 쓰게 한다"""
+    from PyQt5.QtWidgets import QDialog, QMessageBox
+    original = QMessageBox.__dict__.get('showEvent')
+
+    def show_event(box, event):
+        QDialog.showEvent(box, event)
+    QMessageBox.showEvent = show_event
+
+    def restore():
+        if original is not None:
+            QMessageBox.showEvent = original
+    return restore
 
 
 def expand_org(tab):

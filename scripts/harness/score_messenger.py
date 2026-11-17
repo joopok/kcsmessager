@@ -41,6 +41,9 @@ APP = QApplication.instance() or QApplication([])
 
 from server.kakao.server import KakaoServer  # noqa: E402
 from client.kakao.app import Session  # noqa: E402
+from client.kakao.widgets import install_safe_gc  # noqa: E402
+
+install_safe_gc(APP)      # 실제 앱(app.main)과 같게: 메모리 정리(GC)는 이벤트 사이에서만
 
 # ---------------------------------------------------------------- 공용 도구
 QT_WARNINGS, PY_ERRORS = [], []
@@ -539,6 +542,8 @@ from PyQt5.QtWidgets import QApplication
 app = QApplication([])
 from client.kakao.app import Session
 from client.kakao.chat_room import ChatRoomWindow
+from client.kakao.widgets import install_safe_gc
+install_safe_gc(app)      # 실제 앱과 같은 메모리 정리 방식으로 잰다
 def pump(cond, t=20):
     end = time.time() + t
     while time.time() < end:

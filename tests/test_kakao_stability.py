@@ -230,7 +230,7 @@ class TabRefreshTests(unittest.TestCase):
 
     def test_one_presence_change_rebuilds_each_list_once(self):
         self.conn.push('user_status_changed', username='이영희', status='online')
-        self.assertEqual(self.counts, {'FriendsTab': 1, 'OrgTab': self.org_tabs})
+        self.assertEqual(self.counts, {'FriendsTab': 1})       # 보이는 친구 탭만 (다른 탭 뒤의 조직도는 보일 때 그린다)
         self.assertIn('이영희', self.friends.sections['online'])
 
     def test_burst_of_presence_changes_is_merged(self):
@@ -558,6 +558,378 @@ class SafeGarbageCollectionTests(unittest.TestCase):
         from client.kakao import widgets
         widgets.install_safe_gc(app())
         self.assertTrue(app()._safe_gc.timer.isActive())
+
+    def cyclic_garbage(self):
+        """서로 물고 있는 쓰레기 한 쌍 → 살아 있는지 보는 약한 참조"""
+        import weakref
+
+        class Node:
+            pass
+        a, b = Node(), Node()
+        a.other, b.other = b, a
+        return weakref.ref(a)
+
+    def test_dialog_exec_inside_the_app_loop_counts_as_nested(self):
+        # 실제 앱처럼 app.exec_() 안에서 대화상자 exec_() 를 띄워 본다. 별도 프로세스: 앞선 테스트가 quit() 를 불렀으면
+        # 이 프로세스의 이벤트 루프는 바로 끝나 버린다
+        import json
+        import subprocess
+        import sys
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        code = ("import json\n"
+                "from PyQt5.QtCore import QTimer\n"
+                "from PyQt5.QtWidgets import QApplication, QDialog\n"
+                "from client.kakao.widgets import install_safe_gc\n"
+                "app = QApplication([])\n"
+                "install_safe_gc(app)\n"
+                "guard, dlg, seen = app._safe_gc, QDialog(), {}\n"
+                "seen['before'] = guard.nested()\n"
+                "def in_dialog():\n"
+                "    seen['dialog'] = guard.nested()\n"
+                "    dlg.reject()\n"
+                "def in_app():\n"
+                "    seen['app'] = guard.nested()\n"
+                "    QTimer.singleShot(0, in_dialog)\n"
+                "    dlg.exec_()\n"
+                "    seen['after'] = guard.nested()\n"
+                "    app.quit()\n"
+                "QTimer.singleShot(0, in_app)\n"
+                "QTimer.singleShot(5000, lambda: app.exit(7))\n"
+                "code = app.exec_()\n"
+                "print(json.dumps(seen))\n"
+                "raise SystemExit(code)\n")
+        env = dict(os.environ, QT_QPA_PLATFORM='offscreen')
+        done = subprocess.run([sys.executable, '-c', code], cwd=root, env=env, capture_output=True,
+                              text=True, timeout=30)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(json.loads(done.stdout.strip().splitlines()[-1]),
+                         {'before': False, 'app': False, 'dialog': True, 'after': False})
+
+    def test_collection_waits_while_a_nested_event_loop_runs(self):
+        from client.kakao import widgets
+        widgets.install_safe_gc(app())
+        guard = app()._safe_gc
+        probe = self.cyclic_garbage()
+        with mock.patch.object(guard, 'thresholds', (1, 10 ** 9, 10 ** 9)), \
+                mock.patch.object(guard, 'NESTED_BACKLOG', 10 ** 9):
+            with mock.patch.object(guard, 'nested', return_value=True):
+                guard.collect()
+                self.assertIsNotNone(probe())                   # 바깥 이벤트 처리가 끝나지 않았다 - 미룬다
+            with mock.patch.object(guard, 'nested', return_value=False):
+                guard.collect()
+                self.assertIsNone(probe())                      # 루프가 끝난 뒤 정리
+
+    def test_long_nested_loop_still_collects_once_garbage_piles_up(self):
+        from client.kakao import widgets
+        widgets.install_safe_gc(app())
+        guard = app()._safe_gc
+        probe = self.cyclic_garbage()
+        with mock.patch.object(guard, 'thresholds', (1, 10 ** 9, 10 ** 9)), \
+                mock.patch.object(guard, 'NESTED_BACKLOG', 0), \
+                mock.patch.object(guard, 'nested', return_value=True):
+            guard.collect()                                     # 알림 상자가 며칠 떠 있어도 메모리가 끝없이 늘지 않게
+        self.assertIsNone(probe())
+
+    def test_pumping_events_by_hand_counts_as_nested(self):
+        from PyQt5.QtCore import QTimer
+        from client.kakao import widgets
+        widgets.install_safe_gc(app())
+        guard = app()._safe_gc
+        seen = []
+        QTimer.singleShot(0, lambda: seen.append(guard.nested()))
+        for _ in range(20):                                     # 단추 처리 안에서 화면을 한 번 그리게 하는 경우처럼
+            widgets.pump_events()
+            if seen:
+                break
+        self.assertEqual(seen, [True])
+        self.assertFalse(guard.nested())                        # 끝나면 다시 정리할 수 있다
+
+    def test_client_code_pumps_events_only_through_the_guard(self):
+        """client/kakao 는 processEvents 를 직접 부르지 않고 widgets.pump_events 를 쓴다 (그동안 메모리 정리가 미뤄진다)"""
+        root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'client', 'kakao')
+        direct = []
+        for folder, _dirs, names in os.walk(root):
+            for name in sorted(names):
+                path = os.path.join(folder, name)
+                if not name.endswith('.py') or os.path.relpath(path, root) == 'widgets.py':
+                    continue
+                with open(path, encoding='utf-8') as f:
+                    direct += [f'{os.path.relpath(path, root)}:{no}' for no, line in enumerate(f, 1)
+                               if 'processEvents(' in line and not line.lstrip().startswith('#')]
+        self.assertEqual(direct, [])
+
+
+
+# ================================================================== 목록은 달라진 행만 다시 그린다
+def counted(testcase, module, name):
+    """module.name 행 위젯이 몇 번 만들어지는지 센다 → 만들어진 인자 목록"""
+    original = getattr(module, name)
+    made = []
+
+    class Counted(original):
+        def __init__(self, *args, **kwargs):
+            made.append(args)
+            super().__init__(*args, **kwargs)
+    setattr(module, name, Counted)
+    testcase.addCleanup(setattr, module, name, original)
+    return made
+
+
+def row_data(row_list):
+    return [row_list.item(i).data(Qt.UserRole) for i in range(row_list.count())]
+
+
+def row_widgets(row_list):
+    return {repr(row_list.item(i).data(Qt.UserRole)): row_list.itemWidget(row_list.item(i)) for i in range(row_list.count())}
+
+
+class RowListSyncTests(unittest.TestCase):
+    def setUp(self):
+        from client.kakao.chats_tab import RowList
+        app()
+        self.list = RowList()
+        self.addCleanup(self.list.close)
+        self.made = []
+
+    def rows(self, *specs):
+        from PyQt5.QtWidgets import QLabel
+
+        def factory(key):
+            def make():
+                self.made.append(key)
+                return QLabel(str(key))
+            return make
+        return [(key, sig, factory(key), True) for key, sig in specs]
+
+    def test_only_changed_rows_are_built(self):
+        self.assertEqual(self.list.sync_rows(self.rows(('a', 1), ('b', 1), ('c', 1))), 3)
+        before = row_widgets(self.list)
+        self.made.clear()
+        self.assertEqual(self.list.sync_rows(self.rows(('a', 1), ('b', 2), ('c', 1))), 1)
+        self.assertEqual(self.made, ['b'])
+        after = row_widgets(self.list)
+        self.assertIs(after["'a'"], before["'a'"])
+        self.assertIs(after["'c'"], before["'c'"])
+        self.assertIsNot(after["'b'"], before["'b'"])
+
+    def test_rows_are_added_removed_and_moved_without_rebuilding_the_rest(self):
+        self.list.sync_rows(self.rows(('a', 1), ('b', 1), ('c', 1), ('d', 1)))
+        self.list.setCurrentRow(1)                               # b 선택
+        before = row_widgets(self.list)
+        self.made.clear()
+        self.list.sync_rows(self.rows(('c', 1), ('a', 1), ('b', 1), ('e', 1)))     # c 가 맨 위로, d 삭제, e 추가
+        self.assertEqual(row_data(self.list), ['c', 'a', 'b', 'e'])
+        self.assertEqual(sorted(self.made), ['c', 'e'])
+        after = row_widgets(self.list)
+        self.assertIs(after["'a'"], before["'a'"])
+        self.assertIs(after["'b'"], before["'b'"])
+        self.assertEqual(self.list.currentItem().data(Qt.UserRole), 'b')            # 선택은 그대로
+
+    def test_moved_row_stays_selected(self):
+        self.list.sync_rows(self.rows(('a', 1), ('b', 1), ('c', 1)))
+        self.list.setCurrentRow(2)
+        self.list.sync_rows(self.rows(('c', 1), ('a', 1), ('b', 1)))
+        self.assertEqual(self.list.currentItem().data(Qt.UserRole), 'c')
+
+    def test_empty_and_repeated_sync(self):
+        self.list.sync_rows(self.rows(('a', 1)))
+        self.assertEqual(self.list.sync_rows([]), 0)
+        self.assertEqual(self.list.count(), 0)
+
+
+class FriendsRowUpdateTests(unittest.TestCase):
+    def setUp(self):
+        from client.kakao import friends_tab
+        self.module = friends_tab
+        self.state, self.conn = make_demo_state()
+        self.made = counted(self, friends_tab, 'FriendRow')
+        self.tab = friends_tab.FriendsTab(self.state, self.state.settings)
+        self.addCleanup(self.tab.close)
+        self.made.clear()
+
+    def test_presence_change_builds_only_that_persons_rows(self):
+        before = row_widgets(self.tab.list)
+        self.conn.push('user_status_changed', username='이영희', status='online')
+        self.assertEqual([args[1] for args in self.made], ['이영희'])
+        after = row_widgets(self.tab.list)
+        for key in ("('friend', '김철수', 'online')", "('friend', '박민수', 'online')", "('me', '홍길동')"):
+            self.assertIs(after[key], before[key], key)                    # 다른 사람의 행은 그대로
+        self.assertIn(('friend', '이영희', 'online'), row_data(self.tab.list))
+        self.assertNotIn(('friend', '이영희', 'offline'), row_data(self.tab.list))
+
+    def test_result_is_the_same_as_a_full_rebuild(self):
+        self.conn.push('user_status_changed', username='이영희', status='online')
+        self.conn.push('user_updated', user=dict(self.state.user('박민수'), status_message='외근'))
+        self.tab._users_relay.flush()
+        fresh = self.module.FriendsTab(self.state, self.state.settings)
+        self.addCleanup(fresh.close)
+        self.assertEqual(row_data(self.tab.list), row_data(fresh.list))
+
+    def test_selection_survives_someone_elses_change(self):
+        item = self.tab.list.find_data(('friend', '김철수', 'online'))
+        self.tab.list.setCurrentItem(item)
+        self.conn.push('user_status_changed', username='이영희', status='online')
+        self.assertEqual(self.tab.list.currentItem().data(Qt.UserRole), ('friend', '김철수', 'online'))
+
+    def test_theme_change_rebuilds_every_row(self):
+        friend_rows = sum(1 for data in row_data(self.tab.list) if data[0] == 'friend')
+        self.tab.apply_theme()
+        self.assertEqual(len(self.made), friend_rows)
+
+
+class ChatsRowUpdateTests(unittest.TestCase):
+    def setUp(self):
+        from client.kakao import chats_tab
+        self.state, self.conn = make_demo_state()
+        self.made = counted(self, chats_tab, 'RoomRow')
+        self.tab = chats_tab.ChatsTab(self.state, self.state.settings)
+        self.addCleanup(self.tab.close)
+        self.made.clear()
+        self.order = row_data(self.tab.list)
+
+    def new_message(self, room_id, msg_id):
+        self.made.clear()
+        self.conn.push('msg_new', message=text_message(msg_id, room_id=room_id, sender='김철수' if room_id == 'r1' else '박민수'))
+
+    def test_new_message_moves_only_that_room(self):
+        last = self.order[-1] if self.order[-1] != 'r3' else self.order[-2]       # 맨 위가 아닌 대화방
+        other = next(r for r in self.order if r != last)
+        self.tab.list.setCurrentItem(self.tab.list.find_data(other))
+        before = row_widgets(self.tab.list)
+        self.new_message(last, 9101)
+        self.assertEqual(row_data(self.tab.list)[0], last)
+        self.assertEqual([args[1] for args in self.made], [last])
+        self.assertIs(row_widgets(self.tab.list)[repr(other)], before[repr(other)])
+        self.assertEqual(self.tab.list.currentItem().data(Qt.UserRole), other)
+
+    def test_new_message_in_the_top_room_rebuilds_one_row(self):
+        top = self.order[0]
+        self.new_message(top, 9102)
+        self.assertEqual(row_data(self.tab.list), self.order)
+        self.assertEqual([args[1] for args in self.made], [top])
+
+    def test_unrelated_presence_change_builds_nothing(self):
+        self.made.clear()
+        self.conn.push('user_status_changed', username='최지우', status='online')
+        self.assertEqual(self.made, [])
+
+    def test_pin_and_search_still_work(self):
+        self.state.toggle_pin('r3') if hasattr(self.state, 'toggle_pin') else self.state.settings.toggle_in('pinned_rooms', 'r3')
+        self.tab.refresh()
+        self.assertEqual(row_data(self.tab.list)[0], 'r3')
+        self.tab.search_edit.setText('프로젝트')
+        self.assertEqual(row_data(self.tab.list), ['r1'])
+        self.tab.search_edit.setText('')
+        self.assertEqual(sorted(row_data(self.tab.list)), ['r1', 'r2', 'r3'])
+
+
+class OrgRowUpdateTests(unittest.TestCase):
+    def setUp(self):
+        from client.kakao import org_tab
+        from tests.kakao_fakes import expand_org
+        self.state, self.conn = make_demo_state()
+        self.made = counted(self, org_tab, 'MemberRow') 
+        self.made_compact = counted(self, org_tab, 'CompactMemberRow')
+        self.tab = org_tab.OrgTab(self.state, self.state.settings)
+        self.addCleanup(self.tab.close)
+        expand_org(self.tab)
+        self.made.clear()
+        self.made_compact.clear()
+
+    def member_rows(self, name):
+        return [i for i in range(self.tab.list.count()) if self.tab.list.item(i).data(Qt.UserRole) == ('member', name)]
+
+    def test_presence_change_rebuilds_only_that_members_rows(self):
+        rows = self.member_rows('이영희')
+        self.assertTrue(rows)
+        others = {i: self.tab.list.itemWidget(self.tab.list.item(i)) for i in range(self.tab.list.count()) if i not in rows}
+        count = self.tab.list.count()
+        self.conn.push('user_status_changed', username='이영희', status='online')
+        built = [args[1] for args in self.made + self.made_compact]
+        self.assertEqual(built, ['이영희'] * len(rows))
+        self.assertEqual(self.tab.list.count(), count)
+        for i, widget in others.items():
+            self.assertIs(self.tab.list.itemWidget(self.tab.list.item(i)), widget)
+
+    def test_other_changes_still_rebuild_the_list(self):
+        self.conn.push('user_updated', user=dict(self.state.user('이영희'), department='새 부서'))
+        self.assertGreater(len(self.made) + len(self.made_compact), 1)
+
+
+class HiddenTabTests(unittest.TestCase):
+    def setUp(self):
+        from client.kakao.main_window import MainWindow
+        self.state, self.conn = make_demo_state()
+        self.win = MainWindow(self.state, self.state.settings)
+        self.addCleanup(self.win.close)
+        self.win.show()
+        flush(300)
+
+    def test_tab_behind_another_waits_until_it_is_shown(self):
+        self.win.set_tab('friends')
+        flush()
+        chats = self.win.tabs['chats']
+        before = row_data(chats.list)
+        top = before[0]
+        last = next(r for r in reversed(before) if r != 'r3' and r != top)
+        self.conn.push('msg_new', message=text_message(9201, room_id=last, sender='김철수' if last == 'r1' else '박민수'))
+        self.assertEqual(row_data(chats.list), before)                     # 숨은 탭은 그대로
+        self.win.set_tab('chats')
+        flush()
+        self.assertEqual(row_data(chats.list)[0], last)                    # 보이는 순간 반영
+
+    def test_hidden_org_chart_redraws_only_changed_members_when_shown(self):
+        from client.kakao import org_tab
+        from tests.kakao_fakes import expand_org
+        org = self.win.tabs['org']
+        self.win.set_tab('org')
+        flush()
+        expand_org(org)
+        self.win.set_tab('friends')
+        flush()
+        made_a, made_b = counted(self, org_tab, 'MemberRow'), counted(self, org_tab, 'CompactMemberRow')
+        rows = sum(1 for data in row_data(org.list) if data == ('member', '이영희'))
+        self.assertTrue(rows)
+        self.conn.push('user_status_changed', username='이영희', status='online')
+        self.assertEqual(made_a + made_b, [])                              # 가려진 동안에는 그리지 않는다
+        self.win.set_tab('org')
+        flush()
+        self.assertEqual([args[1] for args in made_a + made_b], ['이영희'] * rows)   # 보일 때 그 사람 행만
+
+    def test_tab_that_is_not_inside_a_window_updates_right_away(self):
+        from client.kakao.friends_tab import FriendsTab
+        tab = FriendsTab(self.state, self.state.settings)                  # 어디에도 넣지 않은 목록 (화면에 없음)
+        self.addCleanup(tab.close)
+        self.conn.push('user_status_changed', username='이영희', status='online')
+        self.assertIn('이영희', tab.sections['online'])
+
+
+
+# ================================================================== 테스트 환경: Windows 화면 없는 실행
+class MessageBoxWithoutScreenTests(unittest.TestCase):
+    def test_message_box_skips_the_native_system_menu_step(self):
+        from PyQt5.QtWidgets import QMessageBox
+        from tests import kakao_fakes
+        app()
+        restore = kakao_fakes.skip_message_box_system_menu()
+        self.addCleanup(restore)
+        calls = []
+        patched = QMessageBox.showEvent
+        QMessageBox.showEvent = lambda box, event: (calls.append(1), patched(box, event))[1]
+        box = QMessageBox(QMessageBox.Warning, '정보 수정', '이미 다른 구성원이 쓰는 사번입니다.', QMessageBox.Ok)
+        self.addCleanup(box.close)
+        box.open()
+        flush()
+        self.assertEqual(calls, [1])                      # Qt 가 QMessageBox 의 것이 아니라 바꿔 둔 단계를 불렀다
+        self.assertTrue(box.isVisible())
+        self.assertEqual(box.text(), '이미 다른 구성원이 쓰는 사번입니다.')
+
+    def test_restore_puts_the_original_step_back(self):
+        from PyQt5.QtWidgets import QMessageBox
+        from tests import kakao_fakes
+        original = QMessageBox.__dict__.get('showEvent')
+        kakao_fakes.skip_message_box_system_menu()()
+        self.assertIs(QMessageBox.__dict__.get('showEvent'), original)
 
 
 if __name__ == '__main__':

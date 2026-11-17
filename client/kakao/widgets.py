@@ -8,8 +8,8 @@ import gc
 import hashlib
 import math
 
-from PyQt5.QtCore import (Qt, QRectF, QPoint, QPointF, QSize, QEvent, QObject, QTimer, QBuffer, QByteArray, QIODevice,
-                          pyqtSignal)
+from PyQt5.QtCore import (Qt, QRectF, QPoint, QPointF, QSize, QEvent, QObject, QTimer, QThread, QBuffer, QByteArray,
+                          QIODevice, QCoreApplication, QEventLoop, pyqtSignal)
 from PyQt5.QtGui import (QPainter, QPainterPath, QPen, QColor, QIcon, QPixmap, QBrush, QLinearGradient, QImageReader)
 from PyQt5.QtWidgets import (QWidget, QPushButton, QLabel, QSizePolicy, QAbstractButton, QComboBox,
                              QStyledItemDelegate, QDialog, QApplication, QScrollArea, QFrame, QStyle)
@@ -447,9 +447,14 @@ class SafeGarbageCollector(QObject):
     자동 GC 는 객체를 만드는 아무 순간에 돈다 - 읽기 · 쓰기 스레드 안에서, 또는 Qt 가 위젯을 다루는 도중(이벤트 필터 ·
     스타일 다시 입히기)에. 그때 부모 없는 Qt 위젯이 함께 지워지면 앱이 죽는다 (가끔만 나서 찾기 어려운 종료).
     그래서 자동 GC 를 끄고, 타이머가 울릴 때(= 이벤트 처리 사이) 여기서 대신 돌린다. 참조 수가 0 이 되어 바로 지워지는
-    대부분의 객체는 전과 같다"""
+    대부분의 객체는 전과 같다.
+    대화상자 exec_() · 메뉴 · pump_events() 처럼 다른 이벤트 처리 안에서 도는 루프 중에는 미룬다
+    (바깥에서 처리 중이던 위젯이 지워지지 않게).
+    그 루프가 오래 이어져(자리를 비운 사이 뜬 알림 상자) 쌓인 양이 평소 기준의 NESTED_BACKLOG 배를 넘으면 그때는 정리한다"""
 
     INTERVAL_MS = 2000
+    NESTED_BACKLOG = 50
+    pumping = 0             # pump_events() 가 돌고 있는 깊이 (화면 스레드에서만 바뀐다)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -460,12 +465,18 @@ class SafeGarbageCollector(QObject):
         self.timer.timeout.connect(self.collect)
         self.timer.start()
 
+    def nested(self):
+        """다른 이벤트 처리 안에서 도는 이벤트 루프 중인가 (대화상자 exec_() · 메뉴 · 끌어다 놓기 · pump_events)"""
+        return SafeGarbageCollector.pumping > 0 or QThread.currentThread().loopLevel() > 1
+
     def collect(self, force=False):
         """쌓인 만큼만 정리 (자동 GC 와 같은 기준). force=True 면 전부"""
         if force:
             gc.collect()
             return
         counts = gc.get_count()
+        if self.nested() and counts[0] <= self.thresholds[0] * self.NESTED_BACKLOG:
+            return
         for generation in (2, 1, 0):
             if counts[generation] > self.thresholds[generation]:
                 gc.collect(generation)
@@ -477,6 +488,23 @@ def install_safe_gc(app):
     if app is None or getattr(app, '_safe_gc', None) is not None:
         return
     app._safe_gc = SafeGarbageCollector(app)
+
+
+def pump_events(max_ms=None):
+    """쌓인 화면 이벤트를 지금 처리한다 (processEvents). max_ms 를 주면 그 시간(ms) 안에서만.
+    client/kakao 에서는 processEvents 를 직접 부르지 않고 이것을 쓴다: 단추 처리 같은 다른 이벤트 처리 안에서 불려도
+    그동안 메모리 정리(SafeGarbageCollector)가 미뤄진다"""
+    app = QCoreApplication.instance()
+    if app is None:
+        return
+    SafeGarbageCollector.pumping += 1
+    try:
+        if max_ms is None:
+            app.processEvents()
+        else:
+            app.processEvents(QEventLoop.AllEvents, max_ms)
+    finally:
+        SafeGarbageCollector.pumping -= 1
 
 
 # ---------------------------------------------------------------- 세로로 긴 대화상자

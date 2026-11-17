@@ -464,6 +464,9 @@ class CrashGuardTests(unittest.TestCase):
             hook(*sys.exc_info())
         self.assertIn("KeyError: 'root'", sys.stderr.getvalue())
 
+    @unittest.skipIf(sys.platform.startswith('win'),
+                     'Windows 는 os.kill(SIGINT) 이 신호를 전달하지 않고 프로세스를 바로 끝낸다 (종료 코드 2) - '
+                     'Ctrl+C 처리 자체는 test_keyboard_interrupt_in_slot_quits 가 본다')
     def test_ctrl_c_quits_instead_of_traceback_loop(self):
         # 터미널 Ctrl+C: 예전에는 eventFilter 안 KeyboardInterrupt 트레이스백만 찍히고 앱이 계속 돌았다
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

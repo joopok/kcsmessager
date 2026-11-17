@@ -12,7 +12,7 @@ import ssl
 import threading
 import time
 
-from PyQt5.QtCore import QObject, QCoreApplication, QEventLoop, QThread, pyqtSignal
+from PyQt5.QtCore import QObject, QCoreApplication, QThread, pyqtSignal
 
 MAX_LINE_BYTES = 48 * 1024 * 1024       # 서버가 보내는 한 줄의 상한 (첨부 10MB 는 base64 로 약 14MB)
 MAX_PRELOGIN_BYTES = 1024 * 1024        # 로그인 전 응답(회사 목록 · 재설정 결과)의 상한
@@ -69,9 +69,10 @@ def open_socket_responsive(host, port, timeout=5.0, tls=False):
     if app is None or QThread.currentThread() is not app.thread():
         work()
     else:
+        from client.kakao.widgets import pump_events      # 화면이 있을 때만 필요하다
         threading.Thread(target=work, daemon=True).start()
         while not done.wait(0.01):
-            app.processEvents(QEventLoop.AllEvents, 20)
+            pump_events(20)
     return result['sock'], result['error']
 
 

@@ -1078,15 +1078,16 @@ class EfficiencyFollowupTest(unittest.TestCase):
         from client.kakao.chats_tab import ChatsTab, RoomRow
         tab = ChatsTab(self.state, self.state.settings)
         before = {tab.list.item(i).data(0x0100): tab.list.itemWidget(tab.list.item(i)) for i in range(tab.list.count())}
-        refreshed = []
-        orig = tab.refresh
-        tab.refresh = lambda: (refreshed.append(1), orig())
+        self.state.set_room_draft('r2', '쓰다 만 글')     # r2 의 미리보기가 바뀐다
         self.state.room_changed.emit('r2')
         after = {tab.list.item(i).data(0x0100): tab.list.itemWidget(tab.list.item(i)) for i in range(tab.list.count())}
-        self.assertEqual(refreshed, [])
         self.assertIsNot(after['r2'], before['r2'])      # 그 행만 새로
         self.assertIs(after['r1'], before['r1'])
         self.assertIsInstance(after['r2'], RoomRow)
+        self.assertIn('임시저장', after['r2'].preview.text())
+        self.state.room_changed.emit('r1')               # 보이는 내용이 그대로면 아무 행도 다시 만들지 않는다
+        again = {tab.list.item(i).data(0x0100): tab.list.itemWidget(tab.list.item(i)) for i in range(tab.list.count())}
+        self.assertEqual(again, after)
 
 
 class AutoReconnectTest(unittest.TestCase):

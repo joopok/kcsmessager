@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel, QMenu, Q
 from client.kakao import theme
 from client.kakao.widgets import Avatar, set_shown
 from client.kakao.chats_tab import (ElidedLabel, RowList, TabHeader, make_search_edit, search_box_qss, InviteToRoomDialog,
-                                    user_pixmap, presence_of, connect_avatar_changed, connect_users_changed, PRESENCE_LABELS,
+                                    user_pixmap, presence_of, connect_avatar_changed, connect_users_changed, RefreshWhenVisible, PRESENCE_LABELS,
                                     PRESENCE_COLORS)
 
 GUEST_COMPANY = '게스트'
@@ -710,7 +710,7 @@ class GroupDialog(QDialog):
 
 
 # ================================================================ 조직도 탭
-class OrgTab(QWidget):
+class OrgTab(RefreshWhenVisible, QWidget):
     def __init__(self, state, settings, parent=None):
         super().__init__(parent)
         self.state = state
@@ -783,11 +783,74 @@ class OrgTab(QWidget):
         self.list.row_activated.connect(self._activate)
         self.list.itemClicked.connect(self._clicked)
         self.list.customContextMenuRequested.connect(self._show_context_menu)
-        self._users_relay = connect_users_changed(state, self.refresh)   # user_changed 는 늘 users_changed 와 함께 온다
+        # 접속 상태만 바뀐 사람은 그 사람의 행만 다시 만든다 (조직도의 구성 · 순서는 접속 상태와 무관하다).
+        # 그 밖의 변화(소속 · 이름 · 사진 …)는 목록을 다시 만든다. 다른 탭 뒤에 가려져 있으면 보일 때까지 미룬다
+        self._member_rows = {}          # 사용자명 → [(목록 항목, 행을 만드는 함수)]
+        self._presence_names = set()
+        self._stale_members = set()     # 가려진 동안 접속 상태만 바뀐 사람들 (다시 보일 때 그 행만 다시 만든다)
+        self._users_events = self._presence_events = 0
+        state.users_changed.connect(self._count_users_event)        # 묶음(relay)보다 먼저 센다
+        if hasattr(state, 'presence_changed'):
+            state.presence_changed.connect(self._note_presence)
+        self._users_relay = connect_users_changed(state, self._on_users_changed)
         if hasattr(state, 'org_changed'):
-            state.org_changed.connect(self.refresh)
-        connect_avatar_changed(state, self.refresh)
+            state.org_changed.connect(self.refresh_when_visible)
+        connect_avatar_changed(state, self.refresh_when_visible)
         self.apply_theme()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh_if_stale()
+
+    def _count_users_event(self):
+        self._users_events += 1
+
+    def _note_presence(self, username):
+        self._presence_events += 1
+        self._presence_names.add(username)
+
+    def _on_users_changed(self):
+        """모아 둔 구성원 변화를 반영: 전부 접속 상태 변화였으면 그 사람들의 행만, 아니면 목록 전체"""
+        names = self._presence_names
+        presence_only = bool(names) and self._users_events == self._presence_events
+        self._presence_names = set()
+        self._users_events = self._presence_events = 0
+        if self.hidden_behind_another():
+            if presence_only and not self._stale:
+                self._stale_members |= names
+            else:
+                self._stale = True
+        elif presence_only and not self._stale:
+            self.refresh_members(names)
+        else:
+            self.refresh()
+
+    def refresh_if_stale(self):
+        names, self._stale_members = self._stale_members, set()
+        if self._stale:
+            self._stale = False
+            self.refresh()
+        elif names:
+            self.refresh_members(names)
+
+    def refresh_members(self, names):
+        """names 의 구성원 행만 다시 만든다 (접속 표시 · 상태 글자). 다시 만든 행 수를 돌려준다"""
+        built = 0
+        for name in names:
+            for item, factory in self._member_rows.get(name, ()):
+                widget = factory()
+                item.setSizeHint(QSize(1, widget.sizeHint().height()))
+                self.list.setItemWidget(item, widget)
+                built += 1
+        if built:
+            self.list._fit_rows()
+        return built
+
+    def _add_member(self, name, factory):
+        """구성원 행 추가 + 그 행을 다시 만드는 방법을 기억 (refresh_members 용)"""
+        item = self.list.add_row(factory(), ('member', name))
+        self._member_rows.setdefault(name, []).append((item, factory))
+        return item
 
     # ---- 데이터 ----
     def _all_users(self):
@@ -933,6 +996,9 @@ class OrgTab(QWidget):
         scroll = self.list.verticalScrollBar().value()
         self.list.hover_item = None                    # 지울 항목을 가리키지 않게
         self.list.clear()
+        self._member_rows = {}
+        self._stale = False
+        self._stale_members = set()
         mine = (self.state.user(self.state.me).get('company') or '').strip()
         # KCS AI 지식봇(봇만 있는 회사) → 그룹사(지주사 · 계열사가 모두 같은 단계) → 그룹 → 그 밖의 회사 · 게스트
         top = [c for c in self.tree if c in self.bot_companies]
@@ -1076,7 +1142,7 @@ class OrgTab(QWidget):
             # KCS AI: 'KCS AI 1명' 바로 아래 봇 (지식봇 같은 부서 단계 없이)
             for members in units.values():
                 for name, _ct in members:
-                    self.list.add_row(MemberRow(self.state, name, depth=depth), ('member', name))
+                    self._add_member(name, lambda n=name: MemberRow(self.state, n, depth=depth))
             return
         shown = set()
         for path, members in units.items():
@@ -1102,8 +1168,8 @@ class OrgTab(QWidget):
                 self.list.add_row(UnitHeader('', len(members), False, depth=depth), ('unit', company, ()),
                                   selectable=False)
             for name, concurrent_title in members:
-                self.list.add_row(MemberRow(self.state, name, depth=depth + len(path),
-                                            concurrent_title=concurrent_title), ('member', name))
+                self._add_member(name, lambda n=name, ct=concurrent_title, d=depth + len(path):
+                                 MemberRow(self.state, n, depth=d, concurrent_title=ct))
 
     # ---- 조직도 그룹 (명세 §4.4) ----
     def _can_manage_groups(self):
@@ -1137,7 +1203,7 @@ class OrgTab(QWidget):
         if not members:
             self.list.add_row(HintRow('구성원이 없습니다', 0), ('empty', ('org_group', gid)), selectable=False)
         for name in members:
-            self.list.add_row(MemberRow(self.state, name, depth=0), ('member', name))
+            self._add_member(name, lambda n=name: MemberRow(self.state, n, depth=0))
 
     # ---- 아래쪽 덩어리(그룹 · 게스트) 순서 바꾸기: 머리글을 끌어서 놓기 / 우클릭 → 위로 · 아래로 이동 ----
     # KCS AI · 그룹사는 고정. 그룹 관리자만 바꿀 수 있고 서버도 다시 검사한다 (명세 §4.4)
@@ -1410,7 +1476,7 @@ class OrgTab(QWidget):
         # 직속 구성원 사진 · 부서 화살표는 회사 이름 글자 시작 줄에 맞춘다 (2026-10-10 요청)
         base = CompanyHeader.title_left(depth)
         for name, ct in root:
-            self.list.add_row(CompactMemberRow(self.state, name, concurrent_title=ct, left=base), ('member', name))
+            self._add_member(name, lambda n=name, c=ct: CompactMemberRow(self.state, n, concurrent_title=c, left=base))
         order = [u[0] for u in (info.get('units') or []) if u]
         depts = [d for d in order if d in members] + sorted(d for d in members if d and d not in order)
         if not query:
@@ -1429,8 +1495,8 @@ class OrgTab(QWidget):
             # 부서 바로 아래(부서장 · 팀 없는 부서원) → 팀(팀장 · 팀원). 겸직한 곳에는 '겸직' 표시
             # 아바타 왼쪽 끝은 바로 위 부서·팀 이름 글자 시작 위치에 맞춘다
             for name, ct in direct:
-                self.list.add_row(CompactMemberRow(self.state, name, concurrent_title=ct,
-                                                   left=TreeNodeRow.text_left(0, base)), ('member', name))
+                self._add_member(name, lambda n=name, c=ct: CompactMemberRow(
+                    self.state, n, concurrent_title=c, left=TreeNodeRow.text_left(0, base)))
             for team, team_members in teams:
                 team_open = (dept, team) not in self.collapsed_teams or bool(query)
                 team_node = TreeNodeRow(team, len(team_members), not team_open, depth=1, chip=True,
@@ -1439,8 +1505,8 @@ class OrgTab(QWidget):
                 self.list.add_row(team_node, ('unit', company, (dept, team)), selectable=False)
                 if team_open:
                     for name, ct in team_members:
-                        self.list.add_row(CompactMemberRow(self.state, name, concurrent_title=ct,
-                                                           left=TreeNodeRow.text_left(1, base)), ('member', name))
+                        self._add_member(name, lambda n=name, c=ct: CompactMemberRow(
+                            self.state, n, concurrent_title=c, left=TreeNodeRow.text_left(1, base)))
 
     def _dept_layout(self, units, dept):
         """부서 한 곳 → (부서 바로 아래 [(이름, 겸직직위|None)], [(팀, [(이름, 겸직직위|None)])])
