@@ -4,7 +4,7 @@
 from tests.test_kakao_server import ServerTestBase, Client, uname
 
 from server.chat.chat_server import parse_args
-from server.kakao.server import KakaoServer, LOGIN_FAILED, RESET_MISMATCH
+from server.kakao.server import KakaoServer, LOGIN_FAILED, LOGIN_FAILED_CLOSED, RESET_MISMATCH
 from server.kakao.store import Store
 
 CLOSED = Store.REGISTER_CLOSED
@@ -147,7 +147,8 @@ class ClosedRegistrationTests(RegistrationTestBase):
         self.store.register_user(admin, 'KCS 홀딩스', f'{admin}@kcs.test', 'pw-1234')
         self.store.set_admin(admin, True)
         for login_id in (unregistered, uname('nobody'), 'nobody@kcs.test'):
-            self.assertEqual(self.refused({'type': 'join', 'username': login_id, 'password': 'pw-1234'}), LOGIN_FAILED)
+            self.assertEqual(self.refused({'type': 'join', 'username': login_id, 'password': 'pw-1234'}),
+                             LOGIN_FAILED_CLOSED)
         for name in (unregistered, stopped, admin, uname('nobody')):
             self.assertEqual(self.refused({'type': 'password_reset', 'username': name, 'email': f'{name}@kcs.test',
                                            'new_password': 'new-pass', 'code': 'ABCD-EFGH'}), RESET_MISMATCH, name)
@@ -158,7 +159,7 @@ class ClosedRegistrationTests(RegistrationTestBase):
         c = self.fresh()
         for _ in range(self.server.LOGIN_MAX_FAILURES['id']):
             self.assertEqual(c.expect_error({'type': 'join', 'username': login_id, 'password': 'pw-1234'})['message'],
-                             LOGIN_FAILED)
+                             LOGIN_FAILED_CLOSED)
         self.assertIn('너무 많습니다', c.expect_error({'type': 'join', 'username': login_id,
                                                   'password': 'pw-1234'})['message'])
 
@@ -181,7 +182,29 @@ class ClosedRegistrationTests(RegistrationTestBase):
         self.fresh().request({'type': 'join', 'username': 'first@kcs.test', 'password': 'initial-pw'}, 'welcome')
 
 
+    def test_failed_login_text_is_the_same_for_everyone_and_points_to_registration(self):
+        registered = self.member()
+        self.store.set_password(registered, 'right-password')
+        seen = set()
+        for login_id, password in ((registered, 'wrong-password'), (self.member(), 'any-password'),
+                                   (uname('nobody'), 'any-password')):
+            err = self.fresh().expect_error({'type': 'join', 'username': login_id, 'password': password})
+            self.server._login_failures.clear()
+            self.assertEqual(err['code'], 'auth_failed')
+            seen.add(err['message'])
+        self.assertEqual(seen, {LOGIN_FAILED_CLOSED})
+        self.assertTrue(LOGIN_FAILED_CLOSED.startswith(LOGIN_FAILED))
+        self.assertIn('등록 코드', LOGIN_FAILED_CLOSED)
+        self.assertNotIn('처음 사용 등록', LOGIN_FAILED_CLOSED)    # 이 말이 있으면 클라이언트가 등록 화면으로 넘긴다
+
+
 class OpenRegistrationTests(RegistrationTestBase):
+    def test_open_server_login_failure_has_no_registration_hint(self):
+        name = self.member()
+        self.store.set_password(name, 'right-password')
+        err = self.fresh().expect_error({'type': 'join', 'username': name, 'password': 'wrong-password'})
+        self.assertEqual((err['message'], err['code']), (LOGIN_FAILED, 'auth_failed'))
+
     def test_open_server_keeps_self_registration(self):
         self.assertTrue(self.server.open_registration)
         name = uname('new')

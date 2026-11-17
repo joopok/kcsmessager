@@ -21,6 +21,7 @@ import threading
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Callable, Iterable, Optional
+from pathlib import Path
 
 ISO_FMT = '%Y-%m-%dT%H:%M:%S'
 
@@ -353,10 +354,43 @@ def _locked(func: Callable) -> Callable:
     return wrapper
 
 
+def _reads(func: Callable) -> Callable:
+    """읽기만 하는 무거운 조회(검색 · 서랍 · 멘션 모아보기 등): 읽기 전용 두 번째 연결에서 돈다.
+    WAL 이라 쓰는 쪽을 막지 않고 전역 잠금도 잡지 않는다 - 큰 방을 훑는 조회 한 번이 다른 요청을 세우지 않는다.
+    두 번째 연결이 없으면(메모리 DB 등) 예전처럼 전역 잠금 안에서 돈다. 이 표시가 붙은 메서드는 쓰면 안 된다"""
+    @functools.wraps(func)
+    def wrapper(self: 'Store', *args: Any, **kwargs: Any) -> Any:
+        if self._read_db is None:
+            with self._lock:
+                return func(self, *args, **kwargs)
+        with self._read_lock:
+            self._tls.db = self._read_db
+            try:
+                return func(self, *args, **kwargs)
+            finally:
+                self._tls.db = None
+    return wrapper
+
+
 class Store:
     """SQLite 기반 스레드 안전 저장소."""
 
-    def __init__(self, db_path: str, retention_days: float = DEFAULT_RETENTION_DAYS) -> None:
+    TOOL_NEEDS_RESTART = 'DB 가 예전 버전입니다. 서버를 새 버전으로 한 번 다시 시작한 뒤 실행해 주세요.'
+
+    @classmethod
+    def open_for_tools(cls, db_path: str) -> 'Store':
+        """관리자 도구용 (명세 §4.2): 이미 만들어진 DB 는 표 만들기 · 구조 변경 · org.json 시드 없이 연다
+        (가동 중인 서버의 DB 에 도구가 구조 변경 · 시드를 쓰지 않게). DB 가 없으면 서버처럼 처음부터 만든다"""
+        fresh = True
+        if db_path != ':memory:' and os.path.isfile(db_path):
+            probe = sqlite3.connect(db_path)
+            try:
+                fresh = probe.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'").fetchone() is None
+            finally:
+                probe.close()
+        return cls(db_path, setup=fresh)
+
+    def __init__(self, db_path: str, retention_days: float = DEFAULT_RETENTION_DAYS, setup: bool = True) -> None:
         directory = os.path.dirname(os.path.abspath(db_path))
         os.makedirs(directory, exist_ok=True)
         self.db_path = db_path
@@ -365,22 +399,50 @@ class Store:
         self._lock = threading.Lock()
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
+        self._tls = threading.local()               # _reads 가 도는 동안 그 스레드의 조회를 읽기 전용 연결로 돌린다
+        self._read_lock = threading.Lock()
+        self._read_db: Optional[sqlite3.Connection] = None
         with self._lock:
             self._db.execute('PRAGMA foreign_keys=ON')
-            self._db.execute('PRAGMA journal_mode=WAL')
-            self._db.executescript(_SCHEMA)
-            self._migrate()
             self.org_meta = {'holding': None, 'companies': []}
-            self._seed_users(self._load_seed(directory))
-            self._db.commit()
+            if setup:
+                self._db.execute('PRAGMA journal_mode=WAL')
+                self._db.executescript(_SCHEMA)
+                self._migrate()
+                self._seed_users(self._load_seed(directory))
+                self._db.commit()
+            else:                   # 도구: org.json 은 회사 목록(org_meta)을 알려고 읽기만 한다 - DB 에는 쓰지 않는다
+                self._load_seed(directory)
+        self._open_read_connection()
+
+    def _open_read_connection(self) -> None:
+        """무거운 조회용 읽기 전용 연결 (명세 §5). 열 수 없으면 없는 대로 돈다"""
+        if self.db_path == ':memory:':
+            return
+        try:
+            db = sqlite3.connect(Path(os.path.abspath(self.db_path)).as_uri() + '?mode=ro', uri=True,
+                                 check_same_thread=False, timeout=10)
+            db.row_factory = sqlite3.Row
+            db.execute('PRAGMA query_only=ON')
+            db.execute('SELECT 1 FROM users LIMIT 1').fetchone()
+            self._read_db = db
+        except sqlite3.Error:
+            self._read_db = None
 
     # ------------------------------------------------------------------ 공통
-    @_locked
     def close(self) -> None:
-        try:
-            self._db.close()
-        except sqlite3.Error:
-            pass
+        with self._read_lock:
+            reader, self._read_db = self._read_db, None
+            if reader is not None:
+                try:
+                    reader.close()
+                except sqlite3.Error:
+                    pass
+        with self._lock:
+            try:
+                self._db.close()
+            except sqlite3.Error:
+                pass
 
     def _migrate(self) -> None:
         """v2 DB 에 v2.1 사용자 컬럼을 추가."""
@@ -445,6 +507,8 @@ class Store:
         self._db.execute('CREATE INDEX IF NOT EXISTS idx_attachments_expiry ON attachments(expired, created_at)')
         self._db.execute('CREATE INDEX IF NOT EXISTS idx_messages_post ON messages(post_id)')
         self._db.execute('CREATE INDEX IF NOT EXISTS idx_attachments_uploader ON attachments(uploader, created_at)')
+        # 알림이 있는 일정을 시작 시각 범위로 찾는다 (매초 도는 due_reminders 가 전체 일정을 훑지 않게)
+        self._db.execute('CREATE INDEX IF NOT EXISTS idx_events_remind ON events(start) WHERE remind_minutes IS NOT NULL')
 
     def _add_columns(self, table: str, columns: Iterable[tuple[str, str]]) -> None:
         existing = {r['name'] for r in self._all(f'PRAGMA table_info({table})')}
@@ -573,10 +637,10 @@ class Store:
                          'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (json.dumps(applied, ensure_ascii=False),))
 
     def _one(self, sql: str, params: Iterable[Any] = ()) -> Optional[sqlite3.Row]:
-        return self._db.execute(sql, tuple(params)).fetchone()
+        return (getattr(self._tls, 'db', None) or self._db).execute(sql, tuple(params)).fetchone()
 
     def _all(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
-        return self._db.execute(sql, tuple(params)).fetchall()
+        return (getattr(self._tls, 'db', None) or self._db).execute(sql, tuple(params)).fetchall()
 
     # ------------------------------------------------------------------ 사용자
     @staticmethod
@@ -1633,11 +1697,73 @@ class Store:
     def room_dict(self, room_id: str, viewer: str) -> Optional[dict]:
         return self._room_dict(room_id, viewer)
 
+    _IN_CHUNK = 500           # IN (...) 한 번에 넣는 값의 수
+
+    def _rows_in(self, sql: str, ids: list, before: tuple = ()) -> list[sqlite3.Row]:
+        """sql 의 {marks} 자리에 ids 를 IN 목록으로 넣어 조회 (많으면 나눠서)"""
+        rows: list[sqlite3.Row] = []
+        for start in range(0, len(ids), self._IN_CHUNK):
+            chunk = ids[start:start + self._IN_CHUNK]
+            rows += self._all(sql.format(marks=','.join('?' * len(chunk))), (*before, *chunk))
+        return rows
+
     @_locked
     def rooms_for_user(self, username: str) -> list[dict]:
-        rows = self._all('SELECT room_id FROM room_members WHERE username=?', (username,))
-        rooms = [self._room_dict(r['room_id'], username) for r in rows]
-        rooms = [r for r in rooms if r is not None]
+        """내가 속한 모든 방의 Room (welcome). 방마다 따로 묻지 않고 종류별로 한 번씩 묶어 조회한다 -
+        _room_dict 와 같은 값을 낸다 (tests/test_kakao_room_list.py 가 둘을 비교한다)"""
+        # 방마다: 내가 보기 시작하는 번호, 마지막 메시지 번호, 안 읽은 수 (차단한 사람 · 들어오기 전 메시지 제외)
+        mine = self._all(
+            'SELECT rm.room_id, rm.since_msg_id AS since, '
+            '(SELECT m.msg_id FROM messages m WHERE m.room_id=rm.room_id AND m.msg_id>rm.since_msg_id '
+            f' AND m.{_NOT_BLOCKED} ORDER BY m.msg_id DESC LIMIT 1) AS last_id, '
+            '(SELECT COUNT(*) FROM messages m WHERE m.room_id=rm.room_id '
+            ' AND m.msg_id>MAX(COALESCE(rp.last_read_msg_id, 0), rm.since_msg_id) '
+            f" AND m.sender!=rm.username AND m.kind!='system' AND m.{_NOT_BLOCKED}) AS unread "
+            'FROM room_members rm LEFT JOIN read_pointers rp ON rp.room_id=rm.room_id AND rp.username=rm.username '
+            'WHERE rm.username=?', (username, username, username))
+        ids = [r['room_id'] for r in mine]
+        if not ids:
+            return []
+        room_rows = {r['room_id']: r for r in self._rows_in('SELECT * FROM rooms WHERE room_id IN ({marks})', ids)}
+        members: dict[str, list[str]] = {}
+        nicknames: dict[str, dict[str, str]] = {}
+        for r in self._rows_in('SELECT room_id, username, nickname FROM room_members WHERE room_id IN ({marks}) '
+                               'ORDER BY joined_at, rowid', ids):
+            members.setdefault(r['room_id'], []).append(r['username'])
+            if r['nickname'] is not None:
+                nicknames.setdefault(r['room_id'], {})[r['username']] = r['nickname']
+        pointers: dict[str, dict[str, int]] = {}
+        for r in self._rows_in('SELECT room_id, username, last_read_msg_id FROM read_pointers '
+                               'WHERE room_id IN ({marks})', ids):
+            pointers.setdefault(r['room_id'], {})[r['username']] = int(r['last_read_msg_id'])
+        wanted = {int(r['last_id']) for r in mine if r['last_id'] is not None}
+        wanted |= {int(row['notice_msg_id']) for row in room_rows.values() if row['notice_msg_id'] is not None}
+        messages = {int(r['msg_id']): self._message_dict(r)
+                    for r in self._rows_in('SELECT * FROM messages WHERE msg_id IN ({marks})', sorted(wanted))}
+        rooms = []
+        for info in mine:
+            room_id = info['room_id']
+            row = room_rows.get(room_id)
+            if row is None:
+                continue
+            room_members = members.get(room_id, [])
+            ptrs = pointers.get(room_id, {})
+            notice_id = row['notice_msg_id']
+            rooms.append({
+                'room_id': room_id,
+                'type': row['type'],
+                'name': row['name'],
+                'members': room_members,
+                'owner': self._owner(row, room_members),
+                'created_at': row['created_at'],
+                'notice': messages.get(int(notice_id)) if notice_id is not None else None,
+                'last_message': messages.get(int(info['last_id'])) if info['last_id'] is not None else None,
+                'read_pointers': {u: ptrs.get(u, 0) for u in room_members},
+                'unread_count': int(info['unread']),
+                'description': row['description'],
+                'tags': self._json_list(row['tags']),
+                'nicknames': nicknames.get(room_id, {}),
+            })
         rooms.sort(key=lambda r: (r['last_message']['timestamp'] if r['last_message'] else r['created_at']),
                    reverse=True)
         return rooms
@@ -1803,7 +1929,7 @@ class Store:
         rows = list(reversed(rows[:limit]))
         return [self._message_dict(r) for r in rows], has_more
 
-    @_locked
+    @_reads
     def mentions_of(self, username: str, limit: int = 100) -> list[dict]:
         """내가 속한 방에서 나를 멘션한 메시지 (최신순, 삭제·차단 제외) - 멘션 모아보기 (§10.5)"""
         rows = self._all(
@@ -1936,7 +2062,7 @@ class Store:
         self._db.commit()
         return self._get_message(msg_id)
 
-    @_locked
+    @_reads
     def search(self, username: str, query: str, room_id: Optional[str]) -> list[dict]:
         escaped = query.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
         sql = ('SELECT m.* FROM messages m JOIN room_members rm '
@@ -2170,12 +2296,22 @@ class Store:
             (username, username, end, start))
         return [self._event_dict(r['event_id']) for r in rows]
 
+    MAX_REMIND_MINUTES = 60 * 24 * 30      # 서버가 받는 remind_minutes 의 최댓값 (30일)
+
     @_locked
     def due_reminders(self, now: datetime, grace: timedelta) -> list[tuple[dict, int]]:
         """알림 시각이 지났고 아직 발송하지 않은 일정을 발송 처리 후 (event, minutes) 목록으로 반환."""
         lower = (now - grace).strftime(ISO_FMT)
-        rows = self._all('SELECT event_id, start, remind_minutes FROM events '
-                         'WHERE remind_minutes IS NOT NULL AND start>=?', (lower,))
+        # 알림 시각(start - remind_minutes)이 이미 지난 것만: 시작 시각 범위는 색인(idx_events_remind)으로 좁힌다.
+        # 알림은 길어야 MAX_REMIND_MINUTES 전이므로 그보다 먼 일정은 볼 필요가 없다
+        upper = (now + timedelta(minutes=self.MAX_REMIND_MINUTES) + grace).strftime(ISO_FMT)
+        rows = self._all(
+            'SELECT event_id, start, remind_minutes FROM events '
+            'WHERE remind_minutes IS NOT NULL AND start>=? AND start<=? '
+            "AND strftime('%Y-%m-%dT%H:%M:%S', start, '-' || remind_minutes || ' minutes')<=? "
+            'AND NOT EXISTS (SELECT 1 FROM reminders_sent s WHERE s.event_id=events.event_id '
+            "AND s.remind_at=strftime('%Y-%m-%dT%H:%M:%S', events.start, '-' || events.remind_minutes || ' minutes'))",
+            (lower, upper, now.strftime(ISO_FMT)))
         result = []
         for r in rows:
             try:
@@ -2191,7 +2327,8 @@ class Store:
                 (r['event_id'], remind_at.strftime(ISO_FMT), now_iso()))
             if cur.rowcount == 1:
                 result.append((self._event_dict(r['event_id']), minutes))
-        self._db.commit()
+        if self._db.in_transaction:
+            self._db.commit()
         return result
 
     # ------------------------------------------------------------------ 할 일
@@ -2335,7 +2472,7 @@ class Store:
         return {r['owner'] for r in self._all('SELECT owner FROM blocks WHERE blocked=?', (username,))}
 
     # ------------------------------------------------------------------ v3: 톡서랍(전체)
-    @_locked
+    @_reads
     def drawer(self, username: str, kind: str, limit: int) -> list[dict]:
         cond = {'image': "m.kind='image'", 'file': "m.kind IN ('file', 'voice')",
                 'link': "m.kind='text' AND (m.content LIKE '%http://%' OR m.content LIKE '%https://%')"}[kind]

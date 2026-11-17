@@ -170,7 +170,7 @@ def main(argv=None):
     xlsx = os.path.expanduser(args.xlsx)
 
     photos = match_photos(xlsx)
-    store = Store(args.db)
+    store = Store.open_for_tools(args.db)      # 가동 중인 서버의 DB 구조 · 조직도 시드는 건드리지 않는다
     applied, kept, missing = [], [], []
     try:
         with zipfile.ZipFile(xlsx) as zf:

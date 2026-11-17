@@ -109,8 +109,8 @@ class RequirePasswordTests(ServerTestBase):
         from scripts.set_password import main as set_password
         name = uname('adm')
         self.register(name, 'old-pw-12', remember=True)
-        self.assertEqual(set_password([name, '--db', self.db_path, '--password', 'new-pw']), 0)
-        self.assertTrue(self.server.store.check_password('new-pw', self.server.store.password_hash(name)))
+        self.assertEqual(set_password([name, '--db', self.db_path, '--password', 'new-pw-12']), 0)
+        self.assertTrue(self.server.store.check_password('new-pw-12', self.server.store.password_hash(name)))
         self.assertEqual(set_password([name, '--db', self.db_path, '--clear']), 0)
         self.assertIsNone(self.server.store.password_hash(name))
         self.assertEqual(set_password(['없는사람', '--db', self.db_path, '--password', 'abcd']), 1)

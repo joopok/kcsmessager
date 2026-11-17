@@ -26,6 +26,8 @@ BOT_NAME = 'AI 비서'
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 100
 TOP_K = 6
+MAX_PDF_PAGES = 1000   # 학습하는 PDF 에서 읽는 쪽 수
+MAX_DOC_CHARS = 2_000_000   # 학습하는 문서 하나에서 읽는 글자 수 (넘는 부분은 뺀다)
 LLM_TIMEOUT = 60.0     # Claude 호출 한 번의 시간 제한(초) - 답변 작업 스레드가 오래 붙잡히지 않게
 TEXT_EXTS = {'.txt', '.md', '.csv', '.json', '.log', '.py', '.tsv', '.html', '.xml', '.yaml', '.yml'}
 
@@ -92,7 +94,13 @@ def decode_document(name, data, mime=''):
             raise ValueError('PDF를 읽으려면 서버에 pypdf 패키지가 필요합니다.')
         try:
             reader = PdfReader(io.BytesIO(data))
-            text = '\n\n'.join((page.extract_text() or '') for page in reader.pages)
+            parts, size = [], 0
+            for number, page in enumerate(reader.pages):
+                if number >= MAX_PDF_PAGES or size >= MAX_DOC_CHARS:    # 끝없이 읽지 않는다
+                    break
+                parts.append(page.extract_text() or '')
+                size += len(parts[-1])
+            text = '\n\n'.join(parts)
         except Exception as e:
             raise ValueError(f'PDF를 읽을 수 없습니다: {e}')
     elif ext in TEXT_EXTS or mime.startswith('text/'):
@@ -170,7 +178,8 @@ class RagService:
 
     def add_document(self, owner, name, data, mime=''):
         text = decode_document(name, data, mime)
-        pieces = chunk_text(text)
+        truncated = len(text) > MAX_DOC_CHARS
+        pieces = chunk_text(text[:MAX_DOC_CHARS])
         now = datetime.now().isoformat(timespec='seconds')
         with self._lock:
             cur = self._db.execute('INSERT INTO docs(name, owner, size, chunks, created_at) VALUES (?,?,?,?,?)',
@@ -180,7 +189,7 @@ class RagService:
                 self._insert_chunk('doc', doc_id, None, owner, name, piece, now)
             self._db.commit()
         return {'doc_id': doc_id, 'name': name, 'owner': owner, 'size': len(data),
-                'chunks': len(pieces), 'created_at': now}
+                'chunks': len(pieces), 'created_at': now, **({'truncated': True} if truncated else {})}
 
     def list_documents(self, owner):
         with self._lock:

@@ -237,7 +237,9 @@ class SendProgressTests(unittest.TestCase):
         left.settimeout(0.3)
         self.addCleanup(left.close)
         self.addCleanup(right.close)
-        return Connection(left, ('test', 0)), right
+        conn = Connection(left, ('test', 0))
+        self.addCleanup(conn.close, True)
+        return conn, right
 
     def test_slow_reader_still_gets_a_big_payload(self):
         conn, peer = self.pair()
@@ -257,22 +259,26 @@ class SendProgressTests(unittest.TestCase):
         reader.start()
         with unittest.mock.patch.object(server_mod, 'SOCKET_TIMEOUT', 0.3):       # 전체로는 0.3초를 훌쩍 넘긴다
             self.assertTrue(conn.send(payload))
-        reader.join(10)
+            reader.join(10)
         self.assertGreaterEqual(got[0], 3_000_000)
+        self.assertTrue(conn.alive)
 
     def test_stuck_reader_is_dropped(self):
         conn, _peer = self.pair()
         started = time.monotonic()
-        self.assertFalse(conn.send({'type': 'big', 'data': 'x' * 8_000_000}))
-        self.assertFalse(conn.alive)
+        self.assertTrue(conn.send({'type': 'big', 'data': 'x' * 8_000_000}))    # 줄에 세우는 것은 바로 끝난다
+        self.assertLess(time.monotonic() - started, 0.5)
+        while conn.alive and time.monotonic() - started < 5.0:
+            time.sleep(0.05)
+        self.assertFalse(conn.alive)                                           # 받지 않는 연결은 전용 스레드가 닫는다
         self.assertLess(time.monotonic() - started, 3.0)
 
 
 class HelperTests(unittest.TestCase):
     def test_token_bucket(self):
-        bucket = TokenBucket(rate=1000.0, burst=3)
+        bucket = TokenBucket(rate=100.0, burst=3)
         self.assertEqual([bucket.take() for _ in range(4)], [True, True, True, False])
-        time.sleep(0.01)
+        time.sleep(0.1)                 # 시계 · sleep 의 단위가 굵은 OS(약 16ms)에서도 넉넉하게
         self.assertTrue(bucket.take())
 
     def test_window_limiter(self):

@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import binascii
 import codecs
+import collections
 import json
 import logging
 import os
@@ -20,6 +21,7 @@ import sys
 import queue
 import random
 import re
+import select
 import socket
 import threading
 import time
@@ -74,6 +76,10 @@ SECRET_MIN_BYTES = 12 + 16                   # nonce + GCM 태그
 SECRET_PEER_NO_KEY = '상대방이 아직 비밀채팅을 사용할 수 없습니다'
 SECRET_FORBIDDEN = '비밀채팅방에서는 사용할 수 없는 기능입니다.'
 LOGIN_FAILED = '아이디 또는 비밀번호가 올바르지 않습니다.'
+# 등록이 닫힌 서버의 로그인 실패 문구 (§4.1): 계정이 있든 없든 같다. 클라이언트는 문구에 '처음 사용 등록' 이 있으면 등록 화면으로
+# 바꾸므로(틀린 비밀번호에도 화면이 넘어간다) 그 말을 넣지 않고 화면의 링크 이름으로 안내한다
+LOGIN_FAILED_CLOSED = (LOGIN_FAILED + ' 처음 쓰는 분은 관리자에게 등록 코드를 받아 '
+                       '아래 [처음 사용하시나요?]에서 등록해 주세요.')
 LOGIN_TOKEN_EXPIRED = '저장된 로그인 정보가 만료되었습니다. 비밀번호를 입력해 주세요.'
 NAME_FIXED = '이름은 조직도에 등록된 이름으로 고정되어 바꿀 수 없습니다.'
 EMAIL_ADMIN_ONLY = '이메일은 로그인 아이디라 직접 바꿀 수 없습니다. 관리자에게 변경을 요청해 주세요.'
@@ -86,7 +92,8 @@ NEEDS_REGISTER = '처음 사용하는 아이디입니다. [처음 사용 등록]
 
 # 오류 구분 코드 (명세 §4.1): 문구가 정해진 오류는 여기서 code 를 붙인다. 클라이언트는 문구가 아니라 이 값으로 가른다
 ERROR_CODES = {
-    LOGIN_FAILED: 'auth_failed', LOGIN_TOKEN_EXPIRED: 'token_expired', ACCOUNT_DISABLED: 'account_disabled',
+    LOGIN_FAILED: 'auth_failed', LOGIN_FAILED_CLOSED: 'auth_failed', LOGIN_TOKEN_EXPIRED: 'token_expired',
+    ACCOUNT_DISABLED: 'account_disabled',
     NEEDS_REGISTER: 'needs_register', PASSWORD_REQUIRED: 'password_required', ALREADY_LOGGED_IN: 'already_logged_in',
     LOGIN_REQUIRED: 'login_required', RESET_MISMATCH: 'reset_mismatch', EMAIL_ADMIN_ONLY: 'email_admin_only',
     NAME_FIXED: 'name_fixed',
@@ -370,15 +377,30 @@ def _validate_due(value: Any) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------- 연결
+def encode_frame(payload: dict) -> Optional[bytes]:
+    """보낼 한 줄(JSON + 줄바꿈). 보낼 수 없는 값이 섞였으면 None - 그 한 건만 버린다 (보낼 수 없는 글자는 '?' 로)"""
+    try:
+        return (json.dumps(payload, ensure_ascii=False) + '\n').encode('utf-8', errors='replace')
+    except (TypeError, ValueError, RecursionError) as exc:
+        logger.error('send: 보낼 수 없는 내용 (%s): %s', payload.get('type') if isinstance(payload, dict) else '?', exc)
+        return None
+
+
 class Connection:
-    """클라이언트 연결 1개. 송신은 Lock 으로 보호된다."""
+    """클라이언트 연결 1개. 보낼 것은 대기열에 줄 세우고 이 연결 전용 스레드가 차례로 보낸다 (명세 §2 '연결별 보내기 대기열')
+    - 한 연결이 받지 않고 멈춰도 send() 를 부른 쪽(다른 사람에게도 보내는 스레드)은 기다리지 않는다."""
+
+    MAX_QUEUE_BYTES = 32 * 1024 * 1024     # 이보다 많이 밀리면 그 연결을 닫는다
+    MAX_QUEUE_FRAMES = 20000
+    REPLY_WAIT_BYTES = 8 * 1024 * 1024     # 자기 요청의 응답(wait=True)은 이만큼 쌓여 있으면 줄어들 때까지 기다린다
+    DROP_BYTES = 2 * 1024 * 1024           # 버려도 되는 조각(통화 미디어)은 이만큼 쌓인 연결에는 보내지 않는다
+    DRAIN_SECONDS = 2.0                    # 닫을 때 줄 서 있던 것을 마저 보내는 시간
 
     def __init__(self, sock: socket.socket, address: Any) -> None:
         self.sock = sock
         self.address = address
         self.username: Optional[str] = None
         self.alive = True
-        self._send_lock = threading.Lock()
         now = time.monotonic()
         self.connected_at = now
         self.last_recv = now
@@ -386,37 +408,196 @@ class Connection:
         self.heartbeat = False          # ping/pong 을 하는 클라이언트 (그런 연결만 조용하면 끊는다 - 명세 §2)
         self.bucket: Optional[TokenBucket] = None        # 요청 빈도 (로그인하면 채운다)
         self.media_bucket: Optional[TokenBucket] = None  # 통화 미디어 조각 빈도
+        self._cond = threading.Condition()
+        self._queue: 'collections.deque[bytes]' = collections.deque()
+        self._queued_bytes = 0                           # 줄 서 있는 것 + 지금 보내는 것
+        self._writer: Optional[threading.Thread] = None
+        self._force = False                              # True 면 줄 서 있는 것을 버리고 바로 닫는다
+        self._drain_until = 0.0
+        self._shut = False
+        self._gate: Optional[int] = None                 # 이 스레드가 보내는 것만 먼저 줄 세운다 (로그인 응답)
+        self._gated: list[bytes] = []
+        self._poller: Any = None                         # 지금 바로 보낼 수 있는지 보는 용도 (없는 OS 는 select)
+        if hasattr(select, 'poll'):
+            try:
+                self._poller = select.poll()
+                self._poller.register(sock.fileno(), select.POLLOUT)
+            except (OSError, ValueError):
+                self._poller = None
 
     @property
     def ip(self) -> str:
         return self.address[0] if isinstance(self.address, tuple) and self.address else str(self.address)
 
-    def send(self, payload: dict) -> bool:
+    # ---- 줄 세우기 ----
+    def send(self, payload: dict, wait: bool = False, droppable: bool = False) -> bool:
+        """payload 를 보낼 줄에 세운다 → 세웠으면 True (실제 전송은 전용 스레드가 한다)"""
         if not self.alive:
             return False
-        try:       # 보낼 수 없는 값이 섞인 한 건 때문에 나머지 수신자 전송이 끊기지 않게: 이 건만 버린다
-            data = (json.dumps(payload, ensure_ascii=False) + '\n').encode('utf-8', errors='replace')
-        except (TypeError, ValueError, RecursionError) as exc:
-            logger.error('send: 보낼 수 없는 내용 (%s): %s', payload.get('type'), exc)
+        data = encode_frame(payload)
+        return data is not None and self.send_frame(data, wait=wait, droppable=droppable)
+
+    def send_frame(self, data: bytes, wait: bool = False, droppable: bool = False) -> bool:
+        """이미 만든 한 줄을 세운다 (여러 사람에게 같은 내용을 보낼 때 한 번만 만든다).
+        wait: 이 연결 자신의 요청에 대한 응답 - 많이 밀려 있으면 줄어들 때까지 기다린다 (자기 다음 요청만 늦어진다)
+        droppable: 통화 미디어처럼 버려도 되는 조각 - 밀려 있는 연결에는 보내지 않는다"""
+        with self._cond:
+            if not self.alive:
+                return False
+            if self._gate is not None and threading.get_ident() != self._gate:
+                self._gated.append(data)            # 로그인 응답이 먼저 가도록 잠깐 따로 모아 둔다
+                return True
+            if droppable and self._queued_bytes > self.DROP_BYTES:
+                return False
+            if wait and self._queued_bytes > self.REPLY_WAIT_BYTES:
+                deadline = time.monotonic() + SOCKET_TIMEOUT * 4
+                while self.alive and self._queued_bytes > self.REPLY_WAIT_BYTES:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    self._cond.wait(min(left, 1.0))
+                if not self.alive:
+                    return False
+            if self._queued_bytes == 0:     # 밀린 것이 없으면 기다리지 않는 한도 안에서 바로 보낸다 (스레드를 건너가지 않는다)
+                sent = self._send_now(data)
+                if sent == len(data):
+                    self.last_sent = time.monotonic()
+                    return True
+                if sent > 0:
+                    data = bytes(memoryview(data)[sent:])      # 못 보낸 나머지만 줄에 세운다
+                elif sent < 0:
+                    data = b''
+            if data and self._enqueue(data):
+                return True
+            failed = not data
+        if failed:
+            self.close(force=True)
             return False
+        logger.info('받는 쪽이 밀려 연결을 닫습니다 (%s, %s)', self.username, self.address)
+        self.close(force=True)
+        return False
+
+    def _send_now(self, data: bytes) -> int:
+        """기다리지 않고 보낼 수 있는 만큼만 보낸다 → 보낸 바이트 수 (지금은 못 보내면 0, 연결 오류면 -1). _cond 안에서 호출"""
         try:
-            with self._send_lock:
-                # 한 번에 보낸 만큼씩 시간 제한을 다시 센다 (느린 회선도 큰 첨부를 받는다). 전체로는 최소 속도만 본다
-                view = memoryview(data)
-                deadline = time.monotonic() + SOCKET_TIMEOUT + len(data) / MIN_SEND_BYTES_PER_SEC
-                while view:
-                    view = view[self.sock.send(view[:SEND_CHUNK]):]
-                    if view and time.monotonic() > deadline:
-                        raise socket.timeout('너무 느린 연결')
-                self.last_sent = time.monotonic()
-            return True
+            if os.name == 'posix' and self.sock.gettimeout():
+                # 시간 제한이 있는 소켓은 안쪽이 '기다리지 않는' 상태라, 바로 쓰면 들어가는 만큼만 들어간다
+                try:
+                    return os.write(self.sock.fileno(), data)
+                except BlockingIOError:
+                    return 0
+            if self._poller is not None:
+                ready = self._poller.poll(0)
+                if ready and ready[0][1] & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+                    return -1
+            else:
+                ready = select.select([], [self.sock], [], 0)[1]
+            return self.sock.send(data) if ready else 0
+        except (OSError, ValueError):
+            return -1
+
+    def _enqueue(self, data: bytes) -> bool:
+        """_cond 를 잡은 채 호출. 한도를 넘으면 False"""
+        if self._queue and (self._queued_bytes + len(data) > self.MAX_QUEUE_BYTES
+                            or len(self._queue) >= self.MAX_QUEUE_FRAMES):
+            return False
+        self._queue.append(data)
+        self._queued_bytes += len(data)
+        if self._writer is None:
+            self._writer = threading.Thread(target=self._write_loop, daemon=True, name=f'kakao-send-{self.address}')
+            self._writer.start()
+        elif len(self._queue) == 1:         # 비어 있다가 생겼을 때만 깨운다 (전용 스레드는 빌 때만 잔다)
+            self._cond.notify_all()
+        return True
+
+    def hold_others(self) -> None:
+        """지금부터 release_others() 까지는 이 스레드가 보내는 것만 줄에 세우고, 다른 스레드의 것은 그 뒤로 미룬다"""
+        with self._cond:
+            self._gate = threading.get_ident()
+
+    def release_others(self) -> None:
+        with self._cond:
+            self._gate = None
+            held, self._gated = self._gated, []
+            for data in held:
+                if self.alive and not self._enqueue(data):
+                    break
+
+    def queued_bytes(self) -> int:
+        with self._cond:
+            return self._queued_bytes
+
+    # ---- 전용 스레드 ----
+    def _write_loop(self) -> None:
+        try:
+            while True:
+                with self._cond:
+                    while not self._queue and self.alive:
+                        self._cond.wait(1.0)
+                    if not self._queue or self._force or (not self.alive and time.monotonic() > self._drain_until):
+                        break
+                    data = self._queue.popleft()
+                    if self._queue and len(data) < SEND_CHUNK:      # 줄 서 있는 작은 것들은 묶어서 한 번에 보낸다
+                        parts, size = [data], len(data)
+                        while self._queue and size + len(self._queue[0]) <= SEND_CHUNK:
+                            parts.append(self._queue.popleft())
+                            size += len(parts[-1])
+                        data = b''.join(parts)
+                self._write(data)
+                with self._cond:
+                    self._queued_bytes -= len(data)
+                    self.last_sent = time.monotonic()
+                    self._cond.notify_all()
         except OSError as exc:
             logger.info('send failed to %s: %s', self.address, exc)
-            self.close()
-            return False
+        except Exception:
+            logger.exception('보내기 스레드 오류 (%s)', self.address)
+        self._finish()
 
-    def close(self) -> None:
-        self.alive = False
+    def _write(self, data: bytes) -> None:
+        # 한 번에 보낸 만큼씩 시간 제한을 다시 센다 (느린 회선도 큰 첨부를 받는다). 전체로는 최소 속도만 본다
+        view = memoryview(data)
+        deadline = time.monotonic() + SOCKET_TIMEOUT + len(data) / MIN_SEND_BYTES_PER_SEC
+        while view:
+            view = view[self.sock.send(view[:SEND_CHUNK]):]
+            if view:
+                now = time.monotonic()
+                if now > deadline or self._force or (not self.alive and now > self._drain_until):
+                    raise socket.timeout('너무 느린 연결')
+
+    def _finish(self) -> None:
+        with self._cond:
+            self.alive = False
+            self._queue.clear()
+            self._gated = []
+            self._queued_bytes = 0
+            self._cond.notify_all()
+        self._shutdown()
+
+    # ---- 닫기 ----
+    def close(self, force: bool = False) -> None:
+        """연결을 닫는다. 줄 서 있던 것(오류 안내 등)은 DRAIN_SECONDS 까지 마저 보낸다. force 면 버리고 바로 닫는다"""
+        with self._cond:
+            if self.alive:
+                self._drain_until = time.monotonic() + self.DRAIN_SECONDS
+            self.alive = False
+            self._force = self._force or force
+            draining = (not self._force and bool(self._queue) and self._writer is not None
+                        and self._writer.is_alive() and threading.current_thread() is not self._writer)
+            self._cond.notify_all()
+        if not draining:
+            self._shutdown()
+            return
+        try:
+            self.sock.settimeout(self.DRAIN_SECONDS)     # 전용 스레드가 남은 것을 보내고 닫는다
+        except OSError:
+            self._shutdown()
+
+    def _shutdown(self) -> None:
+        with self._cond:
+            if self._shut:
+                return
+            self._shut = True
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
         except OSError:
@@ -434,10 +615,10 @@ class TokenBucket:
     def __init__(self, rate: float, burst: float) -> None:
         self.rate, self.burst = float(rate), float(burst)
         self.tokens = float(burst)
-        self.stamp = time.monotonic()
+        self.stamp = time.perf_counter()      # 촘촘한 시계 (Windows 의 monotonic 은 약 16ms 단위)
 
     def take(self) -> bool:
-        now = time.monotonic()
+        now = time.perf_counter()
         self.tokens = min(self.burst, self.tokens + (now - self.stamp) * self.rate)
         self.stamp = now
         if self.tokens < 1.0:
@@ -620,6 +801,10 @@ class KakaoServer(AdminHandlers):
         self.rag_factory = rag_factory or _default_rag_factory
         self.rag: Any = None
         self._rag_queue: 'queue.Queue[Optional[Callable[[], None]]]' = queue.Queue()
+        self._rag_ready: 'queue.Queue[Optional[str]]' = queue.Queue()
+        self._rag_pending: 'dict[str, collections.deque[Callable[[], None]]]' = {}   # key 별로 줄 서 있는 일
+        self._rag_slow_count = 0
+        self._rag_slow_lock = threading.Lock()
         self.port = port
         self.db_path = db_path or DEFAULT_DB_PATH
         self.tick_seconds = max(0.05, float(tick_seconds))
@@ -780,6 +965,9 @@ class KakaoServer(AdminHandlers):
             except Exception as exc:
                 logger.warning('포털 연동 비활성화 (메신저 자체 RAG 사용): %s', exc)
         self._rag_queue = queue.Queue()
+        self._rag_ready = queue.Queue()         # 할 일이 있는 key (방 · 사용자) - 한 key 는 한 번에 하나만 들어 있다
+        self._rag_pending = {}
+        self._rag_slow_count = 0
 
     def _spawn(self, target: Callable, *args: Any, name: str = '') -> threading.Thread:
         t = threading.Thread(target=target, args=args, daemon=True, name=name or None)
@@ -796,6 +984,7 @@ class KakaoServer(AdminHandlers):
         self._spawn(self._rag_worker, name='kakao-rag')
         self._spawn(self._preview_worker, name='kakao-preview')
         self._spawn(self._heartbeat_loop, name='kakao-heartbeat')
+        self._spawn_rag_workers()
         try:
             self._accept_loop()
         finally:
@@ -808,6 +997,7 @@ class KakaoServer(AdminHandlers):
         self._spawn(self._rag_worker, name='kakao-rag')
         self._spawn(self._preview_worker, name='kakao-preview')
         self._spawn(self._heartbeat_loop, name='kakao-heartbeat')
+        self._spawn_rag_workers()
         return self._spawn(self._accept_loop, name='kakao-accept')
 
     def stop(self) -> None:
@@ -822,8 +1012,10 @@ class KakaoServer(AdminHandlers):
         with self._conns_lock:
             conns = list(self._conns)
         for conn in conns:
-            conn.close()
+            conn.close(force=True)
         self._rag_queue.put(None)
+        for _ in range(max(1, int(self.RAG_WORKERS))):
+            self._rag_ready.put(None)
         self._preview_queue.put(None)
         current = threading.current_thread()
         with self._threads_lock:
@@ -862,7 +1054,7 @@ class KakaoServer(AdminHandlers):
                     self._conns.add(conn)
             if full:
                 logger.warning('연결 수 한도(%s)에 닿아 새 연결을 닫습니다: %s', self.MAX_CONNECTIONS, address)
-                conn.close()
+                conn.close(force=True)
                 continue
             self._spawn(self._client_loop, conn, name=f'kakao-client-{address}')
 
@@ -887,7 +1079,7 @@ class KakaoServer(AdminHandlers):
                 try:
                     if conn.heartbeat and now - conn.last_recv > self.HEARTBEAT_TIMEOUT:
                         logger.info('%s 응답 없음 - 연결을 닫습니다 (%s)', conn.username, conn.address)
-                        conn.close()            # 읽기 스레드가 깨어나 접속 목록에서 뺀다
+                        conn.close(force=True)  # 읽기 스레드가 깨어나 접속 목록에서 뺀다
                     elif now - conn.last_sent >= self.HEARTBEAT_SECONDS:
                         conn.send({'type': 'ping'})
                 except Exception:
@@ -947,12 +1139,19 @@ class KakaoServer(AdminHandlers):
         with self._conns_lock:
             return [c for cs in self._by_user.values() for c in cs]
 
-    def _deliver(self, conns: list[Connection], payload: dict, ctx: Optional[Ctx] = None) -> None:
+    def _deliver(self, conns: list[Connection], payload: dict, ctx: Optional[Ctx] = None,
+                 droppable: bool = False) -> None:
+        """같은 내용을 여러 연결에 보낸다 - 한 번만 만들어 각 연결의 대기열에 세운다 (보내는 쪽은 기다리지 않는다)"""
+        frame: Optional[bytes] = None
         for conn in conns:
             if ctx is not None and conn is ctx.conn and ctx.has_req_id:
-                conn.send({**payload, 'req_id': ctx.req_id})
-            else:
-                conn.send(payload)
+                conn.send({**payload, 'req_id': ctx.req_id}, droppable=droppable)
+                continue
+            if frame is None:
+                frame = encode_frame(payload)
+                if frame is None:
+                    return
+            conn.send_frame(frame, droppable=droppable)
 
     def _push(self, usernames: Any, payload: dict, ctx: Optional[Ctx] = None) -> None:
         self._deliver(self._user_conns(set(usernames)), payload, ctx)
@@ -964,7 +1163,7 @@ class KakaoServer(AdminHandlers):
     def _reply(self, ctx: Ctx, payload: dict) -> None:
         if ctx.has_req_id:
             payload = {**payload, 'req_id': ctx.req_id}
-        ctx.conn.send(payload)
+        ctx.conn.send(payload, wait=True)      # 자기 요청의 응답: 많이 밀려 있으면 이 연결의 다음 처리만 늦춘다
 
     def _limit_action(self, username: str, action: str) -> None:
         """사용자별 동작 횟수 제한 (ACTION_LIMITS). 넘으면 code:"rate_limited" 오류"""
@@ -1213,6 +1412,8 @@ class KakaoServer(AdminHandlers):
     # 연결 · 요청 한도 (명세 §2). 테스트에서 줄여 쓸 수 있게 클래스 값으로 둔다
     MAX_DAILY_UPLOAD_BYTES = 1024 * 1024 * 1024     # 한 사람이 24시간 동안 올릴 수 있는 첨부 용량
     ORPHAN_SWEEP_SECONDS = 3600.0     # 어디에서도 쓰지 않는 첨부를 치우는 간격
+    RAG_WORKERS = 3                   # AI 비서의 오래 걸리는 일(답변 · 문서 학습)을 나눠 하는 작업 스레드 수
+    RAG_BACKLOG = 100                 # 작업 스레드 하나에 밀려 있을 수 있는 일의 수
     MAX_CONNECTIONS = 3000            # 동시에 열려 있는 연결 수
     MAX_PRELOGIN_PER_IP = 100         # 한 주소에서 로그인하지 않고 열어 둔 연결 수
     PRELOGIN_SECONDS = 30.0           # 로그인하지 않은 연결을 열어 두는 시간
@@ -1370,6 +1571,8 @@ class KakaoServer(AdminHandlers):
         except ProtocolError as exc:
             if str(exc) in (LOGIN_FAILED, LOGIN_TOKEN_EXPIRED):
                 self._record_login_failure(keys)
+            if str(exc) == LOGIN_FAILED and not self.open_registration:
+                raise ProtocolError(LOGIN_FAILED_CLOSED) from None      # 닫힌 서버: 등록 안내를 덧붙인다
             raise
         self._clear_login_failures(keys[:1])
         self._complete_login(conn, msg, 'join', username, created,
@@ -1454,6 +1657,25 @@ class KakaoServer(AdminHandlers):
                         remember: bool) -> None:
         """join/register 성공 뒤: welcome + 접속 알림"""
         login_token = self.store.issue_login_token(username) if remember else None   # 자동 로그인용 (명세 §4.1)
+        conn.hold_others()                     # 로그인 응답이 이 연결로 가는 다른 알림보다 먼저 가게 (§2)
+        try:
+            first_conn = self._send_welcome(conn, msg, req_type, username, login_token)
+        finally:
+            conn.release_others()
+        if first_conn:
+            self._broadcast({'type': 'user_status_changed', 'username': username,
+                             'status': 'online', 'timestamp': now_iso()}, exclude_user=username)
+        if created or first_conn:
+            # 신규 사용자 등록 / 접속 상태(presence) 변경 알림
+            self._broadcast_user(username, exclude_user=username)
+        if self.daily_briefing and first_conn and username != BOT_USERNAME \
+                and self.store.take_briefing_slot(username, date.today().isoformat()):
+            self._rag_queue.put(lambda: self._send_briefing(username))
+        logger.info('%s 접속 (%s)', username, conn.address)
+
+    def _send_welcome(self, conn: Connection, msg: dict, req_type: str, username: str,
+                      login_token: Optional[str]) -> bool:
+        """접속 목록에 넣고 welcome · all_users_list 를 보낸다 → 그 사용자의 첫 연결이었나"""
         with self._conns_lock:
             conns = self._by_user.setdefault(username, set())
             first_conn = not conns
@@ -1486,16 +1708,7 @@ class KakaoServer(AdminHandlers):
         conn.send({'type': 'all_users_list',
                    'users': [u['username'] for u in self.store.list_users()],
                    'online_users': sorted(online)})
-        if first_conn:
-            self._broadcast({'type': 'user_status_changed', 'username': username,
-                             'status': 'online', 'timestamp': now_iso()}, exclude_user=username)
-        if created or first_conn:
-            # 신규 사용자 등록 / 접속 상태(presence) 변경 알림
-            self._broadcast_user(username, exclude_user=username)
-        if self.daily_briefing and first_conn and username != BOT_USERNAME \
-                and self.store.take_briefing_slot(username, date.today().isoformat()):
-            self._rag_queue.put(lambda: self._send_briefing(username))
-        logger.info('%s 접속 (%s)', username, conn.address)
+        return first_conn
 
     def _h_legacy_message(self, ctx: Ctx, msg: dict) -> None:
         if self.require_password:      # 모두에게 가는 구버전 요청은 비밀번호 없는 구버전 · 테스트 서버에서만 (§4)
@@ -2333,7 +2546,8 @@ class KakaoServer(AdminHandlers):
 
     # ------------------------------------------------------------------ RAG (AI 비서)
     def _rag_worker(self) -> None:
-        """RAG 작업(색인·답변·문서 학습)을 순서대로 처리하는 단일 워커."""
+        """금방 끝나는 RAG 작업(색인 · 색인 지우기 · 브리핑 · 안내)을 순서대로 처리한다.
+        오래 걸리는 일(답변 · 문서 학습)은 _rag_slow_worker 들이 맡아, 색인이 느린 답변에 밀리지 않는다"""
         while True:
             job = self._rag_queue.get()
             if job is None or self._stop.is_set():
@@ -2342,6 +2556,46 @@ class KakaoServer(AdminHandlers):
                 job()
             except Exception:
                 logger.exception('RAG 작업 오류')
+
+    def _rag_slow_worker(self) -> None:
+        """오래 걸리는 일을 key 하나씩 집어 처리한다: 같은 key 의 일은 한 번에 하나씩 차례로, 다른 key 는 동시에"""
+        while True:
+            key = self._rag_ready.get()
+            if key is None or self._stop.is_set():
+                break
+            with self._rag_slow_lock:
+                job = self._rag_pending[key][0]
+            try:
+                job()
+            except Exception:
+                logger.exception('RAG 작업 오류')
+            with self._rag_slow_lock:
+                pending = self._rag_pending[key]
+                pending.popleft()
+                self._rag_slow_count -= 1
+                if pending:
+                    self._rag_ready.put(key)        # 같은 key 의 다음 일은 다른 key 들 뒤에 다시 줄 선다
+                else:
+                    del self._rag_pending[key]
+
+    def _spawn_rag_workers(self) -> None:
+        for index in range(max(1, int(self.RAG_WORKERS))):
+            self._spawn(self._rag_slow_worker, name=f'kakao-rag-slow-{index}')
+
+    def _rag_slow_put(self, key: str, job: Callable[[], None]) -> bool:
+        """오래 걸리는 일을 작업 스레드들에 맡긴다 → 맡겼으면 True (너무 밀려 있으면 False).
+        같은 key(방 · 사용자)의 일은 맡긴 순서대로 하나씩 하고, 다른 key 는 서로 기다리지 않는다"""
+        with self._rag_slow_lock:
+            if self._rag_slow_count >= self.RAG_BACKLOG:
+                return False
+            self._rag_slow_count += 1
+            pending = self._rag_pending.get(key)
+            if pending is None:
+                self._rag_pending[key] = collections.deque([job])
+                self._rag_ready.put(key)
+            else:
+                pending.append(job)
+        return True
 
     def _bot_reply(self, room_id: str, text: str) -> None:
         if self._stop.is_set() or not self.store.is_member(room_id, BOT_USERNAME):
@@ -2369,11 +2623,13 @@ class KakaoServer(AdminHandlers):
             if is_bot_direct or (bot_in_room and meta['type'] == 'group' and mentioned):
                 allowed, _wait = self._actions.hit(sender, 'ai_question', *self.ACTION_LIMITS['ai_question'])
                 if allowed:
-                    self._rag_queue.put(lambda: self._rag_answer(message))
-                elif self._actions.hit(sender, 'ai_busy_notice', 1, self.ACTION_LIMITS['ai_question'][1])[0]:
+                    allowed = self._rag_slow_put(room_id, lambda: self._rag_answer(message))
+                if not allowed and self._actions.hit(sender, 'ai_busy_notice', 1,
+                                                     self.ACTION_LIMITS['ai_question'][1])[0]:
                     self._rag_queue.put(lambda: self._bot_reply(room_id, AI_BUSY))   # 안내는 한 번만
         elif message['kind'] in ('file', 'image') and is_bot_direct and message['attachment']:
-            self._rag_queue.put(lambda: self._rag_learn(message))
+            if not self._rag_slow_put(room_id, lambda: self._rag_learn(message)):
+                self._rag_queue.put(lambda: self._bot_reply(room_id, AI_BUSY))
 
     def _rag_answer(self, message: dict) -> None:
         room_id, asker = message['room_id'], message['sender']
@@ -2419,7 +2675,8 @@ class KakaoServer(AdminHandlers):
             logger.exception('RAG 문서 학습 실패')
             self._bot_reply(room_id, RAG_FAILED)
             return
-        self._bot_reply(room_id, f"📚 '{att['name']}' 문서를 학습했습니다 ({doc.get('chunks', 0)}개 조각)")
+        note = ' · 너무 길어 앞부분만' if doc.get('truncated') else ''
+        self._bot_reply(room_id, f"📚 '{att['name']}' 문서를 학습했습니다 ({doc.get('chunks', 0)}개 조각{note})")
 
     def _require_rag(self) -> Any:
         if self.rag is None:
@@ -2436,11 +2693,21 @@ class KakaoServer(AdminHandlers):
         name = clean_file_name(_req_str(msg, 'name', 200, label='문서 이름'))
         data = _decode_b64(msg.get('data_b64'), MAX_ATTACHMENT_BYTES, '문서는 10MB를 초과할 수 없습니다.')
         mime = _opt_str(msg, 'mime', 100, 'application/octet-stream') or 'application/octet-stream'
-        try:
-            doc = rag.add_document(ctx.username, name, data, mime)
-        except ValueError as exc:
-            raise ProtocolError(str(exc) or '문서를 추가할 수 없습니다.') from None
-        self._reply(ctx, {'type': 'rag_doc_added', 'doc': doc})
+
+        def work() -> None:        # 문서 해석은 오래 걸릴 수 있어 요청 처리 밖에서 한다 - 끝나면 응답을 보낸다 (§4.5)
+            try:
+                doc = rag.add_document(ctx.username, name, data, mime)
+            except ValueError as exc:
+                self._send_error(ctx.conn, ctx.req_type, str(exc) or '문서를 추가할 수 없습니다.', msg)
+                return
+            except Exception:
+                logger.exception('RAG 문서 추가 실패')
+                self._send_error(ctx.conn, ctx.req_type, SERVER_ERROR, msg, 'server_error')
+                return
+            self._reply(ctx, {'type': 'rag_doc_added', 'doc': doc})
+
+        if not self._rag_slow_put(ctx.username, work):
+            raise ProtocolError(RATE_LIMITED, code='rate_limited', retry_after=10)
 
     def _h_rag_doc_delete(self, ctx: Ctx, msg: dict) -> None:
         rag = self._require_rag()
@@ -2675,7 +2942,7 @@ class KakaoServer(AdminHandlers):
                    'data_b64': data_b64}
         if kind == 'audio':
             payload['codec'] = codec or 'pcm'
-        self._deliver(self._user_conns(targets), payload)
+        self._deliver(self._user_conns(targets), payload, droppable=True)   # 밀려 있는 연결에는 조각을 버린다
 
     @staticmethod
     def _audio_frame_ok(data_b64: str, codec: str) -> bool:
