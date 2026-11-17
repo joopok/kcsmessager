@@ -52,7 +52,29 @@ class ServerAddressFileTests(unittest.TestCase):
         self.assertFalse(ksettings.load_server_tls(self.dir))
         with open(os.path.join(self.dir, ksettings.SERVER_FILE), 'w', encoding='utf-8') as f:
             json.dump({'host': 'x', 'port': 1, 'tls': 'yes'}, f)                        # bool 아닌 값은 무시
-        self.assertIs(ksettings.load_server_tls(self.dir), ksettings.DEFAULT_TLS)
+        self.assertTrue(ksettings.load_server_tls(self.dir))                             # → 정하지 않은 것: 다른 컴퓨터면 TLS
+
+    def test_remote_servers_use_tls_unless_told_otherwise(self):
+        """tls 를 따로 정하지 않았으면: 이 PC 의 서버는 평문, 다른 컴퓨터의 서버는 TLS (2026-11-17 결정)"""
+        for host in ('127.0.0.1', 'localhost', '::1', 'LOCALHOST', ''):
+            self.assertFalse(ksettings.default_tls_for(host), host)
+        for host in ('talk.kcins.co.kr', '10.20.30.40', '192.168.0.10'):
+            self.assertTrue(ksettings.default_tls_for(host), host)
+        self.assertFalse(ksettings.load_server_tls(self.dir))                            # 저장된 주소 없음 → 이 PC
+        self.assertTrue(ksettings.load_server_tls(self.dir, host='10.20.30.40'))         # 접속할 주소를 알려 주면 그 주소로
+        ksettings.save_server_address('192.168.0.10', 6000, self.dir)                    # 주소만 저장
+        self.assertTrue(ksettings.load_server_tls(self.dir))
+        self.assertFalse(ksettings.load_server_tls(self.dir, host='127.0.0.1'))
+        ksettings.save_server_address('192.168.0.10', 6000, self.dir, tls=False)         # 평문은 명시해야 한다
+        self.assertFalse(ksettings.load_server_tls(self.dir))
+        self.assertFalse(ksettings.load_server_tls(self.dir, host='talk.kcins.co.kr'))   # 명시한 값이 먼저
+
+    def test_bundled_plain_setting_still_wins_over_the_default(self):
+        deploy = {'host': '10.20.30.40', 'port': 5555, 'tls': False}                     # kcs.py build --deploy-plain
+        with mock.patch.object(ksettings, 'load_deploy_defaults', return_value=deploy):
+            self.assertFalse(ksettings.load_server_tls(self.dir))
+        with mock.patch.object(ksettings, 'load_deploy_defaults', return_value=dict(deploy, tls=None)):
+            self.assertTrue(ksettings.load_server_tls(self.dir))                         # 번들에 tls 가 없으면 주소로
 
     def test_bundled_deploy_defaults_sit_between_server_json_and_code_defaults(self):
         """kcs.py build --deploy 가 번들한 deploy.json: server.json 이 없을 때만 쓰이고, 있으면 server.json 이 이긴다"""
@@ -86,9 +108,12 @@ class AppAddressOrderTests(unittest.TestCase):
         from client.kakao import app as kapp, login
         seen = []
 
+        self.tls_seen = tls_seen = getattr(self, 'tls_seen', [])
+
         class FakeSession:
             def __init__(self, host, port, *args, **kwargs):
                 seen.append((host, port))
+                tls_seen.append(kwargs.get('tls'))
 
             def connect(self):
                 raise OSError('테스트: 연결 안 함')
@@ -108,6 +133,33 @@ class AppAddressOrderTests(unittest.TestCase):
         self.assertEqual(self.run_main([], configured=('5.6.7.8', 6002), saved=saved), ('5.6.7.8', 6002))  # 관리자 설정 우선
         self.assertEqual(self.run_main([], saved=saved), ('10.0.0.9', 7000))
         self.assertEqual(self.run_main(['--user', 'a']), ('127.0.0.1', 5555))
+
+    def test_tls_follows_the_address_that_is_actually_used(self):
+        saved = {'login_id': '김명수', 'token': 'tok', 'auto_login': True, 'host': '10.0.0.9', 'port': 7000}
+
+        def tls_of(argv, **kwargs):
+            with mock.patch('client.kakao.settings._saved_tls', return_value=None), \
+                    mock.patch('client.kakao.settings.load_deploy_defaults', return_value=None):
+                self.run_main(argv, **kwargs)
+            return self.tls_seen[-1]
+        self.assertIs(tls_of(['--user', 'a']), False)                                     # 이 PC 의 개발용 서버: 평문
+        self.assertIs(tls_of(['--user', 'a'], configured=('5.6.7.8', 6002)), True)       # 다른 컴퓨터: TLS
+        self.assertIs(tls_of([], saved=saved), True)                                      # 저장된 로그인의 주소도 같은 규칙
+        self.assertIs(tls_of(['--host', '5.6.7.8', '--user', 'a', '--no-tls']), False)   # 명령줄로 명시하면 그대로
+        self.assertIs(tls_of(['--host', '127.0.0.1', '--user', 'a', '--tls']), True)
+
+    def test_connection_failure_mentions_tls_when_the_handshake_failed(self):
+        from client.kakao import app as kapp
+        seen = []
+
+        def fake_exec(box):
+            seen.append(box.informativeText())
+            return 0
+        with mock.patch.object(QMessageBox, 'exec_', fake_exec):
+            kapp.ask_connection_failure('5.6.7.8', 5555, OSError('[SSL: WRONG_VERSION_NUMBER] wrong version number'), tls=True)
+            kapp.ask_connection_failure('5.6.7.8', 5555, OSError('Connection refused'), tls=True)
+        self.assertIn('TLS', seen[0])
+        self.assertNotIn('TLS', seen[1])
 
     def test_connection_failure_has_no_server_settings_button(self):
         from client.kakao import app as kapp

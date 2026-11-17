@@ -387,6 +387,23 @@ class SingleInstanceTests(unittest.TestCase):
         flush(200)
         self.assertEqual(woke, [1])
 
+    def test_notice_counts_as_delivered_once_connected(self):
+        # Windows 의 로컬 소켓은 짧은 글을 바로 다 보내고 나면 "더 보낼 것을 기다림"이 False 로 돌아온다 →
+        # 그것을 실패로 보면 먼저 뜬 창이 실제로는 깨어났는데도 알리지 못했다고 판단한다
+        from PyQt5.QtNetwork import QLocalSocket
+        first, second = self.make(), self.make()
+        self.assertTrue(first.acquire())
+        self.assertTrue(first.listening)
+        woke = []
+        first.activated.connect(lambda: woke.append(1))
+        with mock.patch.object(QLocalSocket, 'waitForBytesWritten', return_value=False):
+            self.assertTrue(second.notify())
+        flush(200)
+        self.assertEqual(woke, [1])
+
+    def test_notice_fails_when_nobody_is_listening(self):
+        self.assertFalse(self.make().notify(timeout_ms=200))
+
     def test_next_start_works_after_the_first_exits(self):
         first, second = self.make(), self.make()
         self.assertTrue(first.acquire())

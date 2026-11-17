@@ -236,6 +236,7 @@ class AppState(QObject):
         self.login_error = {'code': '', 'retry_after': 0}   # 마지막 join · register 거절의 구분 코드 (예전 서버는 '')
         self.session_password = None    # 이번 실행에서 바꾼 새 비밀번호 (다시 연결할 때 쓴다, 메모리에만)
         self._new_password = None
+        self._ended_calls = set()   # 이번 연결에서 끝난 통화 번호 (늦게 온 call_updated 를 버린다)
         self.keyring = None      # 비밀채팅 키 (welcome 후 생성)
         self.peer_keys = None    # 상대 공개키 기억 (처음 본 키를 믿고, 바뀌면 확인을 거친다)
         self.calls = {}          # call_id -> Call
@@ -307,6 +308,7 @@ class AppState(QObject):
         self.rooms = {r['room_id']: r for r in p.get('rooms', [])}
         self.org = p.get('org') or {}   # {'holding': {...}|None, 'companies': [...], 'groups': [...]}
         self.calls = {c['call_id']: c for c in p.get('calls', [])}
+        self._ended_calls = set()        # 새 연결: 서버가 준 목록이 기준 (서버를 다시 켜면 통화 번호가 처음부터일 수 있다)
         self.blocked = set(p.get('blocked', []))
         self.my_friends = list(p.get('friends', []))
         self.file_policy = dict(p.get('file_policy') or {})
@@ -1651,10 +1653,13 @@ class AppState(QObject):
     # ================= v3: 통화 (§8.2) =================
     def _on_call_updated(self, p):
         call = p['call']
+        if call['call_id'] in self._ended_calls:
+            return          # 끝난 통화의 예전 상태가 늦게 도착함 - 받아들이면 끝난 통화가 진행 중으로 되살아난다
         self.calls[call['call_id']] = call
         self.calls_changed.emit()
 
     def _on_call_ended(self, p):
+        self._ended_calls.add(p.get('call_id'))
         self.calls.pop(p.get('call_id'), None)
         self.calls_changed.emit()
         self.call_ended.emit(dict(p))

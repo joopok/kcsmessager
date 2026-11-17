@@ -344,6 +344,32 @@ class HeartbeatTests(unittest.TestCase):
         self.assertEqual(self.lost, [])
 
 
+# ================================================================== 끝난 통화가 되살아나지 않는다
+class EndedCallTests(unittest.TestCase):
+    def call(self, call_id=1):
+        return {'call_id': call_id, 'room_id': 'r2', 'mode': 'voice', 'host': '홍길동', 'started_at': '2026-11-17T12:00:00',
+                'participants': {'홍길동': {'role': 'host'}, '박민수': {'role': 'speaker'}}}
+
+    def test_late_update_for_an_ended_call_is_ignored(self):
+        state, conn = make_demo_state()
+        conn.push('call_updated', call=self.call())
+        conn.push('call_ended', call_id=1, room_id='r2')
+        conn.push('call_updated', call=self.call())               # 끝난 뒤에 늦게 도착한 예전 상태
+        self.assertIsNone(state.call_for_room('r2'))
+        self.assertEqual(state.calls, {})
+
+    def test_other_calls_and_a_new_connection_are_not_affected(self):
+        state, conn = make_demo_state()
+        conn.push('call_ended', call_id=1, room_id='r2')
+        conn.push('call_updated', call=self.call(2))
+        self.assertIn(2, state.calls)
+        conn.push('welcome', me=state.users[state.me], users=list(state.users.values()), rooms=list(state.rooms.values()),
+                  calls=[self.call(1)])                            # 서버를 다시 켜 번호가 처음부터여도 받아들인다
+        self.assertIn(1, state.calls)
+        conn.push('call_updated', call=self.call(1))
+        self.assertIn(1, state.calls)
+
+
 # ================================================================== 안 읽은 수
 class UnreadCountTests(unittest.TestCase):
     def test_server_count_is_used_when_given(self):

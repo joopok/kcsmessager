@@ -50,16 +50,30 @@ class SingleInstance(QObject):
         self._server = server
         return True
 
+    @property
+    def listening(self):
+        """창을 보여 달라는 알림을 받을 수 있는 상태인가 (첫 실행이 잠금을 잡은 뒤)"""
+        return self._server is not None and self._server.isListening()
+
+    def listen_error(self):
+        return self._server.errorString() if self._server is not None and not self._server.isListening() else ''
+
     def notify(self, timeout_ms=1000):
-        """먼저 실행된 쪽에 창을 보여 달라고 알린다. 알렸으면 True"""
+        """먼저 실행된 쪽에 창을 보여 달라고 알린다. 알렸으면 True.
+        먼저 실행된 쪽은 '연결이 들어온 것' 자체를 알림으로 본다 (_on_connection). 그래서 연결되면 알린 것이다.
+        뒤이어 보내는 글은 덤이고 그 결과는 보지 않는다 - Windows 의 로컬 소켓(이름 있는 파이프)은 짧은 글을 바로 다 보내고
+        나면 waitForBytesWritten 이 False 를 돌려줘, 그것을 실패로 보면 깨워 놓고도 못 알렸다고 판단하게 된다"""
         sock = QLocalSocket()
         sock.connectToServer(self._server_name)
         if not sock.waitForConnected(timeout_ms):
             return False
         sock.write(b'show\n')
-        ok = sock.waitForBytesWritten(timeout_ms)
+        sock.flush()
+        sock.waitForBytesWritten(timeout_ms)
         sock.disconnectFromServer()
-        return bool(ok)
+        if sock.state() != QLocalSocket.UnconnectedState:
+            sock.waitForDisconnected(timeout_ms)
+        return True
 
     def _on_connection(self):
         while self._server is not None and self._server.hasPendingConnections():

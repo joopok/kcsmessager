@@ -114,13 +114,17 @@ def setup_high_dpi():
     osenv.prepare_process()
 
 
-def ask_connection_failure(host, port, error):
+def ask_connection_failure(host, port, error, tls=False):
     """연결 실패 안내. 'retry' / 'quit' (서버 주소는 그룹 관리자만 더보기 → 정보에서 바꾼다)"""
     box = QMessageBox()
     box.setIcon(QMessageBox.Warning)
     box.setWindowTitle('서버 연결 실패')
     box.setText('서버에 연결할 수 없습니다.')
-    box.setInformativeText(f'{host}:{port}\n잠시 후 다시 시도해 보고, 계속 안 되면 관리자에게 문의해 주세요.')
+    hint = ''
+    if tls and any(word in str(error).upper() for word in ('SSL', 'TLS', 'CERTIFICATE')):
+        # 다른 컴퓨터의 서버에는 기본으로 TLS 로 붙는다 - 서버가 TLS 를 쓰지 않으면 여기서 실패한다
+        hint = '\nTLS(암호화) 연결을 맺지 못했습니다. 서버가 TLS 를 쓰지 않는다면 관리자에게 이 PC 의 접속 설정을 확인해 달라고 해 주세요.'
+    box.setInformativeText(f'{host}:{port}\n잠시 후 다시 시도해 보고, 계속 안 되면 관리자에게 문의해 주세요.' + hint)
     box.setDetailedText(str(error))
     retry = box.addButton('다시 시도', QMessageBox.AcceptRole)
     box.addButton('종료', QMessageBox.RejectRole)
@@ -479,8 +483,10 @@ def _run(args, app):
     fixed = args.host is not None or args.port is not None or configured is not None
     host = args.host or (configured[0] if configured else DEFAULT_HOST)
     port = args.port or (configured[1] if configured else DEFAULT_PORT)
-    # TLS 여부도 같은 순서: --tls/--no-tls → server.json 의 tls → DEFAULT_TLS
-    tls = args.tls if args.tls is not None else load_server_tls()
+    def tls_for(target):
+        """TLS 여부: --tls/--no-tls → server.json · 번들의 tls → 정하지 않았으면 실제로 접속할 주소로
+        (이 PC 가 아니면 TLS). 저장된 로그인의 주소로 붙을 때도 같은 규칙"""
+        return args.tls if args.tls is not None else load_server_tls(host=target)
     username, password = args.user.strip(), args.password
     saved = login_mod.load_saved_login() if not username else None
 
@@ -500,7 +506,7 @@ def _run(args, app):
             if saved and not args.user and not args.no_auto_login:
                 host, port = saved_address(host, port)
             # 런처(--no-auto-login)로 연 창은 처음 로그인 상태: 아이디·비밀번호를 비우고 저장된 로그인을 쓰지 않는다
-            dlg = LoginDialog(host, port, username, registration=registration, tls=tls,   # 등록 실패면 등록 화면 그대로
+            dlg = LoginDialog(host, port, username, registration=registration, tls=tls_for(host),   # 등록 실패면 등록 화면 그대로
                               fresh=args.no_auto_login)
             dlg.show_error(error)
             if dlg.exec_() != QDialog.Accepted:
@@ -509,12 +515,13 @@ def _run(args, app):
             password, token = dlg.password(), dlg.saved_token()
             remember, auto_login = dlg.remember(), dlg.auto_login()
             registration = dlg.registration()
+        tls = tls_for(host)
         session = Session(host, port, username, password, token=token, remember=remember,
                           registration=registration, tls=tls)
         try:
             session.connect()
         except OSError as e:
-            choice = ask_connection_failure(host, port, e)
+            choice = ask_connection_failure(host, port, e, tls=tls)
             if choice == 'quit':
                 return 1
             error = ''

@@ -35,6 +35,7 @@ MAPPING = [
     (r'test_kakao_registration', 'login'),        # 등록 방식 - 열림/닫힘 · 등록 코드 (명세 §4.1)
     (r'test_kakao_admin_tools', 'admin'),         # 관리자 도구는 가동 중인 DB 의 구조 · 시드를 건드리지 않는다 (§4.2)
     (r'test_kakao_deploy_tools', 'platforms'),    # 배포 전 점검 · 백업 (docs/DEPLOY_CHECKLIST.md)
+    (r'test_kakao_deploy_script', 'platforms'),   # 배포 스크립트 · 배포 뒤 확인 (scripts/deploy_server.sh)
     (r'test_kakao_login_throttle', 'login'),      # 로그인 실패 제한 · 오류 구분 코드 (명세 §4.1)
     (r'test_kakao_relay_rules\.(Preview)', 'link_preview'),           # 미리보기 작업 · 태그 읽기
     (r'test_kakao_relay_rules\.ApprovalDelivery', 'file_security'),   # 승인한 파일을 못 보냈을 때
