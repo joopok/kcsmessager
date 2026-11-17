@@ -12,11 +12,13 @@ DB 는 고치지 않는다. 서버가 켜져 있어도 된다.
   3. 비밀번호를 등록하지 않은 계정 (등록이 닫히면 관리자 등록 코드나 초기 비밀번호가 필요하다)
   4. 관리자 계정, 삭제됐는데 관리자 표시가 남은 계정
   5. 그 밖에 재시작 때 바뀌는 것 안내
+  6. 파일 전송 보안: 저장된 정책에 새로 더해질 기본 차단 형태 (§10.10)
 
 종료 코드: 0 문제 없음 · 1 먼저 고쳐야 할 것이 있음(겹치는 로그인 아이디) · 2 DB 를 열 수 없음
 """
 
 import argparse
+import json
 import os
 import sqlite3
 import sys
@@ -24,6 +26,12 @@ from pathlib import Path
 
 LOGIN_ID_COLUMNS = (('username', '이름'), ('employee_no', '사번'), ('account', '사내 계정'), ('email', '이메일'))
 NAME_LIMIT = 30          # --names 로 보여 주는 이름 수
+# 파일 전송 보안 기본 차단 형태 (server/kakao/file_policy.py 의 DEFAULT_POLICY · LEGACY_DEFAULT_TYPES 와 같아야 한다 -
+# 서버 코드 없이도 돌도록 여기 적어 둔다. tests/test_kakao_deploy_tools.py 가 둘이 같은지 본다)
+FILE_POLICY_DEFAULT_TYPES = ('executable', 'macro_document', 'sealed_archive', 'database', 'credential')
+FILE_POLICY_LEGACY_TYPES = ('executable', 'database', 'credential')
+FILE_POLICY_LABELS = {'macro_document': '매크로 문서 (docm · xlsm · pptm 등, 내용으로도 판별)',
+                      'sealed_archive': '7z · rar · alz · egg 압축 파일'}
 
 
 def open_read_only(path):
@@ -48,6 +56,28 @@ def duplicate_login_ids(users):
                 owners.setdefault(value.lower(), []).append((user['username'], label))
     return sorted((value, sorted(set(holders))) for value, holders in owners.items()
                   if len({name for name, _label in holders}) > 1)
+
+
+def file_policy_change(db):
+    """저장된 파일 전송 보안 정책에 다시 시작할 때 더해질 기본 차단 형태 → dict (서버의 merge_new_defaults 와 같은 규칙)"""
+    stored = None
+    if columns(db, 'org_settings'):
+        row = db.execute("SELECT value FROM org_settings WHERE key='file_policy'").fetchone()
+        if row is not None:
+            try:
+                stored = json.loads(row['value'])
+            except ValueError:
+                stored = None
+    if not isinstance(stored, dict):
+        return {'saved': False, 'enabled': True, 'adds': [], 'skipped': []}
+    seen = stored.get('defaults_seen')
+    seen = seen if isinstance(seen, list) else list(FILE_POLICY_LEGACY_TYPES)
+    blocked = stored.get('blocked_types') or []
+    fresh = [t for t in FILE_POLICY_DEFAULT_TYPES if t not in seen]
+    return {'saved': True, 'enabled': bool(stored.get('enabled', True)),
+            'adds': [t for t in fresh if t not in blocked],
+            'skipped': [t for t in FILE_POLICY_DEFAULT_TYPES if t in seen and t not in blocked
+                        and t not in FILE_POLICY_LEGACY_TYPES]}
 
 
 def collect(db):
@@ -81,6 +111,7 @@ def collect(db):
                                  if u['is_admin'] and (u['admin_company'] or '')),
         'removed_admins': sorted(u['username'] for u in people if u['removed'] and u['is_admin']),
         'late_joiner_rule_ready': 'since_msg_id' in members,
+        'file_policy': file_policy_change(db),
     }
 
 
@@ -135,6 +166,20 @@ def report(result, show_names=False, out=sys.stdout):
     say('  · 등록이 닫힙니다: 조직도에 없는 이름으로 계정이 만들어지지 않습니다.')
     if not result['late_joiner_rule_ready']:
         say('  · 지금 방에 있는 사람은 예전 대화를 계속 봅니다. 다시 시작한 뒤 초대받는 사람부터 그 뒤 대화만 봅니다.')
+    say()
+    say('6. 파일 전송 보안: 새 기본 차단 (매크로 문서 · 7z · rar · alz · egg)')
+    policy = result['file_policy']
+    if not policy['saved']:
+        say('  · 저장된 정책이 없어 기본 정책을 씁니다 - 다시 시작하면 바로 막힙니다.')
+    elif policy['adds']:
+        say('  · 다시 시작할 때 저장된 정책에 더합니다 (서버 로그에 남김): '
+            + ', '.join(FILE_POLICY_LABELS.get(t, t) for t in policy['adds']))
+    else:
+        say('  · 더할 것 없음 (이미 막혀 있거나 관리자가 이미 정한 정책입니다)')
+    if policy['skipped']:
+        say('  · 관리자가 뺀 기본 차단은 그대로 둡니다: ' + ', '.join(FILE_POLICY_LABELS.get(t, t) for t in policy['skipped']))
+    if not policy['enabled']:
+        say('  ! 정책이 꺼져 있어 켜기 전에는 아무것도 막지 않습니다.')
     return 1 if result['duplicates'] else 0
 
 
