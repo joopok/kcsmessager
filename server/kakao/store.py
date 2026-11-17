@@ -429,6 +429,8 @@ class Store:
         self._add_columns('users', (('deputies', "TEXT NOT NULL DEFAULT '[]'"),))   # 대직자 username 목록 (§8.13)
         self._add_columns('messages', (('call_id', 'INTEGER'), ('ladder', 'TEXT'), ('post_id', 'INTEGER')))
         self._add_columns('room_members', (('nickname', 'TEXT'),))
+        # 나중에 들어온 사람은 들어온 뒤의 메시지만 본다 (§4.5): 들어올 때의 마지막 msg_id (0 = 전부 본다)
+        self._add_columns('room_members', (('since_msg_id', 'INTEGER NOT NULL DEFAULT 0'),))
         self._add_columns('attachments', (('expired', 'INTEGER NOT NULL DEFAULT 0'),))
         row = self._one("SELECT sql FROM sqlite_master WHERE type='table' AND name='rooms'")
         if row is not None and "'open'" not in (row['sql'] or ''):
@@ -442,6 +444,7 @@ class Store:
         self._db.execute('CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_root, msg_id)')
         self._db.execute('CREATE INDEX IF NOT EXISTS idx_attachments_expiry ON attachments(expired, created_at)')
         self._db.execute('CREATE INDEX IF NOT EXISTS idx_messages_post ON messages(post_id)')
+        self._db.execute('CREATE INDEX IF NOT EXISTS idx_attachments_uploader ON attachments(uploader, created_at)')
 
     def _add_columns(self, table: str, columns: Iterable[tuple[str, str]]) -> None:
         existing = {r['name'] for r in self._all(f'PRAGMA table_info({table})')}
@@ -555,9 +558,19 @@ class Store:
         for name in getattr(self, '_demo_hidden', ()):
             self._db.execute("UPDATE users SET company='게스트', department='', title='', org_path='[]' "
                              'WHERE username=? AND org_locked=0', (name,))
-        # org.json 의 admins 는 시작할 때마다 관리자로 올린다 (내리지는 않는다 - 명세 §4.2)
+        # org.json 의 admins 는 처음 한 번만 관리자로 올린다 (명세 §4.2) - 앱에서 해제 · 삭제한 사람을 재시작이 되돌리지 않게.
+        # 그룹 관리자가 한 명도 남지 않았으면(복구) 삭제되지 않은 admins 를 다시 올린다
+        row = self._one("SELECT value FROM org_settings WHERE key='seed_admins'")
+        applied = [n for n in self._json_list(row['value'] if row else '[]') if isinstance(n, str)]
+        recover = self._one("SELECT 1 FROM users WHERE is_admin=1 AND admin_company='' AND is_bot=0 AND removed=0") is None
         for name in getattr(self, '_seed_admins', ()):
-            self._db.execute('UPDATE users SET is_admin=1 WHERE username=? AND is_bot=0', (name,))
+            if name in applied and not recover:
+                continue
+            cur = self._db.execute('UPDATE users SET is_admin=1 WHERE username=? AND is_bot=0 AND removed=0', (name,))
+            if cur.rowcount == 1 and name not in applied:
+                applied.append(name)
+        self._db.execute("INSERT INTO org_settings(key, value) VALUES ('seed_admins', ?) "
+                         'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (json.dumps(applied, ensure_ascii=False),))
 
     def _one(self, sql: str, params: Iterable[Any] = ()) -> Optional[sqlite3.Row]:
         return self._db.execute(sql, tuple(params)).fetchone()
@@ -682,31 +695,63 @@ class Store:
     REGISTER_WRONG_EMAIL = '조직도에 등록된 이메일과 다릅니다. 회사 이메일을 확인하거나 관리자에게 문의해 주세요.'
     REGISTER_NEEDS_ORG_EMAIL = '조직도에 이메일이 등록되지 않아 직접 등록할 수 없습니다. 관리자에게 이메일 등록을 요청해 주세요.'
     REGISTER_ADMIN_BY_TOOL = '관리자 계정은 직접 등록할 수 없습니다. 서버 PC 에서 scripts/set_password.py 로 비밀번호를 정해 주세요.'
+    # 등록이 닫힌 서버(§4.1 '등록 방식')의 거절은 이 한 문구뿐이다 - 계정이 있는지 · 등록됐는지 알려 주지 않는다
+    REGISTER_CLOSED = ('등록할 수 없습니다. 이미 등록했다면 이메일과 비밀번호로 로그인하고, '
+                       '처음이라면 관리자에게 등록 코드나 초기 비밀번호를 요청해 주세요.')
 
-    def register_user(self, username: str, company: str, email: str, password: str, employee_no: str = '') -> bool:
+    def register_user(self, username: str, company: str, email: str, password: str, employee_no: str = '',
+                      code: Optional[str] = None, open_registration: bool = True) -> bool:
         """처음 사용 등록 (명세 §4.1). 새로 만들었으면 True. 안 되면 ValueError(사용자에게 보일 사유).
-        employee_no 는 선택(예전 클라이언트·관리자 도구) — 없으면 이메일이 로그인 아이디가 된다"""
+        employee_no 는 선택(예전 클라이언트·관리자 도구) — 없으면 이메일이 로그인 아이디가 된다.
+        open_registration=False(등록 닫힘)면 조직도에 있는 비밀번호 없는 계정 + 관리자가 발급한 등록 코드(code)만 받는다"""
+        if not open_registration:
+            self._check_closed_registration(username, company, code)   # 안 될 등록에 해싱(느림)을 쓰지 않는다
         return self._register_user(username, company, email, self.hash_password(password),   # 해싱은 잠금 밖
-                                   employee_no.strip())
+                                   employee_no.strip(), code, open_registration)
+
+    def _closed_registration_ok(self, username: str, company: str, code: Optional[str]) -> bool:
+        """등록이 닫힌 서버에서 등록할 수 있는 계정인가 (잠금 안에서 호출)"""
+        row = self._one('SELECT company, is_bot, password_hash, is_admin, disabled, removed FROM users WHERE username=?',
+                        (username,))
+        return bool(row is not None and not row['is_bot'] and not row['password_hash'] and not row['is_admin']
+                    and not row['disabled'] and not row['removed']
+                    and row['company'] in ('', GUEST_COMPANY, company)
+                    and isinstance(code, str) and self._reset_code_ok(username, code))
+
+    REGISTER_NAME_CONFLICT = '다른 사람의 로그인 아이디와 같은 이름은 쓸 수 없습니다. 관리자에게 문의해 주세요.'
+    EMAIL_TAKEN = '이미 다른 사람이 쓰는 이메일입니다.'
+
+    def _login_id_taken(self, value: Optional[str], username: str) -> bool:
+        """value 가 username 아닌 사람의 로그인 아이디(이름 · 사번 · 사내 계정 · 이메일, 대소문자 무시)와 같은가.
+        로그인 아이디는 서로 겹치지 않는다 (명세 §4.1) - 잠금 안에서 호출"""
+        value = (value or '').strip()
+        if not value:
+            return False
+        return self._one(
+            "SELECT 1 FROM users WHERE username<>? AND (lower(username)=lower(?) "
+            "OR (employee_no<>'' AND lower(employee_no)=lower(?)) OR (account<>'' AND lower(account)=lower(?)) "
+            "OR (email<>'' AND lower(email)=lower(?))) LIMIT 1", (username, value, value, value, value)) is not None
+
+    @_locked
+    def _check_closed_registration(self, username: str, company: str, code: Optional[str]) -> None:
+        if not self._closed_registration_ok(username, company, code):
+            raise ValueError(self.REGISTER_CLOSED)
 
     @_locked
     def _register_user(self, username: str, company: str, email: str, password_hash: str,
-                       employee_no: str = '') -> bool:
-        if employee_no:
-            # 사번은 로그인 아이디라 다른 사람의 사번·사내 계정·이름과 겹치면 안 된다
-            taken = self._one("SELECT username FROM users WHERE username<>? AND (username=? OR "
-                              "(employee_no<>'' AND lower(employee_no)=lower(?)) OR "
-                              "(account<>'' AND lower(account)=lower(?)))",
-                              (username, employee_no, employee_no, employee_no))
-            if taken is not None:
-                raise ValueError(self.REGISTER_TAKEN_EMPLOYEE_NO)
-        taken = self._one("SELECT username FROM users WHERE email<>'' AND lower(email)=lower(?) AND username<>?",
-                          (email, username))
-        if taken is not None:
+                       employee_no: str = '', code: Optional[str] = None, open_registration: bool = True) -> bool:
+        if not open_registration and not self._closed_registration_ok(username, company, code):
+            raise ValueError(self.REGISTER_CLOSED)
+        # 사번 · 이메일은 로그인 아이디라 다른 사람의 이름 · 사번 · 사내 계정 · 이메일과 겹치면 안 된다
+        if self._login_id_taken(employee_no, username):
+            raise ValueError(self.REGISTER_TAKEN_EMPLOYEE_NO)
+        if self._login_id_taken(email, username):
             raise ValueError(self.REGISTER_TAKEN_EMAIL)
         row = self._one('SELECT company, is_bot, password_hash, employee_no, email, is_admin FROM users WHERE username=?',
                         (username,))
         if row is None:
+            if self._login_id_taken(username, username):       # 새 이름도 마찬가지
+                raise ValueError(self.REGISTER_NAME_CONFLICT)
             self._db.execute(
                 'INSERT INTO users(username, display_name, status_message, birthday, created_at, company, email, '
                 "password_hash, employee_no) VALUES (?, ?, '', NULL, ?, ?, ?, ?, ?)",
@@ -735,6 +780,8 @@ class Store:
             "company=CASE WHEN company IN ('', ?) THEN ? ELSE company END "
             'WHERE username=? AND password_hash IS NULL',
             (password_hash, email, employee_no, employee_no, GUEST_COMPANY, company, username))
+        if cur.rowcount == 1:
+            self._db.execute('DELETE FROM reset_codes WHERE username=?', (username,))   # 등록 코드는 한 번만 쓴다
         self._db.commit()
         if cur.rowcount != 1:     # 그 사이 다른 연결이 먼저 등록했다
             raise ValueError(self.REGISTER_TAKEN_NAME)
@@ -822,17 +869,18 @@ class Store:
 
     def reset_password(self, username: str, email: str, password: str, code: str = '') -> Optional[bool]:
         """비밀번호 재설정 (명세 §4.1): 등록된 계정이고 가입 이메일과 관리자가 발급한 재설정 코드가 맞으면
-        새 비밀번호 + 토큰 모두 폐기 + 코드 사용 처리.
-        → True 바꿈 / False 이메일 · 코드 불일치 · 없는 계정 / None 비밀번호를 등록한 적 없는 계정"""
+        새 비밀번호 + 토큰 모두 폐기 + 코드 사용 처리. 비밀번호가 없는 계정은 등록 코드가 맞으면 최초 등록.
+        → True 바꿈 / False 이메일 · 코드 불일치 · 없는 계정 / None 비밀번호를 등록한 적 없는 계정(코드 없음 · 틀림)"""
         return self._reset_password(username, email, self.hash_password(password), code)   # 해싱은 잠금 밖
 
     @_locked
     def _reset_password(self, username: str, email: str, password_hash: str, code: str = '') -> Optional[bool]:
-        row = self._one('SELECT email, password_hash, is_admin FROM users WHERE username=? AND is_bot=0', (username,))
+        row = self._one('SELECT email, password_hash, is_admin, disabled, removed FROM users '
+                        'WHERE username=? AND is_bot=0', (username,))
         if row is None:
             return False
         if not row['password_hash']:
-            return None
+            return self._activate_with_code(username, row, email, password_hash, code)
         if row['is_admin']:
             raise ValueError(self.RESET_ADMIN_BY_TOOL)
         if not row['email'] or row['email'].lower() != email.strip().lower():
@@ -844,6 +892,25 @@ class Store:
         self._db.execute('DELETE FROM reset_codes WHERE username=?', (username,))   # 한 번만 쓴다
         self._db.commit()
         return True
+
+    def _activate_with_code(self, username: str, row: sqlite3.Row, email: str, password_hash: str,
+                            code: str) -> Optional[bool]:
+        """비밀번호가 없는 계정의 최초 등록을 등록 코드로 (명세 §4.1 '등록 방식', 잠금 안에서 호출).
+        → True 등록함 / False 이메일이 조직도와 다르거나 다른 사람이 쓰는 이메일 / None 코드가 맞지 않음"""
+        if row['is_admin'] or row['disabled'] or row['removed'] or not self._reset_code_ok(username, code):
+            return None
+        email = (email or '').strip()
+        if row['email']:
+            if row['email'].lower() != email.lower():
+                return False
+        elif not email or self._login_id_taken(email, username):
+            return False
+        cur = self._db.execute('UPDATE users SET password_hash=?, email=? WHERE username=? AND password_hash IS NULL',
+                               (password_hash, email, username))
+        self._db.execute('DELETE FROM login_tokens WHERE username=?', (username,))
+        self._db.execute('DELETE FROM reset_codes WHERE username=?', (username,))   # 한 번만 쓴다
+        self._db.commit()
+        return cur.rowcount == 1
 
     @_locked
     def revoke_all_login_tokens(self, username: str) -> None:
@@ -1058,6 +1125,13 @@ class Store:
         return self._file_request_dict(row)
 
     @_locked
+    def reopen_file_request(self, request_id: int) -> None:
+        """승인했지만 보내지 못한 요청을 다시 대기로 돌린다 (파일은 그대로 보관 중)"""
+        self._db.execute("UPDATE file_requests SET status='pending', decided_by=NULL, decided_at=NULL, note='' "
+                         "WHERE request_id=? AND status='approved' AND msg_id IS NULL", (request_id,))
+        self._db.commit()
+
+    @_locked
     def set_file_request_msg(self, request_id: int, msg_id: int) -> dict:
         self._db.execute('UPDATE file_requests SET msg_id=? WHERE request_id=?', (msg_id, request_id))
         self._db.commit()
@@ -1114,21 +1188,19 @@ class Store:
     # ---- 구성원 등록 · 수정 · 삭제 (명세 §4.3) ----
     MEMBER_FIELDS = ('company', 'department', 'title', 'account', 'employee_no', 'extension', 'mobile', 'email')
 
-    def _member_conflict(self, username: str, fields: dict) -> None:
+    def _member_conflict(self, username: str, fields: dict, creating: bool = False) -> None:
+        """로그인 아이디(이름 · 사번 · 사내 계정 · 이메일)는 서로 겹치지 않는다 (명세 §4.1)"""
+        if creating and self._login_id_taken(username, username):
+            raise ValueError('다른 구성원의 로그인 아이디(사번 · 사내 계정)와 같은 이름은 쓸 수 없습니다.')
         for key, label in (('employee_no', '사번'), ('account', '사내 계정'), ('email', '이메일')):
-            value = (fields.get(key) or '').strip()
-            if value and self._one(f"SELECT 1 FROM users WHERE {key}<>'' AND lower({key})=lower(?) AND username<>?",
-                                   (value, username)):
+            if self._login_id_taken(fields.get(key), username):
                 raise ValueError(f'이미 다른 구성원이 쓰는 {label}입니다.')
-        number = (fields.get('employee_no') or '').strip()
-        if number and self._one('SELECT 1 FROM users WHERE username=? AND username<>?', (number, username)):
-            raise ValueError('이미 다른 구성원이 쓰는 사번입니다.')
 
     @_locked
     def member_create(self, username: str, fields: dict) -> None:
         if self._one('SELECT 1 FROM users WHERE username=?', (username,)):
             raise ValueError('이미 있는 이름입니다.')
-        self._member_conflict(username, fields)
+        self._member_conflict(username, fields, creating=True)
         self._db.execute(
             'INSERT INTO users(username, display_name, status_message, birthday, created_at, company, department, '
             'title, account, employee_no, extension, mobile, email, org_path, org_locked) '
@@ -1160,11 +1232,14 @@ class Store:
 
     @_locked
     def member_set_removed(self, username: str, removed: bool) -> None:
-        """삭제(소프트) / 복원. 삭제하면 로그인도 막고 자동 로그인 토큰을 폐기한다"""
+        """삭제(소프트) / 복원. 삭제하면 로그인도 막고 관리자 권한 · 자동 로그인 토큰 · 발급된 코드를 없앤다
+        (복원하면 일반 구성원으로 돌아온다 - 관리자 지정은 그룹 관리자가 다시 한다)"""
         self._db.execute('UPDATE users SET removed=?, disabled=?, org_locked=1 WHERE username=?',
                          (int(removed), int(removed), username))
         if removed:
+            self._db.execute("UPDATE users SET is_admin=0, admin_company='' WHERE username=?", (username,))
             self._db.execute('DELETE FROM login_tokens WHERE username=?', (username,))
+            self._db.execute('DELETE FROM reset_codes WHERE username=?', (username,))
         self._db.commit()
 
     @_locked
@@ -1202,6 +1277,7 @@ class Store:
         """관리자 초기화: 비밀번호·자동 로그인 토큰 삭제 → 그 사람은 [처음 사용 등록]을 다시 한다"""
         self._db.execute('UPDATE users SET password_hash=NULL WHERE username=?', (username,))
         self._db.execute('DELETE FROM login_tokens WHERE username=?', (username,))
+        self._db.execute('DELETE FROM reset_codes WHERE username=?', (username,))   # 재설정용으로 준 코드가 등록 코드가 되지 않게
         self._db.commit()
 
     @_locked
@@ -1263,6 +1339,8 @@ class Store:
                 for k, v in fields.items() if k in allowed]
         if not sets:
             return
+        if self._login_id_taken(fields.get('email'), username):     # 이메일은 로그인 아이디 (§4.1)
+            raise ValueError(self.EMAIL_TAKEN)
         sql = 'UPDATE users SET ' + ', '.join(f'{k}=?' for k, _ in sets) + ' WHERE username=?'
         self._db.execute(sql, [v for _, v in sets] + [username])
         self._db.commit()
@@ -1311,10 +1389,11 @@ class Store:
         row = self._one('SELECT MAX(msg_id) AS m FROM messages WHERE room_id=?', (room_id,))
         return int(row['m'] or 0)
 
-    def _add_member(self, room_id: str, username: str, pointer: int, nickname: Optional[str] = None) -> None:
+    def _add_member(self, room_id: str, username: str, pointer: int, nickname: Optional[str] = None,
+                    since: int = 0) -> None:
         self._db.execute(
-            'INSERT OR IGNORE INTO room_members(room_id, username, joined_at, nickname) VALUES (?, ?, ?, ?)',
-            (room_id, username, now_iso(), nickname),
+            'INSERT OR IGNORE INTO room_members(room_id, username, joined_at, nickname, since_msg_id) '
+            'VALUES (?, ?, ?, ?, ?)', (room_id, username, now_iso(), nickname, since),
         )
         self._db.execute(
             'INSERT INTO read_pointers(room_id, username, last_read_msg_id) VALUES (?, ?, ?) '
@@ -1399,8 +1478,56 @@ class Store:
     def add_members(self, room_id: str, usernames: list[str]) -> None:
         last = self._last_msg_id(room_id)
         for u in usernames:
-            self._add_member(room_id, u, last)
+            self._add_member(room_id, u, last, since=last)    # 초대받은 사람은 지금부터의 메시지만 본다 (§4.5)
         self._db.commit()
+
+    def _since(self, room_id: str, username: Optional[str]) -> int:
+        """그 사람이 그 방에서 볼 수 있는 메시지의 시작 (이 번호보다 큰 msg_id 만 본다. 잠금 안에서 호출)"""
+        if username is None:
+            return 0
+        row = self._one('SELECT since_msg_id FROM room_members WHERE room_id=? AND username=?', (room_id, username))
+        return int(row['since_msg_id']) if row else 0
+
+    @_locked
+    def message_visible(self, msg_id: int, username: str) -> bool:
+        """username 이 그 메시지를 볼 수 있는가: 방 멤버이고 들어온 뒤의 메시지(또는 들어온 뒤 답글이 달린 스레드 원글)"""
+        row = self._one('SELECT rm.since_msg_id AS since FROM messages m JOIN room_members rm '
+                        'ON rm.room_id=m.room_id AND rm.username=? WHERE m.msg_id=?', (username, msg_id))
+        if row is None:
+            return False
+        since = int(row['since'])
+        return msg_id > since or self._one('SELECT 1 FROM messages WHERE thread_root=? AND msg_id>? LIMIT 1',
+                                           (msg_id, since)) is not None
+
+    @_locked
+    def hidden_from(self, room_id: str, msg_id: int) -> set[str]:
+        """그 메시지를 볼 수 없는 멤버 (그 메시지보다 나중에 들어온 사람)"""
+        hidden = set()
+        for row in self._all('SELECT username, since_msg_id FROM room_members WHERE room_id=? AND since_msg_id>=?',
+                             (room_id, msg_id)):
+            if self._one('SELECT 1 FROM messages WHERE thread_root=? AND msg_id>? LIMIT 1',
+                         (msg_id, int(row['since_msg_id']))) is None:
+                hidden.add(row['username'])
+        return hidden
+
+    @_locked
+    def poll_message_id(self, poll_id: int) -> Optional[int]:
+        row = self._one('SELECT msg_id FROM messages WHERE poll_id=? ORDER BY msg_id LIMIT 1', (poll_id,))
+        return int(row['msg_id']) if row else None
+
+    @_locked
+    def room_since_for_user(self, username: str) -> dict[str, int]:
+        """{방: 그 사람이 보기 시작하는 msg_id} - AI 비서의 근거 범위"""
+        return {r['room_id']: int(r['since_msg_id']) for r in
+                self._all('SELECT room_id, since_msg_id FROM room_members WHERE username=?', (username,))}
+
+    @_locked
+    def fix_display_names(self) -> int:
+        """표시 이름 · 멀티프로필 이름을 실명(username)으로 되돌린다 (§4.5 '표시 이름은 실명으로 고정') → 바꾼 개수"""
+        first = self._db.execute('UPDATE users SET display_name=username WHERE is_bot=0 AND display_name<>username')
+        second = self._db.execute('UPDATE multi_profiles SET display_name=owner WHERE display_name<>owner')
+        self._db.commit()
+        return first.rowcount + second.rowcount
 
     @_locked
     def remove_member(self, room_id: str, username: str) -> None:
@@ -1472,8 +1599,9 @@ class Store:
         ptrs = {r['username']: int(r['last_read_msg_id']) for r in ptr_rows}
         read_pointers = {u: ptrs.get(u, 0) for u in members}
         # 차단한 사람의 메시지는 마지막 메시지/안 읽은 수에서 제외 (명세 §8.6)
-        last = self._one(f'SELECT * FROM messages WHERE room_id=? AND {_NOT_BLOCKED} '
-                         'ORDER BY msg_id DESC LIMIT 1', (room_id, viewer))
+        since = self._since(room_id, viewer)
+        last = self._one(f'SELECT * FROM messages WHERE room_id=? AND msg_id>? AND {_NOT_BLOCKED} '
+                         'ORDER BY msg_id DESC LIMIT 1', (room_id, since, viewer))
         notice = None
         if row['notice_msg_id'] is not None:
             nrow = self._one('SELECT * FROM messages WHERE msg_id=?', (row['notice_msg_id'],))
@@ -1481,7 +1609,7 @@ class Store:
         unread = self._one(
             'SELECT COUNT(*) AS c FROM messages WHERE room_id=? AND msg_id>? AND sender!=? AND kind!=\'system\' '
             f'AND {_NOT_BLOCKED}',
-            (room_id, read_pointers.get(viewer, 0), viewer, viewer),
+            (room_id, max(read_pointers.get(viewer, 0), since), viewer, viewer),
         )['c']
         nick_rows = self._all('SELECT username, nickname FROM room_members WHERE room_id=? AND nickname IS NOT NULL',
                               (room_id,))
@@ -1666,6 +1794,10 @@ class Store:
         if viewer is not None:
             sql += f' AND {_NOT_BLOCKED}'
             params.append(viewer)
+            since = self._since(room_id, viewer)
+            if since:                       # 나중에 들어온 사람은 들어온 뒤의 메시지만 (§4.5)
+                sql += ' AND msg_id>?'
+                params.append(since)
         rows = self._all(sql + ' ORDER BY msg_id DESC LIMIT ?', params + [limit + 1])
         has_more = len(rows) > limit
         rows = list(reversed(rows[:limit]))
@@ -1676,7 +1808,7 @@ class Store:
         """내가 속한 방에서 나를 멘션한 메시지 (최신순, 삭제·차단 제외) - 멘션 모아보기 (§10.5)"""
         rows = self._all(
             'SELECT m.* FROM messages m JOIN room_members rm ON rm.room_id=m.room_id AND rm.username=? '
-            'WHERE m.deleted=0 AND m.sender!=? AND m.mentions LIKE ? '
+            'WHERE m.deleted=0 AND m.msg_id>rm.since_msg_id AND m.sender!=? AND m.mentions LIKE ? '
             'AND m.sender NOT IN (SELECT blocked FROM blocks WHERE owner=?) '
             'ORDER BY m.msg_id DESC LIMIT ?',
             (username, username, '%' + json.dumps(username, ensure_ascii=False) + '%', username, limit * 2))
@@ -1695,6 +1827,11 @@ class Store:
         if viewer is not None:
             sql += f' AND {_NOT_BLOCKED}'
             params.append(viewer)
+            root = self._one('SELECT room_id FROM messages WHERE msg_id=?', (root_id,))
+            since = self._since(root['room_id'], viewer) if root else 0
+            if since:
+                sql += ' AND msg_id>?'
+                params.append(since)
         rows = self._all(sql + ' ORDER BY msg_id DESC LIMIT ?', params + [limit])
         return [self._message_dict(r) for r in reversed(rows)]
 
@@ -1804,7 +1941,7 @@ class Store:
         escaped = query.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
         sql = ('SELECT m.* FROM messages m JOIN room_members rm '
                'ON rm.room_id=m.room_id AND rm.username=? '
-               'WHERE m.kind=\'text\' AND m.deleted=0 AND m.content LIKE ? ESCAPE \'\\\' '
+               'WHERE m.kind=\'text\' AND m.deleted=0 AND m.msg_id>rm.since_msg_id AND m.content LIKE ? ESCAPE \'\\\' '
                'AND m.sender NOT IN (SELECT blocked FROM blocks WHERE owner=?)')
         params: list[Any] = [username, f'%{escaped}%', username]
         if room_id is not None:
@@ -1834,6 +1971,49 @@ class Store:
         return int(cur.lastrowid)
 
     @_locked
+    def uploaded_bytes_since(self, username: str, since: str) -> int:
+        """그 사람이 since(ISO) 뒤로 올린 첨부의 크기 합 (보관 기간이 지나 비운 것도 올린 크기로 센다)"""
+        row = self._one('SELECT COALESCE(SUM(size), 0) AS n FROM attachments WHERE uploader=? AND created_at>=?',
+                        (username, since))
+        return int(row['n'])
+
+    @_locked
+    def unread_count(self, room_id: str, username: str) -> int:
+        """그 방에서 username 이 아직 읽지 않은 메시지 수 (room 의 unread_count 와 같은 계산)"""
+        row = self._one('SELECT last_read_msg_id FROM read_pointers WHERE room_id=? AND username=?', (room_id, username))
+        pointer = int(row['last_read_msg_id']) if row else 0
+        return int(self._one(
+            "SELECT COUNT(*) AS c FROM messages WHERE room_id=? AND msg_id>? AND sender!=? AND kind!='system' "
+            f'AND {_NOT_BLOCKED}', (room_id, pointer, username, username))['c'])
+
+    @_locked
+    def purge_orphan_attachments(self, min_age_hours: float = 24.0) -> int:
+        """어디에서도 쓰지 않는 첨부의 데이터를 지운다 → 지운 개수. 쓰는 곳: 메시지 · 프로필/조직도 사진 · 멀티프로필 ·
+        펑 · 처리 전인 파일 전송 요청 · 아직 보내지 않은 예약 메시지. 올린 지 min_age_hours 가 안 된 것은 건드리지 않는다"""
+        cutoff = (datetime.now() - timedelta(hours=float(min_age_hours))).strftime(ISO_FMT)
+        scheduled = set()
+        for row in self._all('SELECT payload FROM scheduled_messages WHERE delivered=0'):
+            try:
+                value = json.loads(row['payload']).get('attachment_id')
+            except (ValueError, AttributeError):
+                continue
+            if isinstance(value, int):
+                scheduled.add(value)
+        rows = self._all(
+            'SELECT a.attachment_id FROM attachments a WHERE a.expired=0 AND a.created_at<=? '
+            'AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.attachment_id=a.attachment_id) '
+            'AND NOT EXISTS (SELECT 1 FROM users u WHERE a.attachment_id IN (u.avatar_id, u.org_avatar_id)) '
+            'AND NOT EXISTS (SELECT 1 FROM multi_profiles p WHERE p.avatar_id=a.attachment_id) '
+            'AND NOT EXISTS (SELECT 1 FROM stories s WHERE s.attachment_id=a.attachment_id) '
+            "AND NOT EXISTS (SELECT 1 FROM file_requests f WHERE f.attachment_id=a.attachment_id "
+            "AND (f.status='pending' OR (f.status='approved' AND f.msg_id IS NULL)))", (cutoff,))
+        ids = [int(r['attachment_id']) for r in rows if int(r['attachment_id']) not in scheduled]
+        if ids:
+            self._db.executemany("UPDATE attachments SET data=X'', expired=1 WHERE attachment_id=?", [(i,) for i in ids])
+            self._db.commit()
+        return len(ids)
+
+    @_locked
     def get_attachment_for(self, attachment_id: int, username: str) -> Optional[dict]:
         """사용자가 접근 가능한(업로더이거나 참조 메시지가 있는 방의 멤버) 첨부만 반환.
 
@@ -1857,7 +2037,7 @@ class Store:
         if row['uploader'] != username and not is_avatar:
             ok = self._one(
                 'SELECT 1 FROM messages m JOIN room_members rm ON rm.room_id=m.room_id '
-                'WHERE m.attachment_id=? AND m.deleted=0 AND rm.username=? LIMIT 1',
+                'WHERE m.attachment_id=? AND m.deleted=0 AND rm.username=? AND m.msg_id>rm.since_msg_id LIMIT 1',
                 (attachment_id, username))
             if ok is None:
                 return None
@@ -2161,7 +2341,8 @@ class Store:
                 'link': "m.kind='text' AND (m.content LIKE '%http://%' OR m.content LIKE '%https://%')"}[kind]
         rows = self._all(
             'SELECT m.* FROM messages m JOIN room_members rm ON rm.room_id=m.room_id AND rm.username=? '
-            f'WHERE {cond} AND m.deleted=0 AND m.sender NOT IN (SELECT blocked FROM blocks WHERE owner=?) '
+            f'WHERE {cond} AND m.deleted=0 AND m.msg_id>rm.since_msg_id '
+            'AND m.sender NOT IN (SELECT blocked FROM blocks WHERE owner=?) '
             'ORDER BY m.msg_id DESC LIMIT ?', (username, username, limit))
         return [self._message_dict(r) for r in rows]
 

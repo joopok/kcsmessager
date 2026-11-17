@@ -17,20 +17,89 @@ EMPLOYEE_NO_RE = re.compile(r'[0-9A-Za-z][0-9A-Za-z_-]{0,19}')   # 사번: 영�
 
 
 class ProtocolError(Exception):
-    """클라이언트에게 error 로 돌려줄 검증 오류 (메시지는 한국어)."""
+    """클라이언트에게 error 로 돌려줄 검증 오류 (메시지는 한국어).
+    code: 클라이언트가 문구 대신 보고 가르는 구분 값 (명세 §4.1 '오류 구분 코드', 없으면 ''), extra: error 에 함께 실을 값"""
+
+    def __init__(self, message: str, code: str = '', **extra: Any) -> None:
+        super().__init__(message)
+        self.code = code
+        self.extra = extra
 
 
 # ---------------------------------------------------------------------- 입력 검증 헬퍼
+MAX_LIST_ITEMS = 1000      # 이름 목록(_str_list) 한 번에 받는 최대 개수
+MAX_TAG_LEN = 64           # req_id · client_tmp_id 문자열 길이
+
+
+def _utf8_ok(value: str) -> bool:
+    """UTF-8 로 보낼 수 있는 글자인가 (짝 없는 서러게이트가 섞이면 저장 · 전송이 실패한다)"""
+    try:
+        value.encode('utf-8')
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+# 글자 방향을 바꾸는 문자 (이름 · 파일 이름의 겉모습을 바꾼다)
+_BIDI_CONTROLS = frozenset({0x061C, 0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A)})
+
+
+def has_hidden_chars(value: str) -> bool:
+    """제어 문자(줄바꿈 · 탭 포함)나 글자 방향을 바꾸는 문자가 들어 있는가"""
+    return any(ord(ch) < 32 or ord(ch) == 127 or ord(ch) in _BIDI_CONTROLS for ch in value)
+
+
+def clean_file_name(name: str) -> str:
+    """첨부 파일 이름 정리 (명세 §4.5): 폴더 부분을 떼고, 제어 문자 · 방향 전환 문자를 지운다. 남는 게 없으면 '파일'"""
+    name = (name or '').replace('\\', '/').rsplit('/', 1)[-1]
+    name = ''.join(ch for ch in name if not has_hidden_chars(ch)).strip().rstrip(' .')
+    return name if name not in ('', '.', '..') else '파일'
+
+
+def _tag_ok(value: Any) -> bool:
+    """req_id · client_tmp_id: 클라이언트가 붙이는 짧은 표식 - 없음 · 정수 · 64자 이내 문자열만 그대로 돌려준다"""
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return -INT_LIMIT <= value <= INT_LIMIT
+    return isinstance(value, str) and len(value) <= MAX_TAG_LEN and _utf8_ok(value)
+
+
+def _opt_tag(msg: dict, key: str) -> Any:
+    value = msg.get(key)
+    if not _tag_ok(value):
+        raise ProtocolError(f'{key} 값이 올바르지 않습니다.')
+    return value
+
+
 def _req_str(msg: dict, key: str, max_len: int, allow_empty: bool = False, label: str = '') -> str:
     value = msg.get(key)
     if not isinstance(value, str):
         raise ProtocolError(f'{label or key} 값이 올바르지 않습니다.')
+    if not _utf8_ok(value):
+        raise ProtocolError(f'{label or key} 값에 쓸 수 없는 문자가 있습니다.')
     value = value.strip()
     if not value and not allow_empty:
         raise ProtocolError(f'{label or key} 값을 입력하세요.')
     if len(value) > max_len:
         raise ProtocolError(f'{label or key} 값은 {max_len}자를 넘을 수 없습니다.')
     return value
+
+
+def _req_name(msg: dict, key: str, max_len: int, allow_empty: bool = False, label: str = '') -> str:
+    """사람 · 방 · 프로필 이름처럼 한 줄로 보이는 값: _req_str + 제어 문자 · 방향 전환 문자 불가"""
+    value = _req_str(msg, key, max_len, allow_empty=allow_empty, label=label)
+    if has_hidden_chars(value):
+        raise ProtocolError(f'{label or key}에 사용할 수 없는 문자가 있습니다.')
+    return value
+
+
+def _opt_name(msg: dict, key: str, max_len: int, default: str = '') -> str:
+    if msg.get(key) is None:
+        return default
+    return _req_name(msg, key, max_len, allow_empty=True)
 
 
 def _opt_str(msg: dict, key: str, max_len: int, default: str = '') -> str:
@@ -64,18 +133,23 @@ def _bool(msg: dict, key: str, default: bool = False) -> bool:
     raise ProtocolError(f'{key} 값이 올바르지 않습니다.')
 
 
-def _str_list(msg: dict, key: str, required: bool = True) -> list[str]:
+def _str_list(msg: dict, key: str, required: bool = True, max_items: int = MAX_LIST_ITEMS) -> list[str]:
+    """문자열 목록 (앞뒤 공백 제거 · 빈 값 제외 · 중복은 처음 것만, 순서 유지). max_items 보다 길면 오류"""
     value = msg.get(key)
     if value is None and not required:
         return []
-    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+    if not isinstance(value, list):
         raise ProtocolError(f'{key} 값이 올바르지 않습니다.')
-    seen: list[str] = []
+    if len(value) > max_items:
+        raise ProtocolError(f'{key} 항목이 너무 많습니다 (최대 {max_items}개).')
+    if not all(isinstance(v, str) and _utf8_ok(v) for v in value):
+        raise ProtocolError(f'{key} 값이 올바르지 않습니다.')
+    seen: dict[str, None] = {}
     for v in value:
         v = v.strip()
-        if v and v not in seen:
-            seen.append(v)
-    return seen
+        if v:
+            seen.setdefault(v, None)
+    return list(seen)
 
 
 def parse_iso(value: Any, key: str) -> datetime:

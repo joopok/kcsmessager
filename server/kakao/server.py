@@ -23,6 +23,7 @@ import re
 import socket
 import threading
 import time
+import zlib
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Optional
@@ -30,8 +31,8 @@ from typing import Any, Callable, Optional
 from . import file_policy
 from .admin_handlers import AdminHandlers
 from .protocol import (ACCOUNT_DISABLED, ADMIN_ONLY, EMAIL_RE, EMPLOYEE_NO_RE, INT_LIMIT,  # noqa: F401 (예전 import 경로 호환)
-                       ProtocolError, _bool, _norm_iso, _opt_int, _opt_str, _req_int, _req_str, _str_list,
-                       parse_iso)
+                       ProtocolError, _bool, _norm_iso, _opt_int, _opt_name, _opt_str, _opt_tag, _req_int, _req_name,
+                       _req_str, _str_list, _tag_ok, _utf8_ok, clean_file_name, parse_iso)
 from . import summary as chat_summary
 from .store import BOT_USERNAME, ISO_FMT, PRESENCES, Store, now_iso
 
@@ -52,6 +53,11 @@ DELETE_WINDOW = timedelta(hours=24)
 REMINDER_GRACE = timedelta(seconds=60)
 SOCKET_TIMEOUT = 30.0
 RECV_SIZE = 65536
+SEND_CHUNK = 256 * 1024
+MIN_SEND_BYTES_PER_SEC = 32 * 1024     # 이보다 느린 회선은 큰 응답을 끝내 받지 못한다고 보고 끊는다
+RATE_LIMITED = '요청이 너무 잦습니다. 잠시 후 다시 시도해 주세요.'
+UPLOAD_QUOTA = '하루에 올릴 수 있는 파일 용량을 넘었습니다. 내일 다시 시도해 주세요.'
+AI_BUSY = '질문이 너무 잦아요. 잠시 후 다시 물어봐 주세요.'
 
 SEND_KINDS = ('text', 'emoticon', 'image', 'file', 'secret', 'contact', 'voice')
 ATTACHMENT_KINDS = ('image', 'file', 'voice')   # 첨부 데이터를 함께 보내는 종류
@@ -69,8 +75,23 @@ SECRET_PEER_NO_KEY = '상대방이 아직 비밀채팅을 사용할 수 없습�
 SECRET_FORBIDDEN = '비밀채팅방에서는 사용할 수 없는 기능입니다.'
 LOGIN_FAILED = '아이디 또는 비밀번호가 올바르지 않습니다.'
 LOGIN_TOKEN_EXPIRED = '저장된 로그인 정보가 만료되었습니다. 비밀번호를 입력해 주세요.'
+NAME_FIXED = '이름은 조직도에 등록된 이름으로 고정되어 바꿀 수 없습니다.'
+EMAIL_ADMIN_ONLY = '이메일은 로그인 아이디라 직접 바꿀 수 없습니다. 관리자에게 변경을 요청해 주세요.'
+LOGIN_REQUIRED = '먼저 로그인(join)해야 합니다.'
+PASSWORD_REQUIRED = '비밀번호를 입력해 주세요.'
+ALREADY_LOGGED_IN = '이미 로그인된 연결입니다.'
+SERVER_ERROR = '서버 오류가 발생했습니다.'
 RESET_MISMATCH = '아이디 · 가입한 이메일 · 재설정 코드가 맞지 않습니다. 코드는 관리자에게 받고 30분 동안 한 번만 쓸 수 있습니다.'
 NEEDS_REGISTER = '처음 사용하는 아이디입니다. [처음 사용 등록]에서 소속 회사·이름·이메일·비밀번호를 등록해 주세요.'
+
+# 오류 구분 코드 (명세 §4.1): 문구가 정해진 오류는 여기서 code 를 붙인다. 클라이언트는 문구가 아니라 이 값으로 가른다
+ERROR_CODES = {
+    LOGIN_FAILED: 'auth_failed', LOGIN_TOKEN_EXPIRED: 'token_expired', ACCOUNT_DISABLED: 'account_disabled',
+    NEEDS_REGISTER: 'needs_register', PASSWORD_REQUIRED: 'password_required', ALREADY_LOGGED_IN: 'already_logged_in',
+    LOGIN_REQUIRED: 'login_required', RESET_MISMATCH: 'reset_mismatch', EMAIL_ADMIN_ONLY: 'email_admin_only',
+    NAME_FIXED: 'name_fixed',
+    Store.REGISTER_CLOSED: 'register_closed', Store.RESET_ADMIN_BY_TOOL: 'admin_account', ADMIN_ONLY: 'admin_only',
+}
 
 CALL_MODES = ('voice', 'video', 'voiceroom')
 CALL_ROLES = ('host', 'speaker', 'listener')
@@ -80,6 +101,12 @@ MAX_VIDEO_PARTICIPANTS = 10
 MAX_VOICEROOM_PARTICIPANTS = 1500
 MAX_VOICEROOM_SPEAKERS = 10                  # host + speaker
 MAX_MEDIA_B64 = 2 * 1024 * 1024
+MAX_AUDIO_FRAME_BYTES = 32000                # 음성 한 조각(PCM)의 상한 = 16kHz mono s16le 1초 (보내는 쪽은 40ms 씩)
+MAX_AUDIO_B64 = MAX_AUDIO_FRAME_BYTES * 4 // 3 + 8
+MAX_INVITE = 100                             # 한 번에 초대할 수 있는 인원 (방 만들기 · 초대 공통)
+MAX_MENTIONS = 200
+BAD_TEXT = '메시지에 쓸 수 없는 문자가 있습니다.'
+UNSUPPORTED_REQUEST = '지원하지 않는 요청입니다.'
 CALL_GONE = '종료되었거나 존재하지 않는 통화입니다.'
 CALL_NOT_PARTICIPANT = '통화 참여자가 아닙니다.'
 
@@ -104,31 +131,52 @@ PREVIEW_MAX_BYTES = 256 * 1024
 
 
 def preview_host_allowed(url: str) -> bool:
-    """링크 미리보기로 서버가 가져가도 되는 주소인가. 서버 자신(127.x · ::1) · 링크 로컬(169.254.x - 클라우드 메타데이터)
-    · 0.0.0.0 · 멀티캐스트는 막는다 (메시지에 주소만 넣어 서버 안쪽 서비스 내용을 대화방으로 빼 가지 못하게).
-    사내망 주소(10.x · 192.168.x 등)는 그룹웨어 링크 미리보기에 필요해 허용한다"""
+    """링크 미리보기로 서버가 가져가도 되는 주소인가. 공인 인터넷 주소만 된다: 서버 자신(127.x · ::1) · 링크 로컬
+    (169.254.x - 클라우드 메타데이터) · 0.0.0.0 · 멀티캐스트 · 사내망(10.x · 172.16~31.x · 192.168.x 등)은 막는다
+    (메시지에 주소만 넣어 서버 안쪽 · 사내 서비스 내용을 대화방으로 빼 가지 못하게 - 명세 §4.5)"""
+    return bool(_preview_addresses(url))
+
+
+def _preview_addresses(url: str) -> list[str]:
+    """미리보기로 가져가도 되는 주소면 그 호스트의 IP 목록, 아니면 [] (하나라도 막힌 주소면 전부 안 된다)"""
     import ipaddress
-    import socket as socket_mod
     from urllib.parse import urlsplit
     try:
         parts = urlsplit(url)
         if parts.scheme not in ('http', 'https') or not parts.hostname:
-            return False
-        infos = socket_mod.getaddrinfo(parts.hostname, parts.port or (443 if parts.scheme == 'https' else 80),
-                                       proto=socket_mod.IPPROTO_TCP)
+            return []
+        infos = socket.getaddrinfo(parts.hostname, parts.port or (443 if parts.scheme == 'https' else 80),
+                                   proto=socket.IPPROTO_TCP)
     except (OSError, ValueError, UnicodeError):
-        return False
+        return []
+    addresses = []
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0].split('%', 1)[0])
-        if ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved:
-            return False
-    return True
+        ip = ipaddress.ip_address(str(info[4][0]).split('%', 1)[0])
+        if not ip.is_global or ip.is_multicast:        # 공인 주소가 아니면(사내망 포함) 가져가지 않는다
+            return []
+        addresses.append(str(info[4][0]))
+    return addresses
+
+
+def _pinned_connection(conn_class: Any, scheme: str) -> Callable:
+    """확인한 바로 그 IP 로만 접속하는 HTTP(S) 연결을 만든다 - 확인할 때와 접속할 때 이름 풀이가 달라지지 않게.
+    (TLS 인증서 확인 · SNI 는 원래 호스트 이름으로 한다)"""
+    def make(host: str, **kwargs: Any) -> Any:
+        addresses = _preview_addresses(f'{scheme}://{host}/')
+        if not addresses:
+            raise OSError('미리보기로 가져갈 수 없는 주소입니다.')
+        conn = conn_class(host, **kwargs)
+        conn._create_connection = lambda address, *args, **kw: socket.create_connection(
+            (addresses[0], address[1]), *args, **kw)
+        return conn
+    return make
 
 
 def fetch_link_preview(url: str, block_internal: bool = True) -> Optional[dict]:
     """URL 의 og:title / og:description / og:site_name (없으면 <title>). 실패하면 None.
     block_internal: 서버 자신 · 링크 로컬 주소는 가져오지 않는다 (리다이렉트로 옮겨 가는 주소도 다시 검사)"""
     import html as html_mod
+    import http.client
     import urllib.request
 
     class _CheckedRedirect(urllib.request.HTTPRedirectHandler):
@@ -137,11 +185,21 @@ def fetch_link_preview(url: str, block_internal: bool = True) -> Optional[dict]:
                 return None
             return super().redirect_request(req, fp, code, msg, headers, newurl)
 
+    class _PinnedHTTP(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(_pinned_connection(http.client.HTTPConnection, 'http'), req)
+
+    class _PinnedHTTPS(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(_pinned_connection(http.client.HTTPSConnection, 'https'), req,
+                                context=getattr(self, '_context', None))
+
     if block_internal and not preview_host_allowed(url):
         return None
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'KCSTalk-LinkPreview/1.0'})
-        opener = urllib.request.build_opener(_CheckedRedirect)
+        handlers = [_CheckedRedirect] + ([_PinnedHTTP, _PinnedHTTPS] if block_internal else [])
+        opener = urllib.request.build_opener(*handlers)
         with opener.open(req, timeout=PREVIEW_TIMEOUT) as resp:
             ctype = resp.headers.get('Content-Type', '')
             if 'html' not in ctype:
@@ -152,21 +210,52 @@ def fetch_link_preview(url: str, block_internal: bool = True) -> Optional[dict]:
         return None
     text = raw.decode(charset, errors='replace')
 
+    found, page_title = _scan_preview_tags(text)
+
     def meta(prop: str) -> str:
-        for pattern in (rf'<meta[^>]+(?:property|name)=["\']{prop}["\'][^>]*content=["\']([^"\']*)',
-                        rf'<meta[^>]+content=["\']([^"\']*)["\'][^>]*(?:property|name)=["\']{prop}["\']'):
-            m = re.search(pattern, text, re.I)
-            if m:
-                return html_mod.unescape(m.group(1)).strip()
-        return ''
-    title = meta('og:title')
-    if not title:
-        m = re.search(r'<title[^>]*>(.*?)</title>', text, re.I | re.S)
-        title = html_mod.unescape(re.sub(r'\s+', ' ', m.group(1))).strip() if m else ''
+        return html_mod.unescape(found.get(prop, '')).strip()
+    title = meta('og:title') or html_mod.unescape(re.sub(r'\s+', ' ', page_title)).strip()
     if not title:
         return None
     return {'url': url, 'title': title[:200], 'description': (meta('og:description') or meta('description'))[:300],
             'site': meta('og:site_name')[:80]}
+
+
+_PREVIEW_META = ('og:title', 'og:description', 'og:site_name', 'description')
+_PREVIEW_TAG_MAX = 2000        # <meta ...> 태그 하나에서 보는 길이
+_PREVIEW_TITLE_MAX = 2000
+_META_ATTR_RE = re.compile(r'''([a-zA-Z_:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))''')
+
+
+def _scan_preview_tags(text: str) -> tuple[dict, str]:
+    """HTML 에서 미리보기용 meta 값({이름: content})과 <title> 글자를 찾는다.
+    태그를 하나씩 정해진 길이 안에서만 보므로 걸리는 시간이 문서 크기에 비례한다 (어떤 문서가 와도)"""
+    lower = text.lower()
+    found: dict[str, str] = {}
+    pos = 0
+    while len(found) < len(_PREVIEW_META):
+        start = lower.find('<meta', pos)
+        if start < 0:
+            break
+        end = lower.find('>', start, start + _PREVIEW_TAG_MAX)
+        if end < 0:
+            pos = start + 5
+            continue
+        attrs = {m.group(1).lower(): m.group(2) or m.group(3) or m.group(4) or ''
+                 for m in _META_ATTR_RE.finditer(text, start + 5, end)}
+        key = (attrs.get('property') or attrs.get('name') or '').lower()
+        if key in _PREVIEW_META and key not in found and 'content' in attrs:
+            found[key] = attrs['content']
+        pos = end + 1
+    title = ''
+    start = lower.find('<title')
+    if start >= 0:
+        open_end = lower.find('>', start, start + _PREVIEW_TAG_MAX)
+        if open_end >= 0:
+            close = lower.find('</title', open_end + 1, open_end + 1 + _PREVIEW_TITLE_MAX)
+            if close >= 0:
+                title = text[open_end + 1:close]
+    return found, title
 RAG_HISTORY_LIMIT = 20
 
 _IMAGE_SIGNATURES = (
@@ -290,14 +379,36 @@ class Connection:
         self.username: Optional[str] = None
         self.alive = True
         self._send_lock = threading.Lock()
+        now = time.monotonic()
+        self.connected_at = now
+        self.last_recv = now
+        self.last_sent = now
+        self.heartbeat = False          # ping/pong 을 하는 클라이언트 (그런 연결만 조용하면 끊는다 - 명세 §2)
+        self.bucket: Optional[TokenBucket] = None        # 요청 빈도 (로그인하면 채운다)
+        self.media_bucket: Optional[TokenBucket] = None  # 통화 미디어 조각 빈도
+
+    @property
+    def ip(self) -> str:
+        return self.address[0] if isinstance(self.address, tuple) and self.address else str(self.address)
 
     def send(self, payload: dict) -> bool:
         if not self.alive:
             return False
-        data = (json.dumps(payload, ensure_ascii=False) + '\n').encode('utf-8')
+        try:       # 보낼 수 없는 값이 섞인 한 건 때문에 나머지 수신자 전송이 끊기지 않게: 이 건만 버린다
+            data = (json.dumps(payload, ensure_ascii=False) + '\n').encode('utf-8', errors='replace')
+        except (TypeError, ValueError, RecursionError) as exc:
+            logger.error('send: 보낼 수 없는 내용 (%s): %s', payload.get('type'), exc)
+            return False
         try:
             with self._send_lock:
-                self.sock.sendall(data)
+                # 한 번에 보낸 만큼씩 시간 제한을 다시 센다 (느린 회선도 큰 첨부를 받는다). 전체로는 최소 속도만 본다
+                view = memoryview(data)
+                deadline = time.monotonic() + SOCKET_TIMEOUT + len(data) / MIN_SEND_BYTES_PER_SEC
+                while view:
+                    view = view[self.sock.send(view[:SEND_CHUNK]):]
+                    if view and time.monotonic() > deadline:
+                        raise socket.timeout('너무 느린 연결')
+                self.last_sent = time.monotonic()
             return True
         except OSError as exc:
             logger.info('send failed to %s: %s', self.address, exc)
@@ -316,10 +427,53 @@ class Connection:
             pass
 
 
+class TokenBucket:
+    """요청 빈도 제한: 초당 rate 개씩 채워지고 burst 개까지 모아 쓴다 (연결마다 하나, 그 연결의 스레드만 쓴다)"""
+    __slots__ = ('rate', 'burst', 'tokens', 'stamp')
+
+    def __init__(self, rate: float, burst: float) -> None:
+        self.rate, self.burst = float(rate), float(burst)
+        self.tokens = float(burst)
+        self.stamp = time.monotonic()
+
+    def take(self) -> bool:
+        now = time.monotonic()
+        self.tokens = min(self.burst, self.tokens + (now - self.stamp) * self.rate)
+        self.stamp = now
+        if self.tokens < 1.0:
+            return False
+        self.tokens -= 1.0
+        return True
+
+
+class WindowLimiter:
+    """사용자별 · 동작별 횟수 제한 (최근 window 초 안에 limit 번)"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._hits: dict[tuple[str, str], list[float]] = {}
+
+    def hit(self, user: str, action: str, limit: int, window: float) -> tuple[bool, int]:
+        """한 번 센다 → (허용인가, 다시 해도 되는 때까지 남은 초). 넘은 뒤의 시도는 세지 않는다"""
+        now = time.monotonic()
+        with self._lock:
+            if len(self._hits) > 20000:        # 오래된 기록 정리
+                for key in [k for k, v in self._hits.items() if not v or now - v[-1] >= 3600]:
+                    del self._hits[key]
+            times = [t for t in self._hits.get((user, action), ()) if now - t < window]
+            if len(times) >= limit:
+                self._hits[(user, action)] = times
+                return False, max(1, int(window - (now - times[0])) + 1)
+            times.append(now)
+            self._hits[(user, action)] = times
+            return True, 0
+
+
 class FrameDecoder:
     """NDJSON + 줄바꿈 없는 연속 JSON 을 모두 처리하는 수신 버퍼."""
 
     def __init__(self) -> None:
+        self.limit = MAX_BUFFER_CHARS     # 완성되지 않은 요청 한 건의 최대 크기 (로그인 전에는 서버가 작게 잡는다)
         self._utf8 = codecs.getincrementaldecoder('utf-8')(errors='replace')
         self._parts: list[str] = []   # 아직 완성되지 않은 프레임 조각 (대용량 첨부 시 재복사 방지)
         self._size = 0
@@ -351,7 +505,7 @@ class FrameDecoder:
                 self._reset(rest)
             else:
                 self._parts = [buf]
-        if self._size > MAX_BUFFER_CHARS:
+        if self._size > self.limit:
             raise OverflowError('수신 버퍼 한도 초과')
         return items
 
@@ -365,7 +519,7 @@ class FrameDecoder:
                 break
             try:
                 obj, idx = self._json.raw_decode(text, idx)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):     # 너무 깊게 겹친 값도 잘못된 형식으로 본다
                 break
             out.append(obj)
         return out, text[idx:]
@@ -427,7 +581,8 @@ class KakaoServer(AdminHandlers):
                  retention_days: float = 90, story_ttl_seconds: float = DEFAULT_STORY_TTL,
                  voiceroom_max_seconds: float = DEFAULT_VOICEROOM_MAX,
                  require_password: bool = False, portal: Optional[dict] = None,
-                 portal_client: Any = None, proxy_protocol: bool = False) -> None:
+                 portal_client: Any = None, proxy_protocol: bool = False,
+                 open_registration: Optional[bool] = None) -> None:
         self.host = host
         # True 면 각 연결의 첫 줄을 PROXY protocol v1 헤더로 읽어 실제 클라이언트 IP 를 복원한다.
         # nginx stream 이 TLS 를 종단하고 loopback 으로 넘기는 배치(.230)에서 켠다 — 안 켜면 모든
@@ -438,7 +593,12 @@ class KakaoServer(AdminHandlers):
         self.portal_client = portal_client      # 테스트용 가짜 포털 클라이언트
         # True 면 비밀번호(또는 자동 로그인 토큰) 없는 join 을 받지 않는다 (배포용 chat_server.py 기본값)
         self.require_password = require_password
+        # 등록 방식 (명세 §4.1): False(닫힘)면 조직도에 없는 이름은 만들지 않고, 비밀번호 없는 계정은 관리자가 발급한
+        # 등록 코드가 있어야 등록된다. 기본값은 비밀번호 필수 서버면 닫힘, 테스트 · 데모(비밀번호 없는 join)면 열림
+        self.open_registration = (not require_password) if open_registration is None else bool(open_registration)
+        self._dummy_hash: Optional[str] = None
         self._login_failures: dict[str, list[float]] = {}   # 아이디/IP → 최근 실패 시각
+        self._actions = WindowLimiter()
         self._login_failures_lock = threading.Lock()
         self.retention_days = float(retention_days)          # 받은 파일 보관 기간 (§8.10)
         self.story_ttl_seconds = float(story_ttl_seconds)    # 펑 유지 시간 (§8.3)
@@ -529,6 +689,7 @@ class KakaoServer(AdminHandlers):
             'todo_delete': self._h_todo_delete,
             'todo_list': self._h_todo_list,
             'login_token_revoke': self._h_login_token_revoke,
+            'password_change': self._h_password_change,
             'profile_update': self._h_profile_update,
             'attachment_get': self._h_attachment_get,
             'presence_set': self._h_presence_set,
@@ -575,6 +736,10 @@ class KakaoServer(AdminHandlers):
     def _bind(self) -> None:
         self._stop.clear()
         self.store = Store(self.db_path, retention_days=self.retention_days)
+        if not self.open_registration:         # 표시 이름은 실명으로 고정 (§4.5): 예전에 바꿔 둔 이름을 되돌린다
+            fixed = self.store.fix_display_names()
+            if fixed:
+                logger.info('표시 이름 %d개를 조직도 이름으로 되돌렸습니다', fixed)
         with self._calls_lock:
             self._calls.clear()
             self._room_calls.clear()
@@ -583,7 +748,7 @@ class KakaoServer(AdminHandlers):
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind((self.host, self.port))
-            sock.listen(64)
+            sock.listen(256)
         except OSError:
             sock.close()
             self.store.close()
@@ -630,6 +795,7 @@ class KakaoServer(AdminHandlers):
         self._spawn(self._scheduler_loop, name='kakao-scheduler')
         self._spawn(self._rag_worker, name='kakao-rag')
         self._spawn(self._preview_worker, name='kakao-preview')
+        self._spawn(self._heartbeat_loop, name='kakao-heartbeat')
         try:
             self._accept_loop()
         finally:
@@ -641,6 +807,7 @@ class KakaoServer(AdminHandlers):
         self._spawn(self._scheduler_loop, name='kakao-scheduler')
         self._spawn(self._rag_worker, name='kakao-rag')
         self._spawn(self._preview_worker, name='kakao-preview')
+        self._spawn(self._heartbeat_loop, name='kakao-heartbeat')
         return self._spawn(self._accept_loop, name='kakao-accept')
 
     def stop(self) -> None:
@@ -680,13 +847,51 @@ class KakaoServer(AdminHandlers):
                 sock, address = self._listener.accept()
             except socket.timeout:
                 continue
-            except OSError:
-                break
-            sock.settimeout(SOCKET_TIMEOUT)
+            except OSError as exc:
+                if self._stop.is_set():
+                    break
+                logger.error('연결을 받지 못했습니다 (잠시 뒤 계속): %s', exc)   # 파일 개수 한도 등 - 서버를 내리지 않는다
+                self._stop.wait(0.2)
+                continue
+            sock.settimeout(min(SOCKET_TIMEOUT, self.PRELOGIN_SECONDS))        # 로그인하면 SOCKET_TIMEOUT 으로
+            self._enable_keepalive(sock)
             conn = Connection(sock, address)
             with self._conns_lock:
-                self._conns.add(conn)
+                full = len(self._conns) >= self.MAX_CONNECTIONS
+                if not full:
+                    self._conns.add(conn)
+            if full:
+                logger.warning('연결 수 한도(%s)에 닿아 새 연결을 닫습니다: %s', self.MAX_CONNECTIONS, address)
+                conn.close()
+                continue
             self._spawn(self._client_loop, conn, name=f'kakao-client-{address}')
+
+    @staticmethod
+    def _enable_keepalive(sock: socket.socket) -> None:
+        """끊긴 줄 모르는 연결을 운영체제가 찾아내게 한다 (클라이언트가 응답할 필요 없음)"""
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            for name, value in (('TCP_KEEPIDLE', 60), ('TCP_KEEPALIVE', 60), ('TCP_KEEPINTVL', 20), ('TCP_KEEPCNT', 3)):
+                option = getattr(socket, name, None)
+                if option is not None:
+                    sock.setsockopt(socket.IPPROTO_TCP, option, value)
+        except OSError:
+            pass
+
+    def _heartbeat_loop(self) -> None:
+        """조용한 연결에 ping 을 보내고(끊긴 연결은 보내다 드러난다), ping/pong 을 하는 클라이언트가
+        HEARTBEAT_TIMEOUT 동안 아무것도 보내지 않으면 끊는다. ping 을 모르는 예전 클라이언트는 조용해도 끊지 않는다"""
+        while not self._stop.wait(max(0.05, min(5.0, self.HEARTBEAT_SECONDS / 3))):
+            now = time.monotonic()
+            for conn in self._all_joined_conns():
+                try:
+                    if conn.heartbeat and now - conn.last_recv > self.HEARTBEAT_TIMEOUT:
+                        logger.info('%s 응답 없음 - 연결을 닫습니다 (%s)', conn.username, conn.address)
+                        conn.close()            # 읽기 스레드가 깨어나 접속 목록에서 뺀다
+                    elif now - conn.last_sent >= self.HEARTBEAT_SECONDS:
+                        conn.send({'type': 'ping'})
+                except Exception:
+                    logger.exception('하트비트 오류')
 
     # ------------------------------------------------------------------ 연결 관리
     def _online_users(self) -> set[str]:
@@ -761,8 +966,18 @@ class KakaoServer(AdminHandlers):
             payload = {**payload, 'req_id': ctx.req_id}
         ctx.conn.send(payload)
 
-    def _send_error(self, conn: Connection, req_type: str, message: str, request: Optional[dict]) -> None:
-        payload: dict = {'type': 'error', 'req_type': req_type, 'message': message}
+    def _limit_action(self, username: str, action: str) -> None:
+        """사용자별 동작 횟수 제한 (ACTION_LIMITS). 넘으면 code:"rate_limited" 오류"""
+        allowed, wait = self._actions.hit(username, action, *self.ACTION_LIMITS[action])
+        if not allowed:
+            raise ProtocolError(RATE_LIMITED, code='rate_limited', retry_after=wait)
+
+    def _send_error(self, conn: Connection, req_type: str, message: str, request: Optional[dict],
+                    code: str = '', extra: Optional[dict] = None) -> None:
+        payload: dict = {'type': 'error', 'req_type': req_type, 'message': message, **(extra or {})}
+        code = code or ERROR_CODES.get(message, '')
+        if code:                               # 구분 코드가 있는 오류만 (없는 것은 예전과 같은 모양)
+            payload['code'] = code
         if isinstance(request, dict) and 'req_id' in request:
             payload['req_id'] = request['req_id']
         conn.send(payload)
@@ -780,9 +995,13 @@ class KakaoServer(AdminHandlers):
             try:
                 chunk = conn.sock.recv(self.PROXY_V1_MAX - len(buf))
             except socket.timeout:
-                if not conn.alive or self._stop.is_set():
-                    return buf
+                if not conn.alive or self._stop.is_set() \
+                        or time.monotonic() - conn.connected_at > self.PRELOGIN_SECONDS:
+                    conn.close()
+                    return b''
                 continue
+            except OSError:
+                return b''
             if not chunk:
                 return buf
             buf += chunk
@@ -800,6 +1019,7 @@ class KakaoServer(AdminHandlers):
 
     def _client_loop(self, conn: Connection) -> None:
         decoder = FrameDecoder()
+        decoder.limit = self.PRELOGIN_MAX_CHARS             # 로그인 전에는 작은 요청만 받는다
         try:
             if self.proxy_protocol:
                 rest = self._read_proxy_header(conn)
@@ -808,7 +1028,18 @@ class KakaoServer(AdminHandlers):
                         if not conn.alive:
                             break
                         self._handle_item(conn, item)
+            with self._conns_lock:                          # 주소가 정해진 뒤: 한 주소의 로그인 전 연결 수
+                waiting = sum(1 for c in self._conns if c.username is None and c.ip == conn.ip)
+            if waiting > self.MAX_PRELOGIN_PER_IP:
+                logger.warning('로그인 전 연결이 너무 많은 주소: %s', conn.ip)
+                return
             while conn.alive and not self._stop.is_set():
+                if conn.username is None:
+                    if time.monotonic() - conn.connected_at > self.PRELOGIN_SECONDS:
+                        self._send_error(conn, '', '로그인하지 않아 연결을 닫습니다.', None, 'login_timeout')
+                        break
+                elif decoder.limit != MAX_BUFFER_CHARS:
+                    decoder.limit = MAX_BUFFER_CHARS
                 try:
                     data = conn.sock.recv(RECV_SIZE)
                 except socket.timeout:
@@ -817,10 +1048,11 @@ class KakaoServer(AdminHandlers):
                     break
                 if not data:
                     break
+                conn.last_recv = time.monotonic()
                 try:
                     items = decoder.feed(data)
                 except OverflowError:
-                    self._send_error(conn, '', '요청이 너무 큽니다.', None)
+                    self._send_error(conn, '', '요청이 너무 큽니다.', None, 'too_large')
                     break
                 for item in items:
                     if not conn.alive:
@@ -837,6 +1069,9 @@ class KakaoServer(AdminHandlers):
             self._send_error(conn, '', '요청 형식이 올바르지 않습니다.', item if isinstance(item, dict) else None)
             return
         req_type = item['type']
+        if not _tag_ok(item.get('req_id')):        # 응답에 그대로 돌려주는 값이라 짧은 표식만 받는다 (§4)
+            self._send_error(conn, req_type[:40], 'req_id 값이 올바르지 않습니다.', None)
+            return
         try:
             if req_type == 'join':
                 self._h_join(conn, item)
@@ -848,7 +1083,8 @@ class KakaoServer(AdminHandlers):
                 self._h_password_reset(conn, item)
                 return
             if req_type == 'org_companies':     # 로그인 전에도 (처음 사용 등록 화면)
-                payload = {'type': 'org_companies', 'companies': self.store.company_names()}
+                payload = {'type': 'org_companies', 'companies': self.store.company_names(),
+                           'open_registration': self.open_registration}
                 if 'req_id' in item:
                     payload['req_id'] = item['req_id']
                 conn.send(payload)
@@ -856,8 +1092,18 @@ class KakaoServer(AdminHandlers):
             if req_type == 'leave':
                 conn.close()
                 return
+            if req_type in ('ping', 'pong'):       # 하트비트 (명세 §2): ping 에는 pong 으로 답하고, pong 은 받기만 한다
+                conn.heartbeat = True
+                if req_type == 'ping':
+                    conn.send({'type': 'pong', **({'req_id': item['req_id']} if 'req_id' in item else {})})
+                return
             if conn.username is None:
-                raise ProtocolError('먼저 로그인(join)해야 합니다.')
+                raise ProtocolError(LOGIN_REQUIRED)
+            if req_type == 'call_media':
+                if conn.media_bucket is not None and not conn.media_bucket.take():
+                    return                         # 너무 잦은 미디어 조각은 조용히 버린다
+            elif conn.bucket is not None and not conn.bucket.take():
+                raise ProtocolError(RATE_LIMITED, code='rate_limited', retry_after=1)
             handler = self._handlers.get(req_type)
             if handler is None:
                 raise ProtocolError(f'알 수 없는 요청입니다: {req_type}')
@@ -865,10 +1111,10 @@ class KakaoServer(AdminHandlers):
                       req_id=item.get('req_id'), has_req_id='req_id' in item)
             handler(ctx, item)
         except ProtocolError as exc:
-            self._send_error(conn, req_type, str(exc), item)
+            self._send_error(conn, req_type, str(exc), item, exc.code, exc.extra)
         except Exception:  # 한 요청의 오류가 연결을 끊지 않도록
             logger.exception('요청 처리 중 오류: %s', req_type)
-            self._send_error(conn, req_type, '서버 오류가 발생했습니다.', item)
+            self._send_error(conn, req_type, SERVER_ERROR, item, 'server_error')
 
     def _disconnect(self, conn: Connection) -> None:
         conn.close()
@@ -907,6 +1153,8 @@ class KakaoServer(AdminHandlers):
             raise ProtocolError('존재하지 않는 메시지입니다.')
         if not self.store.is_member(message['room_id'], username):
             raise ProtocolError('이 채팅방의 대화상대가 아닙니다. 초대를 받은 뒤 이용할 수 있습니다.')
+        if not self.store.message_visible(msg_id, username):     # 내가 들어오기 전의 메시지 (§4.5)
+            raise ProtocolError('존재하지 않는 메시지입니다.')
         return message
 
     def _push_room_updated(self, room_id: str, usernames: Any, ctx: Optional[Ctx] = None) -> None:
@@ -945,7 +1193,9 @@ class KakaoServer(AdminHandlers):
 
     def _push_msg_updated(self, message: dict, ctx: Optional[Ctx] = None) -> None:
         members = self.store.members(message['room_id'])
-        self._push(self._message_recipients(members, message), {'type': 'msg_updated', 'message': message}, ctx)
+        hidden = self.store.hidden_from(message['room_id'], message['msg_id'])   # 그 메시지보다 나중에 들어온 사람
+        recipients = [m for m in self._message_recipients(members, message) if m not in hidden]
+        self._push(recipients, {'type': 'msg_updated', 'message': message}, ctx)
 
     def _require_not_secret(self, meta: dict) -> None:
         if meta['type'] == 'secret':
@@ -960,12 +1210,35 @@ class KakaoServer(AdminHandlers):
             raise ProtocolError(f'존재하지 않는 사용자입니다: {", ".join(missing)}')
 
     # ------------------------------------------------------------------ join / 구버전
-    LOGIN_MAX_FAILURES = {'id': 5, 'ip': 20}   # 아이디별 / IP별(사무실 공용 IP 고려) 허용 실패 횟수
-    LOGIN_LOCK_SECONDS = 300                   # 넘으면 이 시간 동안 그 아이디·IP 의 로그인을 막는다
+    # 연결 · 요청 한도 (명세 §2). 테스트에서 줄여 쓸 수 있게 클래스 값으로 둔다
+    MAX_DAILY_UPLOAD_BYTES = 1024 * 1024 * 1024     # 한 사람이 24시간 동안 올릴 수 있는 첨부 용량
+    ORPHAN_SWEEP_SECONDS = 3600.0     # 어디에서도 쓰지 않는 첨부를 치우는 간격
+    MAX_CONNECTIONS = 3000            # 동시에 열려 있는 연결 수
+    MAX_PRELOGIN_PER_IP = 100         # 한 주소에서 로그인하지 않고 열어 둔 연결 수
+    PRELOGIN_SECONDS = 30.0           # 로그인하지 않은 연결을 열어 두는 시간
+    PRELOGIN_MAX_CHARS = 64 * 1024    # 로그인 전 요청 한 건의 크기
+    HEARTBEAT_SECONDS = 45.0          # 서버가 이만큼 아무것도 보내지 않은 연결에 ping 을 보낸다
+    HEARTBEAT_TIMEOUT = 150.0         # ping/pong 을 하는 클라이언트가 이만큼 조용하면 끊는다
+    REQUEST_RATE, REQUEST_BURST = 200.0, 2000.0     # 연결당 요청: 초당 200개, 한꺼번에 2,000개까지
+    MEDIA_RATE, MEDIA_BURST = 150.0, 450.0          # 연결당 통화 미디어 조각 (넘으면 조용히 버린다)
+    # 사용자별 동작 횟수 (동작: (횟수, 초)) - 넘으면 code:"rate_limited"
+    ACTION_LIMITS = {'friend_lookup': (10, 60), 'ai_question': (20, 60), 'room_export': (6, 60),
+                     'story_post': (20, 60), 'rag_doc_add': (20, 60), 'search': (120, 60), 'upload': (120, 60)}
+
+    # 로그인 실패 제한 (명세 §4.1 '보안'). 5분(LOGIN_LOCK_SECONDS) 안의 실패 횟수로 본다
+    #   id     : 한 주소(IP)에서 한 아이디 - 다른 주소에서 로그인하는 본인은 막히지 않는다
+    #   id_all : 한 아이디 전체(여러 주소에서 나눠 시도하는 경우)
+    #   ip     : 한 주소 전체 - 사무실이 주소 하나를 같이 쓰므로 넉넉하게
+    LOGIN_MAX_FAILURES = {'id': 5, 'id_all': 20, 'ip': 100}
+    LOGIN_LOCK_SECONDS = 300
+    LOGIN_FAILURE_KEYS_MAX = 5000              # 기록이 이보다 많아지면 지난 것을 치운다
+    _LOGIN_LIMIT_OF = {'at': 'id', 'id': 'id_all', 'ip': 'ip'}
 
     def _login_keys(self, conn: Connection, login_id: str) -> list[str]:
+        """[이 주소에서 이 아이디, 아이디 전체, 주소 전체] - 성공하면 첫 번째만 지운다"""
         ip = conn.address[0] if isinstance(conn.address, tuple) and conn.address else str(conn.address)
-        return [f'id:{login_id.lower()}', f'ip:{ip}']
+        login_id = login_id.lower()
+        return [f'at:{login_id}|{ip}', f'id:{login_id}', f'ip:{ip}']
 
     def _check_login_throttle(self, keys: list[str]) -> None:
         now = time.monotonic()
@@ -976,15 +1249,20 @@ class KakaoServer(AdminHandlers):
                     self._login_failures[key] = recent
                 else:                    # 없는 아이디로 계속 시도해도 빈 목록이 쌓이지 않게
                     self._login_failures.pop(key, None)
-                if len(recent) >= self.LOGIN_MAX_FAILURES[key.split(':', 1)[0]]:
-                    wait = int(self.LOGIN_LOCK_SECONDS - (now - recent[0])) // 60 + 1
-                    raise ProtocolError(f'로그인 실패가 너무 많습니다. {wait}분 뒤에 다시 시도해 주세요.')
+                if len(recent) >= self.LOGIN_MAX_FAILURES[self._LOGIN_LIMIT_OF[key.split(':', 1)[0]]]:
+                    seconds = max(1, int(self.LOGIN_LOCK_SECONDS - (now - recent[0])) + 1)
+                    raise ProtocolError(f'로그인 실패가 너무 많습니다. {(seconds - 1) // 60 + 1}분 뒤에 다시 시도해 주세요.',
+                                        code='throttled', retry_after=seconds)
 
     def _record_login_failure(self, keys: list[str]) -> None:
         now = time.monotonic()
         with self._login_failures_lock:
             for key in keys:
                 self._login_failures.setdefault(key, []).append(now)
+            if len(self._login_failures) > self.LOGIN_FAILURE_KEYS_MAX:
+                for key in [k for k, times in self._login_failures.items()
+                            if not times or now - times[-1] >= self.LOGIN_LOCK_SECONDS]:
+                    del self._login_failures[key]
 
     def _clear_login_failures(self, keys: list[str]) -> None:
         with self._login_failures_lock:
@@ -994,7 +1272,7 @@ class KakaoServer(AdminHandlers):
     def _authenticate(self, login_id: str, password: Any, token: Any = None) -> tuple[str, bool]:
         """아이디/비밀번호(또는 자동 로그인 토큰) 확인 (명세 §4.1) → (username, 새로 만든 계정인지)"""
         if self.require_password and password is None and token is None:
-            raise ProtocolError('비밀번호를 입력해 주세요.')
+            raise ProtocolError(PASSWORD_REQUIRED)
         if token is not None:
             username = self.store.resolve_login(login_id)
             if not isinstance(token, str) or not username or len(token) > 128 \
@@ -1010,19 +1288,66 @@ class KakaoServer(AdminHandlers):
         stored = self.store.password_hash(username) if username else None
         if stored:
             if password is None:
-                raise ProtocolError('비밀번호를 입력해 주세요.')
+                raise ProtocolError(PASSWORD_REQUIRED)
             if not self.store.check_password(password, stored):
                 raise ProtocolError(LOGIN_FAILED)
             self._check_not_disabled(username)      # 비밀번호가 맞을 때만 알린다 (계정 유무를 드러내지 않게)
             return username, False
         if password is not None:            # 비밀번호 등록은 [처음 사용 등록](register)에서 한 번만
-            raise ProtocolError(NEEDS_REGISTER)
+            if self.open_registration:
+                raise ProtocolError(NEEDS_REGISTER)
+            # 등록이 닫힌 서버: 없는 아이디 · 비밀번호 없는 계정도 틀린 비밀번호와 똑같이 답한다 (걸리는 시간도 비슷하게)
+            if self._dummy_hash is None:
+                self._dummy_hash = Store.hash_password('-')
+            self.store.check_password(password, self._dummy_hash)
+            raise ProtocolError(LOGIN_FAILED)
         if username is None and (len(login_id) > 20 or '@' in login_id):
             raise ProtocolError('사용자 이름은 20자 이내로 입력해 주세요.')
+        if username is None and not self.open_registration:
+            raise ProtocolError(LOGIN_FAILED)
         if username is not None:
             self._check_not_disabled(username)
         created = self.store.ensure_user(username or login_id)   # 구버전·테스트 클라이언트 (비밀번호 없이)
         return username or login_id, created
+
+    PASSWORD_MAX = 64
+
+    @property
+    def password_min(self) -> int:
+        """새로 정하는 비밀번호의 최소 길이 (명세 §4.1): 비밀번호 필수 서버 8자, 구버전 · 테스트 서버 4자.
+        로그인은 예전에 정한 짧은 비밀번호도 그대로 받는다"""
+        return 8 if self.require_password else 4
+
+    def _new_password(self, value: Any) -> str:
+        if not isinstance(value, str) or not self.password_min <= len(value) <= self.PASSWORD_MAX:
+            raise ProtocolError(f'비밀번호는 {self.password_min}~{self.PASSWORD_MAX}자로 입력해 주세요.')
+        return value
+
+    def _drop_sessions(self, username: str, keep: Optional[Connection] = None) -> None:
+        """그 계정의 접속 중인 연결을 끊는다 (비밀번호가 바뀌었을 때). keep 은 남긴다"""
+        for conn in self._user_conns([username]):
+            if conn is not keep:
+                conn.send({'type': 'error', 'req_type': '', 'code': 'session_expired',
+                           'message': '비밀번호가 바뀌어 다시 로그인해야 합니다.'})
+                self._disconnect(conn)
+
+    def _h_password_change(self, ctx: Ctx, msg: dict) -> None:
+        """본인 비밀번호 변경 (명세 §4.1): 지금 비밀번호 확인 → 새 비밀번호 + 자동 로그인 토큰 모두 폐기 + 다른 연결 끊기"""
+        keys = self._login_keys(ctx.conn, ctx.username)
+        self._check_login_throttle(keys)
+        old = msg.get('old_password')
+        stored = self.store.password_hash(ctx.username)
+        if not isinstance(old, str) or not stored or not self.store.check_password(old, stored):
+            self._record_login_failure(keys)
+            raise ProtocolError('지금 비밀번호가 올바르지 않습니다.', code='auth_failed')
+        password = self._new_password(msg.get('new_password'))
+        self.store.set_password(ctx.username, password)
+        self.store.revoke_all_login_tokens(ctx.username)
+        self._clear_login_failures(keys[:1])
+        self._drop_sessions(ctx.username, keep=ctx.conn)
+        token = self.store.issue_login_token(ctx.username) if msg.get('remember') is True else None
+        self._reply(ctx, {'type': 'password_changed', **({'login_token': token} if token else {})})
+        logger.info('%s 비밀번호 변경 (%s)', ctx.username, ctx.conn.address)
 
     def _check_not_disabled(self, username: str) -> None:
         if self.store.is_disabled(username):
@@ -1035,8 +1360,10 @@ class KakaoServer(AdminHandlers):
         if username == BOT_USERNAME or self.store.is_bot(username):
             raise ProtocolError('봇 계정으로는 로그인할 수 없습니다.')
         if conn.username is not None:
-            raise ProtocolError('이미 로그인된 연결입니다.')
+            raise ProtocolError(ALREADY_LOGGED_IN)
         keys = self._login_keys(conn, username)
+        if msg.get('token') is not None:       # 자동 로그인 토큰은 맞혀 볼 수 없는 값이라 주소 전체 제한만 본다
+            keys = keys[2:]                    # (아이디가 잠겨 있어도 로그인을 저장해 둔 본인은 들어온다)
         self._check_login_throttle(keys)
         try:
             username, created = self._authenticate(username, msg.get('password'), msg.get('token'))
@@ -1052,7 +1379,7 @@ class KakaoServer(AdminHandlers):
         """처음 사용 등록: 소속 회사 + 이름 + 이메일 + 비밀번호 (명세 §4.1). 성공하면 join 과 같은 welcome.
         다음부터는 이메일과 비밀번호로 로그인한다. employee_no(사번)는 선택 — 2026-10-14 부터 클라이언트가 보내지 않는다"""
         if conn.username is not None:
-            raise ProtocolError('이미 로그인된 연결입니다.')
+            raise ProtocolError(ALREADY_LOGGED_IN)
         company = msg.get('company')
         if not isinstance(company, str) or company.strip() not in self.store.company_names():
             raise ProtocolError('소속 회사를 선택해 주세요.')
@@ -1067,17 +1394,20 @@ class KakaoServer(AdminHandlers):
         email = msg.get('email').strip() if isinstance(msg.get('email'), str) else ''
         if len(email) > 120 or not EMAIL_RE.fullmatch(email):
             raise ProtocolError('이메일 주소 형식이 올바르지 않습니다.')
-        password = msg.get('password')
-        if not isinstance(password, str) or not 4 <= len(password) <= 64:
-            raise ProtocolError('비밀번호는 4~64자로 입력해 주세요.')
+        password = self._new_password(msg.get('password'))
+        code = msg.get('code')                 # 관리자가 발급한 등록 코드 (등록이 닫힌 서버에서 필요)
+        if not isinstance(code, str) or len(code) > 20:
+            code = None
         keys = self._login_keys(conn, name)
         self._check_login_throttle(keys)
-        self._check_not_disabled(name)
+        if self.open_registration:             # 닫힌 서버는 사용 중지도 같은 문구로 거절한다 (store 가 함께 본다)
+            self._check_not_disabled(name)
         try:
-            created = self.store.register_user(name, company.strip(), email, password, employee_no)
+            created = self.store.register_user(name, company.strip(), email, password, employee_no, code=code,
+                                               open_registration=self.open_registration)
         except ValueError as exc:
             self._record_login_failure(keys)   # 남의 조직도 계정 이메일·사번을 맞혀 보는 것도 로그인 실패처럼 막는다
-            raise ProtocolError(str(exc)) from None
+            raise ProtocolError(str(exc), code=ERROR_CODES.get(str(exc), 'register_rejected')) from None
         self._complete_login(conn, msg, 'register', name, created, remember=msg.get('remember') is True)
 
     def _h_password_reset(self, conn: Connection, msg: dict) -> None:
@@ -1086,9 +1416,7 @@ class KakaoServer(AdminHandlers):
         email = msg.get('email').strip() if isinstance(msg.get('email'), str) else ''
         if not email or len(email) > 120:
             raise ProtocolError('가입한 이메일을 입력해 주세요.')
-        password = msg.get('new_password')
-        if not isinstance(password, str) or not 4 <= len(password) <= 64:
-            raise ProtocolError('비밀번호는 4~64자로 입력해 주세요.')
+        password = self._new_password(msg.get('new_password'))
         code = msg.get('code')
         if not isinstance(code, str) or not code.strip() or len(code) > 20:
             # 이메일만으로는 바꾸지 못한다 - 메일 서버가 없어 관리자가 본인 확인 후 일회용 코드를 알려 준다
@@ -1096,18 +1424,26 @@ class KakaoServer(AdminHandlers):
         keys = self._login_keys(conn, login_id)
         self._check_login_throttle(keys)
         username = self.store.resolve_login(login_id)
-        if username:
+        closed = not self.open_registration    # 등록이 닫힌 서버: 계정 상태(없음 · 미등록 · 사용 중지 · 관리자)를 알려 주지 않는다
+        if username and not closed:
             self._check_not_disabled(username)
         try:
-            changed = self.store.reset_password(username, email, password, code) if username else False
+            usable = bool(username) and EMAIL_RE.fullmatch(email) is not None \
+                and not (closed and self.store.is_disabled(username))
+            changed = self.store.reset_password(username, email, password, code) if usable else False
         except ValueError as exc:          # 관리자 계정은 이메일만으로 바꾸지 못한다
-            raise ProtocolError(str(exc)) from None
+            if not closed:
+                raise ProtocolError(str(exc)) from None
+            changed = False
+        if changed is None and closed:
+            changed = False
         if changed is None:
             raise ProtocolError(NEEDS_REGISTER)
         if not changed:
             self._record_login_failure(keys)   # 남의 계정을 이메일로 맞혀 보는 것을 막는다
             raise ProtocolError(RESET_MISMATCH)
         self._clear_login_failures(keys[:1])
+        self._drop_sessions(username)          # 예전 비밀번호로 들어와 있던 연결은 끊는다
         payload = {'type': 'password_reset_ok', 'username': username}
         if 'req_id' in msg:
             payload['req_id'] = msg['req_id']
@@ -1123,6 +1459,12 @@ class KakaoServer(AdminHandlers):
             first_conn = not conns
             conns.add(conn)
             conn.username = username
+        conn.bucket = TokenBucket(self.REQUEST_RATE, self.REQUEST_BURST)
+        conn.media_bucket = TokenBucket(self.MEDIA_RATE, self.MEDIA_BURST)
+        try:
+            conn.sock.settimeout(SOCKET_TIMEOUT)
+        except OSError:
+            pass
         online = self._online_users()
         ctx = Ctx(conn=conn, username=username, req_type=req_type, req_id=msg.get('req_id'),
                   has_req_id='req_id' in msg)
@@ -1136,6 +1478,9 @@ class KakaoServer(AdminHandlers):
             'blocked': self.store.blocked_list(username),
             'friends': self.store.friends_of(username),
             'file_policy': file_policy.public_policy(self.store.file_policy()),
+            # 서버 정책 (§4.1): 등록 화면의 코드 칸 · 프로필의 이메일 칸을 여기에 맞춘다
+            'policy': {'open_registration': self.open_registration, 'email_editable': self.open_registration,
+                       'display_name_editable': self.open_registration},
             **({'login_token': login_token} if login_token else {}),
         })
         conn.send({'type': 'all_users_list',
@@ -1153,8 +1498,10 @@ class KakaoServer(AdminHandlers):
         logger.info('%s 접속 (%s)', username, conn.address)
 
     def _h_legacy_message(self, ctx: Ctx, msg: dict) -> None:
+        if self.require_password:      # 모두에게 가는 구버전 요청은 비밀번호 없는 구버전 · 테스트 서버에서만 (§4)
+            raise ProtocolError(UNSUPPORTED_REQUEST)
         content = msg.get('content')
-        if not isinstance(content, str):
+        if not isinstance(content, str) or not _utf8_ok(content):
             raise ProtocolError('content 값이 올바르지 않습니다.')
         if len(content) > MAX_CONTENT_LEN:
             raise ProtocolError(f'메시지는 {MAX_CONTENT_LEN}자를 넘을 수 없습니다.')
@@ -1169,11 +1516,11 @@ class KakaoServer(AdminHandlers):
         self._push_room_updated(room_id, {ctx.username, target}, ctx)
 
     def _h_room_create(self, ctx: Ctx, msg: dict) -> None:
-        name = _opt_str(msg, 'name', 50)
+        name = _opt_name(msg, 'name', 50)
         members = [m for m in _str_list(msg, 'members') if m != ctx.username]
         if not members:
             raise ProtocolError('초대할 친구를 1명 이상 선택하세요.')
-        if len(members) > 100:
+        if len(members) > MAX_INVITE:
             raise ProtocolError('한 번에 초대할 수 있는 인원을 초과했습니다.')
         self._require_users_exist(members)
         room_id = self.store.create_group(ctx.username, name, members)
@@ -1187,6 +1534,8 @@ class KakaoServer(AdminHandlers):
         usernames = [u for u in _str_list(msg, 'usernames') if u not in meta['members']]
         if not usernames:
             raise ProtocolError('새로 초대할 친구가 없습니다.')
+        if len(usernames) > MAX_INVITE:
+            raise ProtocolError('한 번에 초대할 수 있는 인원을 초과했습니다.')
         self._require_users_exist(usernames)
         self.store.add_members(meta['room_id'], usernames)
         self._push_room_updated(meta['room_id'], meta['members'] + usernames, ctx)
@@ -1257,7 +1606,7 @@ class KakaoServer(AdminHandlers):
         meta = self._require_room_member(msg.get('room_id'), ctx.username)
         if meta['type'] != 'group':
             raise ProtocolError('그룹 채팅방만 이름을 변경할 수 있습니다.')
-        name = _req_str(msg, 'name', 50, allow_empty=True, label='채팅방 이름')
+        name = _req_name(msg, 'name', 50, allow_empty=True, label='채팅방 이름')
         self.store.rename_room(meta['room_id'], name)
         self._push_room_updated(meta['room_id'], meta['members'], ctx)
 
@@ -1274,10 +1623,27 @@ class KakaoServer(AdminHandlers):
     def _decode_attachment(self, att: Any) -> tuple[str, str, bytes]:
         if not isinstance(att, dict):
             raise ProtocolError('첨부 파일 정보가 올바르지 않습니다.')
-        name = _req_str(att, 'name', 200, label='파일 이름')
+        name = clean_file_name(_req_str(att, 'name', 200, label='파일 이름'))
         mime = _opt_str(att, 'mime', 100, 'application/octet-stream') or 'application/octet-stream'
         data = _decode_b64(att.get('data_b64'), MAX_ATTACHMENT_BYTES, '첨부 파일은 10MB를 초과할 수 없습니다.')
         return name, mime, data
+
+    def _check_upload_quota(self, username: str, size: int) -> None:
+        """하루에 올릴 수 있는 첨부 용량 (명세 §2)"""
+        since = (datetime.now() - timedelta(days=1)).strftime(ISO_FMT)
+        if self.store.uploaded_bytes_since(username, since) + size > self.MAX_DAILY_UPLOAD_BYTES:
+            raise ProtocolError(UPLOAD_QUOTA, code='quota_exceeded')
+
+    @staticmethod
+    def _checked_image_kind(kind: str, mime: str, data: bytes) -> tuple[str, str]:
+        """사진으로 다루는 것은 내용이 실제 사진(PNG/JPEG/GIF/BMP/WEBP)인 것뿐이다 (§7.1) → (kind, mime).
+        사진 형식이 아닌 것을 사진으로 보내면 파일로 바꾸고, 내용과 다른 image/* 표시는 지운다"""
+        sniffed = _sniff_image(data)
+        if kind == 'image':
+            return ('image', sniffed[0]) if sniffed else ('file', 'application/octet-stream')
+        if kind == 'file' and mime.lower().startswith('image/'):
+            return kind, sniffed[0] if sniffed else 'application/octet-stream'
+        return kind, mime
 
     def _h_send(self, ctx: Ctx, msg: dict) -> None:
         meta = self._require_room_member(msg.get('room_id'), ctx.username)
@@ -1294,6 +1660,9 @@ class KakaoServer(AdminHandlers):
             content = ''
         if not isinstance(content, str):
             raise ProtocolError('content 값이 올바르지 않습니다.')
+        if not _utf8_ok(content):
+            raise ProtocolError(BAD_TEXT)
+        client_tmp_id = _opt_tag(msg, 'client_tmp_id')     # 받는 사람 모두에게 그대로 가는 값
         if kind == 'secret':
             self._validate_secret_content(content)
         elif len(content) > MAX_CONTENT_LEN:
@@ -1309,26 +1678,30 @@ class KakaoServer(AdminHandlers):
         reply_to_id = _opt_int(msg, 'reply_to_id')
         if reply_to_id is not None:
             orig = self.store.get_message(reply_to_id)
-            if orig is None or orig['room_id'] != room_id:
+            if orig is None or orig['room_id'] != room_id or not self.store.message_visible(reply_to_id, ctx.username):
                 raise ProtocolError('답장할 메시지를 찾을 수 없습니다.')
 
         thread_root_id = _opt_int(msg, 'thread_root_id')
         if thread_root_id is not None:
             self._check_thread_root(thread_root_id, meta)
+            if not self.store.message_visible(thread_root_id, ctx.username):
+                raise ProtocolError('스레드 원글을 찾을 수 없습니다.')
             if msg.get('send_at') is not None:
                 raise ProtocolError('스레드 답글은 예약해서 보낼 수 없습니다.')
 
-        mentions = [m for m in _str_list(msg, 'mentions', required=False) if m in meta['members']]
+        mentions = [m for m in _str_list(msg, 'mentions', required=False, max_items=MAX_MENTIONS)
+                    if m in meta['members']]
 
         attachment_id = None
         if kind in ATTACHMENT_KINDS:
             name, mime, data = self._decode_attachment(msg.get('attachment'))
             if kind == 'voice' and not mime.startswith('audio/'):
                 raise ProtocolError('음성메시지는 오디오 파일이어야 합니다.')
+            kind, mime = self._checked_image_kind(kind, mime, data)
             violation = self._file_violation(ctx.username, name, data)
             if violation is not None:          # 파일 전송 보안 (§10.10): 오류 대신 승인 요청을 낼 수 있게 알려 준다
                 self._reply(ctx, {'type': 'file_blocked', 'room_id': room_id, 'kind': kind, 'name': name,
-                                  'size': len(data), 'client_tmp_id': msg.get('client_tmp_id'), **violation,
+                                  'size': len(data), 'client_tmp_id': client_tmp_id, **violation,
                                   'message': f"보낼 수 없는 파일입니다 ({violation['detail']})."})
                 logger.info('파일 전송 차단 %s: %s (%s)', ctx.username, name, violation['detail'])
                 return
@@ -1342,9 +1715,10 @@ class KakaoServer(AdminHandlers):
                 send_at = None  # 과거/현재 시각이면 즉시 전송
 
         if kind in ATTACHMENT_KINDS:
+            self._limit_action(ctx.username, 'upload')
+            self._check_upload_quota(ctx.username, len(data))
             attachment_id = self.store.save_attachment(name, mime, data, ctx.username)
 
-        client_tmp_id = msg.get('client_tmp_id')
         silent = bool(msg.get('silent'))
         if send_at is not None:
             payload = {'kind': kind, 'content': content, 'reply_to_id': reply_to_id, 'mentions': mentions,
@@ -1416,8 +1790,12 @@ class KakaoServer(AdminHandlers):
         meta = self._require_room_member(msg.get('room_id'), ctx.username)
         last = _req_int(msg, 'last_msg_id')
         value = self.store.update_read(meta['room_id'], ctx.username, last)
-        self._push(meta['members'], {'type': 'read_update', 'room_id': meta['room_id'],
-                                     'username': ctx.username, 'last_read_msg_id': value}, ctx)
+        payload = {'type': 'read_update', 'room_id': meta['room_id'], 'username': ctx.username,
+                   'last_read_msg_id': value}
+        self._push([m for m in meta['members'] if m != ctx.username], payload)
+        # 읽은 본인의 연결(다른 기기 포함)에는 그 방의 남은 안 읽은 수도 함께 (§4)
+        self._push([ctx.username], {**payload, 'unread_count': self.store.unread_count(meta['room_id'], ctx.username)},
+                   ctx)
 
     def _h_react(self, ctx: Ctx, msg: dict) -> None:
         message = self._require_message_member(_req_int(msg, 'msg_id'), ctx.username)
@@ -1458,6 +1836,8 @@ class KakaoServer(AdminHandlers):
         content = msg.get('content')
         if not isinstance(content, str) or not content.strip():
             raise ProtocolError('수정할 내용을 입력하세요.')
+        if not _utf8_ok(content):
+            raise ProtocolError(BAD_TEXT)
         if len(content) > MAX_CONTENT_LEN:
             raise ProtocolError(f'메시지는 {MAX_CONTENT_LEN}자를 넘을 수 없습니다.')
         sent = datetime.strptime(message['timestamp'], ISO_FMT)
@@ -1482,7 +1862,8 @@ class KakaoServer(AdminHandlers):
         msg_id = _opt_int(msg, 'msg_id')
         if msg_id is not None:
             target = self.store.get_message(msg_id)
-            if target is None or target['room_id'] != meta['room_id']:
+            if target is None or target['room_id'] != meta['room_id'] \
+                    or not self.store.message_visible(msg_id, ctx.username):
                 raise ProtocolError('공지로 등록할 메시지를 찾을 수 없습니다.')
             if target['deleted'] or target['kind'] == 'system':
                 raise ProtocolError('이 메시지는 공지로 등록할 수 없습니다.')
@@ -1493,6 +1874,7 @@ class KakaoServer(AdminHandlers):
 
     def _h_search(self, ctx: Ctx, msg: dict) -> None:
         query = _req_str(msg, 'query', 100, label='검색어')
+        self._limit_action(ctx.username, 'search')
         room_id = msg.get('room_id')
         if room_id is not None:
             self._require_room_member(room_id, ctx.username)
@@ -1524,6 +1906,9 @@ class KakaoServer(AdminHandlers):
             raise ProtocolError('존재하지 않는 투표입니다.')
         if not self.store.is_member(poll['room_id'], username):
             raise ProtocolError('이 채팅방의 대화상대가 아닙니다. 초대를 받은 뒤 이용할 수 있습니다.')
+        poll_msg = self.store.poll_message_id(poll_id)
+        if poll_msg is not None and not self.store.message_visible(poll_msg, username):   # 들어오기 전의 투표
+            raise ProtocolError('존재하지 않는 투표입니다.')
         return poll
 
     def _h_poll_vote(self, ctx: Ctx, msg: dict) -> None:
@@ -1687,8 +2072,13 @@ class KakaoServer(AdminHandlers):
     # ------------------------------------------------------------------ 프로필 / 첨부
     def _h_profile_update(self, ctx: Ctx, msg: dict) -> None:
         fields: dict = {}
+        refused: list[str] = []            # 바꿀 수 없어 그대로 둔 항목의 안내 (다른 항목은 저장한다)
         if msg.get('display_name') is not None:
-            fields['display_name'] = _req_str(msg, 'display_name', 20, label='이름')
+            display_name = _req_name(msg, 'display_name', 20, label='이름')
+            if self.open_registration:
+                fields['display_name'] = display_name
+            elif display_name != ctx.username:  # 닫힌 서버: 표시 이름은 조직도 이름으로 고정 (§4.5)
+                refused.append(NAME_FIXED)
         if msg.get('status_message') is not None:
             fields['status_message'] = _req_str(msg, 'status_message', 60, allow_empty=True,
                                                 label='상태메시지')
@@ -1712,13 +2102,25 @@ class KakaoServer(AdminHandlers):
             email = _opt_str(msg, 'email', 120).strip()
             if email and not EMAIL_RE.fullmatch(email):
                 raise ProtocolError('이메일 형식이 올바르지 않습니다.')
-            fields['email'] = email[:120]
+            if email != ((self.store.get_user(ctx.username) or {}).get('email') or ''):
+                if self.open_registration:
+                    fields['email'] = email[:120]
+                else:                      # 등록이 닫힌 서버: 이메일(로그인 아이디)은 관리자가 고친다 (§4.1)
+                    refused.append(EMAIL_ADMIN_ONLY)
         if 'deputies' in msg:
             fields['deputies'] = self._validate_deputies(ctx.username, msg.get('deputies'))
         if not fields:
-            raise ProtocolError('변경할 항목이 없습니다.')
-        self.store.update_profile(ctx.username, fields)
+            if not refused and msg.get('display_name') is not None:     # 지금 이름 그대로 보낸 것뿐 (바뀌는 것 없음)
+                self._broadcast_user(ctx.username, ctx)
+                return
+            raise ProtocolError(refused[0] if refused else '변경할 항목이 없습니다.')
+        try:
+            self.store.update_profile(ctx.username, fields)
+        except ValueError as exc:          # 다른 사람이 쓰는 이메일
+            raise ProtocolError(str(exc)) from None
         self._broadcast_user(ctx.username, ctx)
+        for message in refused:            # 다른 항목은 저장하고, 바꿀 수 없는 항목만 그대로 둔다
+            self._send_error(ctx.conn, ctx.req_type, message, msg)
 
     def _validate_deputies(self, me: str, value) -> list:
         """대직자 목록 (§8.13): username 문자열 목록, 중복 제거 · 순서 유지 · 최대 MAX_DEPUTIES"""
@@ -1752,6 +2154,7 @@ class KakaoServer(AdminHandlers):
                 raise ProtocolError('전화번호를 정확히 입력해 주세요.')
             target = self.store.find_user_by_contact(query)
             if target is None:
+                self._limit_action(ctx.username, 'friend_lookup')      # 못 찾은 조회만 센다
                 raise ProtocolError('해당 전화번호·이메일로 가입한 사용자가 없습니다. 상대가 프로필에 등록한 번호·이메일인지 확인하세요.')
         if target == ctx.username:
             raise ProtocolError('나 자신은 친구로 추가할 수 없습니다.')
@@ -1801,10 +2204,21 @@ class KakaoServer(AdminHandlers):
                 self._run_voiceroom_timeouts()
                 self._run_story_expiry()
                 self._run_retention()
+                self._run_orphan_sweep()
             except Exception:
                 if self._stop.is_set():
                     break
                 logger.exception('스케줄러 오류')
+
+    def _run_orphan_sweep(self) -> None:
+        """어디에서도 쓰지 않는 하루 넘은 첨부(바꾼 프로필 사진 · 보내지 못한 파일)의 데이터를 지운다"""
+        now = time.monotonic()
+        if now - getattr(self, '_orphan_swept_at', -1e18) < self.ORPHAN_SWEEP_SECONDS:
+            return
+        self._orphan_swept_at = now
+        purged = self.store.purge_orphan_attachments()
+        if purged:
+            logger.info('쓰지 않는 첨부 %d개의 데이터를 지웠습니다', purged)
 
     def _run_scheduled(self) -> None:
         # 꺼낼 때 delivered 로 표시한다(두 번 보내지 않게). 대신 못 보낸 건은 조용히 사라지지 않게 보낸 사람에게 알린다
@@ -1870,12 +2284,17 @@ class KakaoServer(AdminHandlers):
                 preview = None
             if not preview or self._stop.is_set():
                 continue
-            current = self.store.get_message(job['msg_id'])
-            if current is None or current['deleted'] or job['url'] not in (current['content'] or ''):
-                continue  # 그 사이 수정/삭제됨
-            updated = self.store.set_link_preview(job['msg_id'], preview)
-            if updated is not None:
-                self._push_msg_updated(updated)
+            try:       # 한 건이 실패해도(저장소 오류 등) 미리보기 작업 스레드는 계속 돈다
+                current = self.store.get_message(job['msg_id'])
+                if current is None or current['deleted'] or job['url'] not in (current['content'] or ''):
+                    continue  # 그 사이 수정/삭제됨
+                updated = self.store.set_link_preview(job['msg_id'], preview)
+                if updated is not None:
+                    self._push_msg_updated(updated)
+            except Exception:
+                if self._stop.is_set():
+                    break
+                logger.exception('링크 미리보기 저장 오류 (msg %s)', job.get('msg_id'))
 
     # ------------------------------------------------------------------ 오늘의 브리핑 (선톡)
     def _send_briefing(self, username: str) -> None:
@@ -1948,7 +2367,11 @@ class KakaoServer(AdminHandlers):
                 self._rag_queue.put(lambda: self.rag.index_message(message))
             mentioned = BOT_USERNAME in message['mentions'] or BOT_MENTION in message['content']
             if is_bot_direct or (bot_in_room and meta['type'] == 'group' and mentioned):
-                self._rag_queue.put(lambda: self._rag_answer(message))
+                allowed, _wait = self._actions.hit(sender, 'ai_question', *self.ACTION_LIMITS['ai_question'])
+                if allowed:
+                    self._rag_queue.put(lambda: self._rag_answer(message))
+                elif self._actions.hit(sender, 'ai_busy_notice', 1, self.ACTION_LIMITS['ai_question'][1])[0]:
+                    self._rag_queue.put(lambda: self._bot_reply(room_id, AI_BUSY))   # 안내는 한 번만
         elif message['kind'] in ('file', 'image') and is_bot_direct and message['attachment']:
             self._rag_queue.put(lambda: self._rag_learn(message))
 
@@ -1960,9 +2383,14 @@ class KakaoServer(AdminHandlers):
         question = message['content'].replace(BOT_MENTION, '').strip() or message['content']
         history, _ = self.store.history(room_id, None, RAG_HISTORY_LIMIT)
         try:
-            room_ids = self.store.room_ids_for_user(asker)
+            room_ids: Any = self.store.room_since_for_user(asker)   # {방: 보기 시작하는 msg_id} (들어오기 전 대화 제외)
+            meta = self.store.room_meta(room_id) or {}
+            if meta.get('type') != 'direct':
+                # 여럿이 보는 방: 그 방의 대화만 근거로 삼고(질문자의 다른 방 내용이 방 사람들에게 보이지 않게),
+                # 앞 대화도 질문자와 AI 비서가 한 말만 넘긴다 (§7.6)
+                room_ids = {room_id: room_ids.get(room_id, 0)}
+                history = [m for m in history if m.get('sender') in (asker, BOT_USERNAME)]
             if getattr(self.rag, 'accepts_context', False):     # 포털 연동: 방 · 이름을 함께 넘겨 대화 저장
-                meta = self.store.room_meta(room_id) or {}
                 asker_row = self.store.get_user(asker) or {}
                 answer = self.rag.answer(question, asker, room_ids, history, room_id=room_id,
                                          asker_name=self._name_of(asker), room_name=meta.get('name') or '',
@@ -2004,7 +2432,8 @@ class KakaoServer(AdminHandlers):
 
     def _h_rag_doc_add(self, ctx: Ctx, msg: dict) -> None:
         rag = self._require_rag()
-        name = _req_str(msg, 'name', 200, label='문서 이름')
+        self._limit_action(ctx.username, 'rag_doc_add')
+        name = clean_file_name(_req_str(msg, 'name', 200, label='문서 이름'))
         data = _decode_b64(msg.get('data_b64'), MAX_ATTACHMENT_BYTES, '문서는 10MB를 초과할 수 없습니다.')
         mime = _opt_str(msg, 'mime', 100, 'application/octet-stream') or 'application/octet-stream'
         try:
@@ -2230,6 +2659,8 @@ class KakaoServer(AdminHandlers):
         codec = msg.get('codec')
         if kind == 'audio' and codec is not None and codec not in AUDIO_CODECS:
             raise ProtocolError('오디오 코덱은 pcm/zpcm 중 하나여야 합니다.')
+        if kind == 'audio' and not self._audio_frame_ok(data_b64, codec or 'pcm'):
+            raise ProtocolError('음성 조각이 너무 큽니다.')
         with self._calls_lock:
             call = self._calls.get(call_id)
             if call is None:
@@ -2245,6 +2676,22 @@ class KakaoServer(AdminHandlers):
         if kind == 'audio':
             payload['codec'] = codec or 'pcm'
         self._deliver(self._user_conns(targets), payload)
+
+    @staticmethod
+    def _audio_frame_ok(data_b64: str, codec: str) -> bool:
+        """음성 한 조각은 풀었을 때 MAX_AUDIO_FRAME_BYTES 이하여야 한다 (§8.2) - 받는 쪽이 크게 부풀려 풀지 않게"""
+        if len(data_b64) > MAX_AUDIO_B64:
+            return False
+        try:
+            raw = base64.b64decode(data_b64, validate=True)
+            if codec == 'zpcm':
+                unpacker = zlib.decompressobj()
+                raw = unpacker.decompress(raw, MAX_AUDIO_FRAME_BYTES + 1)
+                if unpacker.unconsumed_tail:
+                    return False
+        except (binascii.Error, ValueError, zlib.error):
+            return False
+        return len(raw) <= MAX_AUDIO_FRAME_BYTES
 
     def _h_call_list(self, ctx: Ctx, msg: dict) -> None:
         room_id = msg.get('room_id')
@@ -2268,6 +2715,7 @@ class KakaoServer(AdminHandlers):
         kind = msg.get('kind', 'text')
         if kind not in ('text', 'image'):
             raise ProtocolError('펑 종류는 text/image 중 하나여야 합니다.')
+        self._limit_action(ctx.username, 'story_post')
         content = _opt_str(msg, 'content', 500)
         bg_color = msg.get('bg_color') or DEFAULT_STORY_COLOR
         if not isinstance(bg_color, str) or not COLOR_RE.match(bg_color):
@@ -2283,6 +2731,7 @@ class KakaoServer(AdminHandlers):
             sniffed = _sniff_image(data)
             if sniffed is None:
                 raise ProtocolError('사진 펑은 이미지 파일(PNG/JPEG/GIF/BMP/WEBP)이어야 합니다.')
+            self._check_upload_quota(ctx.username, len(data))
             attachment_id = self.store.save_attachment(name, sniffed[0], data, ctx.username)
         story = self.store.create_story(ctx.username, kind, content, attachment_id, bg_color.upper(),
                                         self.story_ttl_seconds)
@@ -2339,8 +2788,11 @@ class KakaoServer(AdminHandlers):
             if seen_viewers & set(viewers):
                 raise ProtocolError('한 친구는 하나의 멀티프로필에만 지정할 수 있습니다.')
             seen_viewers |= set(viewers)
-            item = {'profile_id': pid, 'name': _req_str(p, 'name', 20, label='프로필 이름'),
-                    'display_name': _req_str(p, 'display_name', 20, label='이름'),
+            display_name = _req_name(p, 'display_name', 20, label='이름')
+            if not self.open_registration:      # 닫힌 서버: 멀티프로필도 이름은 실명 (§4.5)
+                display_name = ctx.username
+            item = {'profile_id': pid, 'name': _req_name(p, 'name', 20, label='프로필 이름'),
+                    'display_name': display_name,
                     'status_message': _opt_str(p, 'status_message', 60), 'viewers': viewers}
             if _bool(p, 'avatar_clear'):
                 item['avatar_id'] = self.store.org_avatar(ctx.username)
@@ -2444,12 +2896,12 @@ class KakaoServer(AdminHandlers):
 
     # ------------------------------------------------------------------ 8.9 오픈채팅
     def _h_open_room_create(self, ctx: Ctx, msg: dict) -> None:
-        name = _req_str(msg, 'name', 50, label='채팅방 이름')
+        name = _req_name(msg, 'name', 50, label='채팅방 이름')
         description = _opt_str(msg, 'description', 500)
         tags = _str_list(msg, 'tags', required=False)
         if len(tags) > 10 or any(len(t) > 20 for t in tags):
             raise ProtocolError('태그는 20자 이하, 최대 10개까지 가능합니다.')
-        nickname = _opt_str(msg, 'nickname', 20) or self.store.display_name(ctx.username)
+        nickname = _opt_name(msg, 'nickname', 20) or self.store.display_name(ctx.username)
         room_id = self.store.create_open_room(ctx.username, name, description, tags, nickname)
         self._push_room_updated(room_id, [ctx.username], ctx)
 
@@ -2468,7 +2920,7 @@ class KakaoServer(AdminHandlers):
             raise ProtocolError('이미 참여한 오픈채팅방입니다.')
         if self.store.is_banned(room_id, ctx.username):
             raise ProtocolError('방장이 내보낸 오픈채팅방에는 다시 들어갈 수 없습니다.')
-        nickname = _req_str(msg, 'nickname', 20, label='닉네임')
+        nickname = _req_name(msg, 'nickname', 20, label='닉네임')
         self.store.join_open_room(room_id, ctx.username, nickname)
         self._push_room_updated(room_id, meta['members'] + [ctx.username], ctx)
         self._post_system(room_id, f'{nickname}님이 들어왔습니다')
@@ -2559,6 +3011,7 @@ class KakaoServer(AdminHandlers):
         since, until = self._export_day(msg, 'since'), self._export_day(msg, 'until')
         if since and until and since > until:
             raise ProtocolError('시작 날짜가 끝 날짜보다 늦습니다.')
+        self._limit_action(ctx.username, 'room_export')
 
         def in_range(m: dict) -> bool:
             day = (m.get('timestamp') or '')[:10]

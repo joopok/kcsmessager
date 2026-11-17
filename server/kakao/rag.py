@@ -26,6 +26,7 @@ BOT_NAME = 'AI 비서'
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 100
 TOP_K = 6
+LLM_TIMEOUT = 60.0     # Claude 호출 한 번의 시간 제한(초) - 답변 작업 스레드가 오래 붙잡히지 않게
 TEXT_EXTS = {'.txt', '.md', '.csv', '.json', '.log', '.py', '.tsv', '.html', '.xml', '.yaml', '.yml'}
 
 # 흔한 조사/어미 (검색어 정규화용, 긴 것부터)
@@ -207,12 +208,21 @@ class RagService:
         terms = extract_terms(question)
         if not terms:
             return []
+        # room_ids 가 {방: msg_id} 면 그 방은 그 번호 뒤의 메시지만 근거로 삼는다 (나중에 들어온 방 - 명세 §4.5)
+        since = {r: int(v) for r, v in room_ids.items() if v} if isinstance(room_ids, dict) else {}
         room_ids = list(room_ids)
         scope = '(c.source="doc" AND (c.owner=? OR c.owner="")'
         params = [asker]
         if room_ids:
-            scope += f' OR (c.source="message" AND c.room_id IN ({",".join("?" * len(room_ids))}))'
-            params += room_ids
+            whole = [r for r in room_ids if r not in since]
+            parts = []
+            if whole:
+                parts.append(f'c.room_id IN ({",".join("?" * len(whole))})')
+                params += whole
+            for room, start in since.items():
+                parts.append('(c.room_id=? AND c.source_id>?)')
+                params += [room, start]
+            scope += ' OR (c.source="message" AND (' + ' OR '.join(parts) + '))'
         scope += ')'
         candidates = {}
         with self._lock:
@@ -303,6 +313,7 @@ class RagService:
             betas=['server-side-fallback-2026-07-01'],
             fallbacks='default',
             messages=[{'role': 'user', 'content': user_content}],
+            timeout=LLM_TIMEOUT,
         )
         if response.stop_reason == 'refusal':
             return '죄송해요, 이 질문에는 답변할 수 없어요.'

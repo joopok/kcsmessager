@@ -18,6 +18,7 @@ import hashlib
 import io
 import os
 import zipfile
+import zlib
 from typing import Any, Optional
 
 # (키, 이름, 대표 확장자) - 관리자 화면에 이 순서로 나온다
@@ -25,7 +26,10 @@ CATEGORIES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ('executable', '실행 파일 · 스크립트',
      ('exe', 'msi', 'com', 'scr', 'bat', 'cmd', 'ps1', 'psm1', 'vbs', 'vbe', 'js', 'jse', 'wsf', 'wsh', 'hta',
       'cpl', 'dll', 'sys', 'jar', 'app', 'pkg', 'dmg', 'deb', 'rpm', 'apk', 'sh', 'run', 'lnk', 'reg',
-      'command', 'msix', 'appx')),
+      'command', 'msix', 'appx',
+      # 바로가기 · 도움말 · 설정 스크립트 · 디스크 이미지 (2026-11-17): 열면 다른 프로그램을 실행하거나 통째로 담아 온다
+      'url', 'website', 'scf', 'pif', 'chm', 'wsc', 'sct', 'inf', 'msc', 'gadget', 'jnlp', 'xll', 'application',
+      'msp', 'mst', 'iso', 'img', 'vhd', 'vhdx')),
     ('archive', '압축 파일',
      ('zip', '7z', 'rar', 'alz', 'egg', 'tar', 'gz', 'tgz', 'bz2', 'xz', 'iso', 'cab', 'lzh', 'z')),
     ('database', '데이터베이스 · 백업 · 메일함',
@@ -66,7 +70,11 @@ DEFAULT_POLICY: dict[str, Any] = {
 MAX_EXTENSIONS = 100
 MAX_NAMES = 100
 MAX_RULE_LEN = 60
-MAX_ZIP_ENTRIES = 2000          # 이보다 많으면 앞쪽만 본다 (압축 폭탄으로 서버를 붙잡지 않게)
+MAX_ZIP_ENTRIES = 250000        # 이름을 보는 항목 수 - 10MB 압축 파일이 담을 수 있는 것보다 많다 (전부 본다)
+MAX_ZIP_SNIFF = 5000            # 내용 앞부분까지 보는 항목 수
+MAX_ZIP_DEPTH = 2               # 압축 파일 안의 압축 파일을 여는 단계
+MAX_NESTED_ARCHIVES = 10        # 안에 든 압축 파일을 여는 개수
+MAX_NESTED_BYTES = 20 * 1024 * 1024    # 안에 든 압축 파일을 푸는 크기 합
 
 RULE_TEXT = {'type': '막힌 파일 형태', 'extension': '막힌 확장자', 'name': '막힌 파일 이름'}
 
@@ -205,6 +213,58 @@ def _zip_names(data: bytes) -> list[str]:
         return []
 
 
+_PROGRAM_MAGIC = (b'MZ', b'\x7fELF', b'\xfe\xed\xfa\xce', b'\xfe\xed\xfa\xcf', b'\xce\xfa\xed\xfe',
+                  b'\xcf\xfa\xed\xfe', b'\xca\xfe\xba\xbe')
+_ZIP_READ_ERRORS = (zipfile.BadZipFile, ValueError, OSError, RuntimeError, NotImplementedError, EOFError, zlib.error)
+
+
+def _check_zip(policy: dict, data: bytes, document: bool = False, depth: int = 0,
+               budget: Optional[dict] = None) -> Optional[dict]:
+    """zip 안을 본다: 든 파일의 이름 · 내용 앞부분 · 그 안의 zip (MAX_ZIP_DEPTH 단계까지).
+    document=True(오피스 · 한글 문서)면 이름 규칙은 적용하지 않고, 실행 파일이 들어 있는지만 본다.
+    암호가 걸렸거나 깨진 항목은 내용을 볼 수 없어 이름만 본다"""
+    budget = budget if budget is not None else {'archives': MAX_NESTED_ARCHIVES, 'bytes': MAX_NESTED_BYTES}
+    blocked = policy.get('blocked_types') or []
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except _ZIP_READ_ERRORS:
+        return None
+    with zf:
+        infos = [info for info in zf.infolist()[:MAX_ZIP_ENTRIES] if not info.is_dir()]
+        if not document:
+            for info in infos:
+                found = _check_name(policy, info.filename, inner=True)
+                if found:
+                    return found
+        for info in infos[:MAX_ZIP_SNIFF]:
+            try:
+                with zf.open(info) as member:
+                    head = member.read(16)
+            except _ZIP_READ_ERRORS:
+                continue
+            base = os.path.basename(info.filename)
+            if document:
+                sniffed = 'executable' if head.startswith(_PROGRAM_MAGIC) else None
+            else:
+                sniffed = sniff_category(head, extension_of(info.filename))
+            if sniffed and sniffed != 'archive' and sniffed in blocked:
+                return {'rule': 'type', 'value': sniffed,
+                        'detail': f"압축 파일 안 '{base}': 실제 내용은 {CATEGORY_LABELS[sniffed]} 형태예요"}
+            if head.startswith(b'PK\x03\x04') and depth + 1 < MAX_ZIP_DEPTH and budget['archives'] > 0 \
+                    and info.file_size <= budget['bytes']:
+                budget['archives'] -= 1
+                budget['bytes'] -= info.file_size
+                try:
+                    inner = zf.read(info)
+                except _ZIP_READ_ERRORS:
+                    continue
+                inner_document = extension_of(info.filename) in _ZIP_DOCUMENTS and _is_zip_document(inner)
+                found = _check_zip(policy, inner, inner_document, depth + 1, budget)
+                if found:
+                    return found
+    return None
+
+
 def check(policy: Optional[dict], name: str, data: bytes) -> Optional[dict]:
     """정책 위반이면 {rule, value, detail, category}, 괜찮으면 None.
 
@@ -222,11 +282,8 @@ def check(policy: Optional[dict], name: str, data: bytes) -> Optional[dict]:
         found = {'rule': 'type', 'value': sniffed,
                  'detail': (f"확장자는 .{ext or '(없음)'} 이지만 실제 내용은 {CATEGORY_LABELS[sniffed]} 형태예요"
                             if disguised else f"{CATEGORY_LABELS[sniffed]} 형태는 보낼 수 없어요")}
-    if found is None and (sniffed == 'archive' or ext == 'zip') and data[:2] == b'PK':
-        for inner in _zip_names(data):
-            found = _check_name(policy, inner, inner=True)
-            if found:
-                break
+    if found is None and data[:2] == b'PK' and (sniffed in ('archive', 'document') or ext == 'zip'):
+        found = _check_zip(policy, data, document=sniffed == 'document')
     if found is not None:
         found['category'] = sniffed or _EXT_CATEGORY.get(ext) or ''
         # 이름이 말하는 형태와 실제 내용이 다르고, 그 내용이 막힌 형태인가 (이름 예외로 풀어 주면 안 되는 파일)
