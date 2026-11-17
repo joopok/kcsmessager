@@ -205,6 +205,23 @@ class AdminHandlers:
     def _file_policy(self) -> dict:
         return self.store.file_policy() or file_policy.DEFAULT_POLICY
 
+    def _merge_file_policy_defaults(self) -> None:
+        """서버가 시작할 때: 저장된 정책에 새 기본 차단 형태를 한 번 더하고 로그에 남긴다 (명세 §10.10).
+        저장한 적 없으면 기본 정책을 그대로 쓰므로 할 일이 없다. 관리자가 뺀 형태는 다시 넣지 않는다"""
+        stored = self.store.file_policy()
+        if stored is None:
+            return
+        merged, added = file_policy.merge_new_defaults(stored)
+        if merged is stored:
+            return
+        self.store.set_file_policy(merged)
+        off = '' if merged.get('enabled') else ' - 정책이 꺼져 있어 켜기 전에는 막지 않습니다'
+        if added:
+            logger.info('파일 전송 보안: 새 기본 차단 형태 %d개를 저장된 정책에 더했습니다 (%s)%s', len(added),
+                        ', '.join(file_policy.CATEGORY_LABELS[t] for t in added), off)
+        else:
+            logger.info('파일 전송 보안: 새 기본 차단 형태 0개를 저장된 정책에 더했습니다 (이미 막혀 있음)%s', off)
+
     def _file_violation(self, username: str, name: str, data: bytes) -> Optional[dict]:
         """정책 위반이면 {rule, value, detail, category, sha256}. 관리자가 풀어 준 예외(사람 + 파일)면 None"""
         violation = file_policy.check(self._file_policy(), name, data)
@@ -278,7 +295,7 @@ class AdminHandlers:
             policy = file_policy.normalize_policy(msg.get('policy'))
         except file_policy.PolicyError as exc:
             raise ProtocolError(str(exc)) from None
-        self.store.set_file_policy(policy)
+        self.store.set_file_policy(file_policy.with_defaults_seen(policy))    # 관리자가 본 기본값 - 뺀 것은 다시 넣지 않는다
         self._broadcast({'type': 'file_policy', 'policy': file_policy.public_policy(policy)})
         self._admin_done(ctx, 'file_policy', '파일 전송 보안 정책 변경', enabled=policy['enabled'])
 

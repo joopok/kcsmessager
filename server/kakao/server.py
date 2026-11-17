@@ -14,6 +14,7 @@ import base64
 import binascii
 import codecs
 import collections
+import functools
 import json
 import logging
 import os
@@ -723,6 +724,17 @@ class Ctx:
     extra: dict = field(default_factory=dict)
 
 
+def _call_ordered(method: Callable) -> Callable:
+    """통화 상태를 바꾸고 그 알림을 대기열에 세우는 일을 통화 알림 순서 잠금(_call_order) 안에서 한다 (명세 §8.2).
+    상태는 _calls_lock 안에서 뜨고 알림은 밖에서 세우므로, 잠금이 없으면 두 스레드의 순서가 뒤바뀌어
+    call_ended 뒤에 그보다 앞선 상태의 call_updated 가 갈 수 있다. 알림은 대기열에 세우기만 하므로 오래 잡지 않는다"""
+    @functools.wraps(method)
+    def run(self: 'KakaoServer', *args: Any, **kwargs: Any) -> Any:
+        with self._call_order:
+            return method(self, *args, **kwargs)
+    return run
+
+
 @dataclass
 class Call:
     """진행 중인 통화 1건 (메모리에만 존재, KakaoServer._calls_lock 으로 보호)."""
@@ -787,6 +799,7 @@ class KakaoServer(AdminHandlers):
         # 통화 레지스트리 (영속화하지 않음)
         self._calls_lock = threading.Lock()
         self._calls: dict[int, Call] = {}
+        self._call_order = threading.RLock()     # 통화 상태 순서 = 알림 순서 (_call_ordered)
         self._summary_lock = threading.Lock()
         self._summaries_running: set = set()      # (username, room_id) 요약 진행 중
         self._room_calls: dict[str, int] = {}
@@ -925,6 +938,7 @@ class KakaoServer(AdminHandlers):
             fixed = self.store.fix_display_names()
             if fixed:
                 logger.info('표시 이름 %d개를 조직도 이름으로 되돌렸습니다', fixed)
+        self._merge_file_policy_defaults()      # 새 기본 차단 형태를 저장된 정책에 한 번 (§10.10)
         with self._calls_lock:
             self._calls.clear()
             self._room_calls.clear()
@@ -2767,6 +2781,7 @@ class KakaoServer(AdminHandlers):
     def _push_call(self, snapshot: dict, ctx: Optional[Ctx] = None) -> None:
         self._push(self.store.members(snapshot['room_id']), {'type': 'call_updated', 'call': snapshot}, ctx)
 
+    @_call_ordered
     def _h_call_start(self, ctx: Ctx, msg: dict) -> None:
         meta = self._require_room_member(msg.get('room_id'), ctx.username)
         mode = msg.get('mode')
@@ -2787,6 +2802,7 @@ class KakaoServer(AdminHandlers):
         self._publish_new_message(message)
         self._push_call(snapshot, ctx)
 
+    @_call_ordered
     def _h_call_join(self, ctx: Ctx, msg: dict) -> None:
         call_id = _req_int(msg, 'call_id')
         with self._calls_lock:
@@ -2813,6 +2829,7 @@ class KakaoServer(AdminHandlers):
             return True
         return False
 
+    @_call_ordered
     def _h_call_leave(self, ctx: Ctx, msg: dict) -> None:
         call_id = _req_int(msg, 'call_id')
         with self._calls_lock:
@@ -2826,6 +2843,7 @@ class KakaoServer(AdminHandlers):
         else:
             self._push_call(snapshot, ctx)
 
+    @_call_ordered
     def _leave_all_calls(self, username: str, room_id: Optional[str] = None) -> None:
         """접속 종료/방 나가기 시 그 사용자가 참여 중인 통화에서 뺀다."""
         updated: list[dict] = []
@@ -2858,6 +2876,7 @@ class KakaoServer(AdminHandlers):
             text = f'통화 종료 · {duration // 60}:{duration % 60:02d}'
         self._post_system(call.room_id, text)
 
+    @_call_ordered
     def _h_call_hand(self, ctx: Ctx, msg: dict) -> None:
         call_id = _req_int(msg, 'call_id')
         raised = _bool(msg, 'raised', default=True)
@@ -2872,6 +2891,7 @@ class KakaoServer(AdminHandlers):
             snapshot = call.to_dict()
         self._push_call(snapshot, ctx)
 
+    @_call_ordered
     def _h_call_role(self, ctx: Ctx, msg: dict) -> None:
         call_id = _req_int(msg, 'call_id')
         target = _req_str(msg, 'username', 20, label='대상')
@@ -2899,6 +2919,7 @@ class KakaoServer(AdminHandlers):
             snapshot = call.to_dict()
         self._push_call(snapshot, ctx)
 
+    @_call_ordered
     def _h_call_state(self, ctx: Ctx, msg: dict) -> None:
         call_id = _req_int(msg, 'call_id')
         changes = {k: _bool(msg, k) for k in ('muted', 'video', 'screen') if msg.get(k) is not None}
@@ -2964,8 +2985,10 @@ class KakaoServer(AdminHandlers):
         room_id = msg.get('room_id')
         if room_id is not None:
             self._require_room_member(room_id, ctx.username)
-        self._reply(ctx, {'type': 'call_list', 'calls': self._calls_for_user(ctx.username, room_id)})
+        with self._call_order:      # 목록과 그 뒤의 call_updated 가 상태 순서대로 가게 (기다리지 않고 세우기만 한다)
+            self._deliver([ctx.conn], {'type': 'call_list', 'calls': self._calls_for_user(ctx.username, room_id)}, ctx)
 
+    @_call_ordered
     def _run_voiceroom_timeouts(self) -> None:
         now = time.monotonic()
         with self._calls_lock:

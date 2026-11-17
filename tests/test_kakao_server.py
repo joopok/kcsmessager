@@ -1526,6 +1526,44 @@ class TestCalls(ServerTestBase):
         sender.send({'type': 'call_media', 'call_id': call_id, 'kind': kind, 'seq': seq,
                      'data_b64': base64.b64encode(b'frame%d' % seq).decode(), **extra})
 
+    def test_call_notices_follow_state_order(self):
+        """상태를 뜬 뒤 알림을 세우기 전에 다른 스레드가 끼어들어도, 한 연결이 받는 순서는 상태 순서와 같다 (명세 §8.2)"""
+        from unittest import mock
+        a, b, c = self.connect(), self.connect(), self.connect()
+        rid = self.group(a, [b, c])['room_id']
+        call = self._start(a, rid, 'voice')
+        for cl in (b, c):
+            cl.request({'type': 'call_join', 'call_id': call['call_id']}, 'call_updated',
+                       lambda m, u=cl.username: u in m['call']['participants'])
+        time.sleep(0.3)
+        with c.cond:
+            c.buffer.clear()
+        original = self.server._push_call
+
+        def slow_push(snapshot, ctx=None):
+            people = snapshot['participants']
+            if a.username in people and people.get(b.username, {}).get('muted'):
+                time.sleep(0.5)                 # b 의 상태 알림(a 가 아직 있음)을 세우기 직전에 a 가 나간다
+            original(snapshot, ctx)
+        with mock.patch.object(self.server, '_push_call', slow_push):
+            b.send({'type': 'call_state', 'call_id': call['call_id'], 'muted': True})
+            time.sleep(0.15)
+            a.send({'type': 'call_leave', 'call_id': call['call_id']})
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with c.cond:
+                    seen = [m['call']['participants'] for m in c.buffer if m.get('type') == 'call_updated']
+                if len(seen) >= 2:
+                    break
+                time.sleep(0.05)
+            time.sleep(0.3)                     # 늦게 오는 것이 더 있는지
+        with c.cond:
+            seen = [m['call']['participants'] for m in c.buffer if m.get('type') == 'call_updated']
+        self.assertEqual(len(seen), 2, seen)
+        self.assertEqual(sorted(seen[0]), sorted([a.username, b.username, c.username]))   # b 음소거 (a 가 나가기 전)
+        self.assertEqual(sorted(seen[1]), sorted([b.username, c.username]))               # a 가 나간 뒤 = 마지막
+        self.assertTrue(seen[0][b.username]['muted'] and seen[1][b.username]['muted'])
+
     def test_video_call_lifecycle_and_relay(self):
         a, b, c, outsider = self.connect(), self.connect(), self.connect(), self.connect()
         rid = self.group(a, [b, c])['room_id']

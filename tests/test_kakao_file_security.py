@@ -54,7 +54,7 @@ class PolicyCheckTests(unittest.TestCase):
         self.assertEqual(check(policy, '2026 사업계획(대외비).pdf', b'%PDF')['rule'], 'name')
         self.assertEqual(check(policy, '영업_고객명단_v2.xlsx', b'')['rule'], 'name')      # * 없으면 '들어 있으면'
         self.assertEqual(check(policy, '도면.DWG', b'AC1032')['rule'], 'extension')
-        self.assertEqual(check(policy, 'a.7z', b'7z\xbc\xaf\x27\x1c')['value'], 'archive')
+        self.assertEqual(check(policy, 'a.7z', b'7z\xbc\xaf\x27\x1c')['value'], 'sealed_archive')    # 압축 파일을 막으면 함께
         self.assertEqual(check(policy, '자료.pdf', b'PK\x03\x04')['value'], 'archive')       # 확장자 위장한 압축
         self.assertIsNone(check(policy, '계약서.hwpx', zip_with('mimetype', 'Contents/a.xml')))   # 한글 문서는 압축이 아니다
         self.assertIsNone(check(policy, '보고서.docx', zip_with('[Content_Types].xml', 'word/document.xml')))
@@ -74,6 +74,128 @@ class PolicyCheckTests(unittest.TestCase):
         public = file_policy.public_policy(None)
         self.assertEqual(public['blocked_types'], DEFAULT_POLICY['blocked_types'])
         self.assertIn('exe', next(c for c in public['categories'] if c['key'] == 'executable')['extensions'])
+
+
+def office_zip(*names, extra=b'x'):
+    """오피스(OOXML) 문서 모양의 zip ([Content_Types].xml + names)"""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w') as zf:
+        zf.writestr('[Content_Types].xml', '<Types/>')
+        for name in names:
+            zf.writestr(name, extra)
+    return buf.getvalue()
+
+
+OLE = b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1' + b'\0' * 504
+OLE_WITH_VBA = OLE + 'Macros'.encode('utf-16-le') + b'\0' * 8 + '_VBA_PROJECT'.encode('utf-16-le') + b'\0' * 40
+
+
+class MacroAndSealedArchiveTests(unittest.TestCase):
+    """매크로 문서 · 7z/rar/alz/egg 기본 차단 (2026-11-17 결정, 명세 §10.10)"""
+
+    def test_macro_documents_by_extension_and_content(self):
+        for name in ('계획.docm', '정산.XLSM', '발표.pptm', '추가기능.xlam'):
+            self.assertEqual(check(None, name, office_zip('word/document.xml'))['value'], 'macro_document', name)
+        hidden = check(None, '보고서.docx', office_zip('word/document.xml', 'word/vbaProject.bin'))
+        self.assertEqual((hidden['value'], hidden['disguised']), ('macro_document', True))   # 이름 예외로 못 푼다
+        self.assertIn('실제 내용은 매크로 문서', hidden['detail'])
+        self.assertEqual(check(None, '자료.zip', office_zip('xl/workbook.xml', 'xl/vbaProject.bin'))['value'],
+                         'macro_document')                                  # 매크로 문서를 .zip 으로 바꿔도
+        self.assertEqual(check(None, '표.xlsx', office_zip('xl/macrosheets/sheet1.xml'))['value'], 'macro_document')
+        self.assertEqual(check(None, '옛문서.doc', OLE_WITH_VBA)['value'], 'macro_document')
+        for name, data in (('보고서.docx', office_zip('word/document.xml')), ('표.xlsx', office_zip('xl/workbook.xml')),
+                           ('옛문서.doc', OLE), ('큰표.xlsb', office_zip('xl/workbook.bin'))):
+            self.assertIsNone(check(None, name, data), name)                # 매크로 없는 문서는 그대로
+
+    def test_macro_documents_inside_zip(self):
+        self.assertIn("'계획.docm'", check(None, 'a.zip', zip_with('계획.docm'))['detail'])
+        nested = io.BytesIO()
+        with zipfile.ZipFile(nested, 'w') as zf:
+            zf.writestr('보고서.docx', office_zip('word/document.xml', 'word/vbaProject.bin'))
+            zf.writestr('옛문서.doc', OLE_WITH_VBA)
+        found = check(None, '모음.zip', nested.getvalue())
+        self.assertEqual(found['value'], 'macro_document')
+        plain = io.BytesIO()
+        with zipfile.ZipFile(plain, 'w') as zf:
+            zf.writestr('보고서.docx', office_zip('word/document.xml'))
+            zf.writestr('옛문서.doc', OLE)
+        self.assertIsNone(check(None, '모음.zip', plain.getvalue()))
+
+    def test_sealed_archives_by_extension_and_content(self):
+        for name, magic in (('a.7z', b'7z\xbc\xaf\x27\x1c'), ('b.rar', b'Rar!\x1a\x07\x01\x00'), ('c.alz', b'ALZ\x01'),
+                            ('d.EGG', b'EGGA\x00\x01')):
+            self.assertEqual(check(None, name, b'zzzz')['value'], 'sealed_archive', name)
+            renamed = check(None, '자료.dat', magic + b'\0' * 20)
+            self.assertEqual((renamed['value'], renamed['disguised']), ('sealed_archive', True))
+        self.assertEqual(check(None, 'a.zip', zip_with('b.rar'))['value'], 'sealed_archive')    # zip 안의 rar
+        inner = io.BytesIO()
+        with zipfile.ZipFile(inner, 'w') as zf:
+            zf.writestr('자료.bin', b'EGGA\x00\x01' + b'\0' * 20)         # zip 안의, 이름만 바꾼 egg
+        self.assertEqual(check(None, 'a.zip', inner.getvalue())['value'], 'sealed_archive')
+        self.assertEqual(check(None, 'a.zip', zip_with('자료.egg'))['value'], 'sealed_archive')
+        self.assertIsNone(check(None, '사진.zip', zip_with('a.png')))       # zip · gz 는 기본으로 막지 않는다
+        self.assertIsNone(check(None, 'log.gz', b'\x1f\x8b' + b'\0' * 10))
+
+    def test_parent_types_imply_new_ones(self):
+        docs = normalize_policy({'blocked_types': ['document']})
+        self.assertEqual(check(docs, 'a.docm', b'')['value'], 'macro_document')
+        only_macro = normalize_policy({'blocked_types': ['macro_document']})
+        self.assertIsNone(check(only_macro, 'a.docx', office_zip('word/document.xml')))
+        public = file_policy.public_policy(None)
+        archive = next(c for c in public['categories'] if c['key'] == 'archive')['extensions']
+        self.assertTrue({'7z', 'rar', 'alz', 'egg'} <= set(archive))               # 클라이언트 미리 보기도 함께 막는다
+        self.assertEqual(precheck({**public, 'blocked_types': ['archive']}, 'a.7z')['rule'], 'type')
+        self.assertEqual(precheck(public, '계획.docm')['value'], 'macro_document')
+        self.assertEqual(precheck(public, '자료.egg')['value'], 'sealed_archive')
+        no_sealed = normalize_policy({'blocked_types': ['executable']})     # 관리자가 sealed_archive 를 빼면 egg 도 막지 않는다
+        self.assertIsNone(check(no_sealed, '자료.egg', b'EGGA\x00\x01'))
+
+    def test_merge_new_defaults_once(self):
+        legacy = {'enabled': True, 'blocked_types': ['executable', 'credential'], 'blocked_extensions': ['hwp'],
+                  'blocked_names': []}                                       # 2026-11-17 전에 저장한 정책 (database 는 뺌)
+        merged, added = file_policy.merge_new_defaults(legacy)
+        self.assertEqual(added, ['macro_document', 'sealed_archive'])
+        self.assertEqual(merged['blocked_types'], ['executable', 'macro_document', 'sealed_archive', 'credential'])
+        self.assertEqual(merged['blocked_extensions'], ['hwp'])
+        again, added = file_policy.merge_new_defaults(merged)
+        self.assertIs(again, merged)
+        self.assertEqual(added, [])
+        removed = {**merged, 'blocked_types': ['executable']}               # 그 뒤 관리자가 뺐다
+        self.assertIs(file_policy.merge_new_defaults(removed)[0], removed)
+        archive = {**legacy, 'blocked_types': ['archive']}                   # 압축 파일 전체를 막아 둔 정책
+        merged, added = file_policy.merge_new_defaults(archive)
+        self.assertEqual(added, ['macro_document', 'sealed_archive'])
+        self.assertIn('defaults_seen', merged)
+        self.assertNotIn('defaults_seen', file_policy.public_policy(merged))
+
+
+class FilePolicyStartupMergeTests(unittest.TestCase):
+    def test_server_start_adds_new_defaults_to_saved_policy_and_logs(self):
+        from server.kakao.server import KakaoServer
+        from server.kakao.store import Store
+        from tests.test_kakao_server import FakeRag
+        tmp = tempfile.mkdtemp(prefix='kcs_fp_merge_')
+        self.addCleanup(__import__('shutil').rmtree, tmp, True)
+        db = os.path.join(tmp, 'k.db')
+        store = Store(db)
+        store.set_file_policy({'enabled': True, 'blocked_types': ['executable', 'database', 'credential'],
+                               'blocked_extensions': [], 'blocked_names': ['*대외비*']})
+        store.close()
+        for round_no in (1, 2):
+            server = KakaoServer(port=0, db_path=db, rag_factory=FakeRag)
+            with self.assertLogs('kakao.server', 'INFO') as logs:
+                server.serve_in_thread()
+            server.stop()
+            merged = [line for line in logs.output if '새 기본 차단 형태' in line]
+            if round_no == 1:
+                self.assertEqual(len(merged), 1, logs.output)
+                self.assertIn('2개를 저장된 정책에 더했습니다 (매크로 문서, 속을 볼 수 없는 압축 파일', merged[0])
+            else:
+                self.assertEqual(merged, [])                                 # 한 번만
+        store = Store(db)
+        self.addCleanup(store.close)
+        self.assertEqual(store.file_policy()['blocked_types'],
+                         ['executable', 'macro_document', 'sealed_archive', 'database', 'credential'])
 
 
 class FileSecurityServerTests(ServerTestBase):
@@ -113,6 +235,9 @@ class FileSecurityServerTests(ServerTestBase):
         admin = self.member(admin=True)
         done = admin.request({'type': 'admin_file_policy_set', 'policy': policy}, 'admin_done')
         self.assertEqual(done['action'], 'file_policy')
+        saved = self.server.store.file_policy()                              # 관리자가 뺀 새 기본값은 재시작 때 다시 넣지 않는다
+        self.assertEqual(saved['blocked_types'], [])
+        self.assertTrue({'macro_document', 'sealed_archive'} <= set(saved['defaults_seen']))
         pushed = b.wait_for('file_policy')['policy']                         # 모두에게 바로 적용
         self.assertEqual(pushed['blocked_extensions'], ['hwp'])
         self.send_file(a, room['room_id'], '정산.txt', EXE, tmp='x2')        # 실행 파일은 이제 풀림
@@ -303,7 +428,8 @@ class FileSecurityClientTests(unittest.TestCase):
         tab.names_edit.setPlainText('*대외비*\n\n고객명단')
         tab.save()
         self.assertEqual(self.conn.last('admin_file_policy_set')['policy'],
-                         {'enabled': True, 'blocked_types': ['executable', 'archive', 'database', 'credential'],
+                         {'enabled': True, 'blocked_types': ['executable', 'macro_document', 'sealed_archive', 'archive',
+                                                             'database', 'credential'],
                           'blocked_extensions': ['hwp', 'dwg'], 'blocked_names': ['*대외비*', '고객명단']})
         tab.enabled_check.setChecked(False)
         self.assertFalse(tab.ext_edit.isEnabled())

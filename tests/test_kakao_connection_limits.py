@@ -247,27 +247,41 @@ class SendProgressTests(unittest.TestCase):
         got = []
 
         def read_slowly():
-            total = 0
-            while total < 3_000_000:
-                chunk = peer.recv(65536)
-                if not chunk:
-                    break
-                total += len(chunk)
-                time.sleep(0.01)
-            got.append(total)
+            total = since_pause = 0
+            try:
+                while total < 3_000_000:
+                    chunk = peer.recv(262144)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    since_pause += len(chunk)
+                    if since_pause >= 262144:   # 받은 양 기준으로 쉰다 (조각 크기가 OS 마다 달라 조각마다 쉬면 느린 러너에서 끝나지 않는다)
+                        since_pause = 0
+                        time.sleep(0.05)        # 약 11번 x 0.05초: 전체로는 0.3초를 넘기고, 한 번 쉬는 것은 0.3초보다 짧다
+            finally:
+                got.append(total)
         reader = threading.Thread(target=read_slowly, daemon=True)
         reader.start()
-        with unittest.mock.patch.object(server_mod, 'SOCKET_TIMEOUT', 0.3):       # 전체로는 0.3초를 훌쩍 넘긴다
+        with unittest.mock.patch.object(server_mod, 'SOCKET_TIMEOUT', 0.3):
             self.assertTrue(conn.send(payload))
-            reader.join(10)
+            reader.join(30)
+        self.assertEqual(len(got), 1, '받는 스레드가 30초 안에 끝나지 않았습니다')
         self.assertGreaterEqual(got[0], 3_000_000)
         self.assertTrue(conn.alive)
 
     def test_stuck_reader_is_dropped(self):
         conn, _peer = self.pair()
+        # Windows 루프백은 보내기 버퍼를 늘려 큰 덩어리를 한 번에 받아 주기도 한다 - 그러면 줄에 남는 것이 없어
+        # 서버 쪽에서는 '보낸 것'이다. 운영체제 버퍼가 차서 실제로 줄에 남을 때까지 보낸 뒤 그때부터 잰다
+        conn.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+        for _ in range(64):
+            began = time.monotonic()
+            self.assertTrue(conn.send({'type': 'big', 'data': 'x' * 1_000_000}))
+            self.assertLess(time.monotonic() - began, 0.5)                       # 줄에 세우는 것은 바로 끝난다
+            if conn.queued_bytes() > 0:
+                break
+        self.assertGreater(conn.queued_bytes(), 0, '받지 않는 상대인데 64MB 를 운영체제가 모두 받아 주었습니다')
         started = time.monotonic()
-        self.assertTrue(conn.send({'type': 'big', 'data': 'x' * 8_000_000}))    # 줄에 세우는 것은 바로 끝난다
-        self.assertLess(time.monotonic() - started, 0.5)
         while conn.alive and time.monotonic() - started < 5.0:
             time.sleep(0.05)
         self.assertFalse(conn.alive)                                           # 받지 않는 연결은 전용 스레드가 닫는다

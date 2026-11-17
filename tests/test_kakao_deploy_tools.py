@@ -99,6 +99,30 @@ class PredeployCheckTests(DeployToolBase):
         self.assertEqual((code, result['duplicates'], result['renamed']), (0, [], []))
         self.assertIn('✓ 없음', text)
 
+    def test_file_policy_defaults_to_be_added(self):
+        from server.kakao import file_policy
+        self.assertEqual(predeploy_check.FILE_POLICY_DEFAULT_TYPES, tuple(file_policy.DEFAULT_POLICY['blocked_types']))
+        self.assertEqual(predeploy_check.FILE_POLICY_LEGACY_TYPES, file_policy.LEGACY_DEFAULT_TYPES)
+        store = self.store()
+        store.member_create('가나다', {'company': 'KCS 홀딩스'})
+        store.set_admin('가나다', True)
+        _code, result, text = self.run_check()
+        self.assertFalse(result['file_policy']['saved'])
+        self.assertIn('기본 정책을 씁니다', text)
+        store.set_file_policy({'enabled': False, 'blocked_types': ['executable'], 'blocked_extensions': [],
+                               'blocked_names': []})                         # 2026-11-17 전에 저장한 정책
+        _code, result, text = self.run_check()
+        self.assertEqual(result['file_policy']['adds'], ['macro_document', 'sealed_archive'])
+        self.assertIn('저장된 정책에 더합니다', text)
+        self.assertIn('정책이 꺼져 있어', text)
+        merged, _added = file_policy.merge_new_defaults(store.file_policy())   # 서버가 시작하며 합친 뒤 관리자가 매크로를 뺐다
+        store.set_file_policy({**merged, 'enabled': True,
+                               'blocked_types': [t for t in merged['blocked_types'] if t != 'macro_document']})
+        _code, result, text = self.run_check()
+        self.assertEqual((result['file_policy']['adds'], result['file_policy']['skipped']), ([], ['macro_document']))
+        self.assertIn('더할 것 없음', text)
+        self.assertIn('관리자가 뺀 기본 차단은 그대로', text)
+
     def test_old_database_and_bad_paths(self):
         raw = sqlite3.connect(self.db)
         raw.execute('CREATE TABLE users (username TEXT PRIMARY KEY, display_name TEXT NOT NULL, is_bot INTEGER DEFAULT 0)')
@@ -136,7 +160,8 @@ class BackupTests(DeployToolBase):
             self.assertEqual(copy.execute('PRAGMA quick_check').fetchone()[0], 'ok')
         finally:
             copy.close()
-        self.assertEqual(os.stat(os.path.join(folder, 'kakao.db')).st_mode & 0o777, 0o600)
+        if os.name == 'posix':                                                  # 권한 비트는 POSIX 에서만 (Windows 는 폴더 ACL)
+            self.assertEqual(os.stat(os.path.join(folder, 'kakao.db')).st_mode & 0o777, 0o600)
         store.add_message(room, 'a', 'text', '백업 뒤에도 서버는 그대로 쓴다')
 
     def test_keeps_only_the_latest_folders(self):
