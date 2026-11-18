@@ -94,6 +94,7 @@ pm2 logs kcs-talk-server --lines 50
 ```
 
 - 접속 중인 클라이언트는 끊겼다가 자동으로 다시 붙습니다.
+- 2026-11-18 변경분이 들어간 뒤 처음 다시 시작할 때는 메시지 색인을 새로 만들어 시작이 조금 늦습니다 (메시지 100만 건에 약 2초, DB 가 1~2할 커짐). 그 뒤로는 그대로입니다.
 - 등록을 예전처럼 열어 두려면 `ecosystem.config.cjs` 의 실행 인자에 `--open-registration` 을 더한 뒤 `pm2 startOrReload ecosystem.config.cjs --update-env` 로 올립니다. 넣지 않으면 **닫힘**입니다.
 
 ## 5. 다시 시작한 뒤 확인

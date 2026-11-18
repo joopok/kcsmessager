@@ -799,6 +799,11 @@ class KakaoServer(AdminHandlers):
         # 통화 레지스트리 (영속화하지 않음)
         self._calls_lock = threading.Lock()
         self._calls: dict[int, Call] = {}
+        self._user_json_cache: tuple[int, dict] = (-1, {})   # welcome 의 사용자 JSON 조각 (_users_json_for)
+        self._presence_lock = threading.Lock()
+        self._presence_pending: dict[str, str] = {}          # 아직 알리지 않은 접속 상태 변화 {이름: 시각}
+        self._presence_wake = threading.Event()
+        self._welcome_gate = threading.BoundedSemaphore(max(1, int(self.WELCOME_BUILDS)))
         self._call_order = threading.RLock()     # 통화 상태 순서 = 알림 순서 (_call_ordered)
         self._summary_lock = threading.Lock()
         self._summaries_running: set = set()      # (username, room_id) 요약 진행 중
@@ -998,6 +1003,7 @@ class KakaoServer(AdminHandlers):
         self._spawn(self._rag_worker, name='kakao-rag')
         self._spawn(self._preview_worker, name='kakao-preview')
         self._spawn(self._heartbeat_loop, name='kakao-heartbeat')
+        self._spawn(self._presence_loop, name='kakao-presence')
         self._spawn_rag_workers()
         try:
             self._accept_loop()
@@ -1011,6 +1017,7 @@ class KakaoServer(AdminHandlers):
         self._spawn(self._rag_worker, name='kakao-rag')
         self._spawn(self._preview_worker, name='kakao-preview')
         self._spawn(self._heartbeat_loop, name='kakao-heartbeat')
+        self._spawn(self._presence_loop, name='kakao-presence')
         self._spawn_rag_workers()
         return self._spawn(self._accept_loop, name='kakao-accept')
 
@@ -1118,8 +1125,42 @@ class KakaoServer(AdminHandlers):
             return user
         return {**user, 'email': ''}
 
+    def _users_json_for(self, viewer: str, online: set[str]) -> tuple[str, list[str]]:
+        """welcome 의 users 를 JSON 배열 글자로 → (JSON, 이름 목록). _users_for 와 바이트까지 같다
+        (tests/test_kakao_user_cache.py 가 비교한다). 사용자 목록은 store.user_directory 캐시에서, 한 사람의 JSON 조각은
+        (버전, 이름, 접속 여부, 이메일 가림)마다 한 번만 만든다. 보는 사람마다 다른 것(멀티프로필 · 이메일 · 접속)만 덧씌운다"""
+        version, entries = self.store.user_directory()
+        overrides = self.store.profile_overrides_for_viewer(viewer)
+        admin = self.store.admin_scope(viewer) is not None
+        cache = self._user_json_cache
+        if cache[0] != version or version < 0:
+            cache = (version, {})
+            self._user_json_cache = cache
+        pieces = cache[1]
+        parts: list[str] = []
+        names: list[str] = []
+        for on, off in entries:
+            name = on['username']
+            names.append(name)
+            is_online = name in online or on['is_bot']
+            base = on if is_online else off
+            override = overrides.get(name)
+            if override:                     # 멀티프로필: 이 사람에게만 다르게 보인다 - 조각을 나누어 쓰지 않는다
+                parts.append(json.dumps(self._private_view(self._apply_profile(base, override), viewer, admin),
+                                        ensure_ascii=False))
+                continue
+            hide = not (admin or name == viewer or not base.get('email'))
+            key = (name, is_online, hide)
+            piece = pieces.get(key)
+            if piece is None:
+                piece = json.dumps({**base, 'email': ''} if hide else base, ensure_ascii=False)
+                pieces[key] = piece
+            parts.append(piece)
+        return '[' + ', '.join(parts) + ']', names
+
     def _users_for(self, viewer: str, online: set[str]) -> list[dict]:
-        """viewer 에게 보낼 사용자 목록 (멀티프로필 적용, 조회 1회)."""
+        """viewer 에게 보낼 사용자 목록 (멀티프로필 적용, 조회 1회). welcome 은 같은 결과를 캐시로 만드는
+        _users_json_for 를 쓴다 - 이 함수는 그 기준(테스트가 둘을 비교한다)"""
         overrides = self.store.profile_overrides_for_viewer(viewer)
         admin = self.store.admin_scope(viewer) is not None
         return [self._private_view(self._apply_profile(u, overrides.get(u['username'])), viewer, admin)
@@ -1127,20 +1168,91 @@ class KakaoServer(AdminHandlers):
 
     def _broadcast_user(self, username: str, ctx: Optional[Ctx] = None, exclude_user: Optional[str] = None) -> None:
         """user_updated 를 수신자별(멀티프로필)로 만들어 모든 접속자에게 보낸다."""
+        for conn, frame in self._user_updated_frames(username, self._all_joined_conns(), ctx, exclude_user):
+            conn.send_frame(frame)
+
+    def _user_updated_frames(self, username: str, conns: list[Connection], ctx: Optional[Ctx] = None,
+                             exclude_user: Optional[str] = None) -> list[tuple[Connection, bytes]]:
+        """user_updated 한 줄을 받는 연결마다 → [(연결, 줄)]. 보이는 모양(멀티프로필 · 이메일)이 같은 연결끼리는
+        한 번 만든 줄을 함께 쓴다 (예전에는 연결마다 만들어 접속자 수만큼 직렬화했다)"""
         base = self.store.get_user(username, self._online_users())
         if base is None:
-            return
+            return []
         overrides = self.store.profile_overrides_for_owner(username)
         admins = set(self.store.admin_usernames())
-        for conn in self._all_joined_conns():
-            if exclude_user is not None and conn.username == exclude_user:
+        made: dict[Any, Optional[bytes]] = {}
+        out: list[tuple[Connection, bytes]] = []
+        for conn in conns:
+            viewer = conn.username
+            if exclude_user is not None and viewer == exclude_user:
                 continue
-            user = self._private_view(self._apply_profile(base, overrides.get(conn.username)), conn.username,
-                                      conn.username in admins)
-            payload = {'type': 'user_updated', 'user': user}
-            if ctx is not None and conn is ctx.conn and ctx.has_req_id:
-                payload['req_id'] = ctx.req_id
-            conn.send(payload)
+            override = overrides.get(viewer)
+            user = None
+            if override or (ctx is not None and conn is ctx.conn and ctx.has_req_id):
+                user = self._private_view(self._apply_profile(base, override), viewer, viewer in admins)
+                payload = {'type': 'user_updated', 'user': user}
+                if ctx is not None and conn is ctx.conn and ctx.has_req_id:
+                    payload['req_id'] = ctx.req_id
+                frame = encode_frame(payload)
+            else:
+                show = viewer in admins or viewer == username or not base.get('email')
+                if show not in made:
+                    made[show] = encode_frame({'type': 'user_updated', 'user': base if show else {**base, 'email': ''}})
+                frame = made[show]
+            if frame is not None:
+                out.append((conn, frame))
+        return out
+
+    # welcome 에서 캐시로 만든 users JSON 을 끼울 자리 표시 (실행마다 다른 값 - 사용자 글자와 겹치지 않게)
+    _USERS_MARK = '\x00users-' + os.urandom(8).hex() + '\x00'
+    _USERS_MARK_JSON = json.dumps(_USERS_MARK)
+
+    # ---- 접속 · 접속 종료 알림 묶기 (명세 §2 '접속 알림')
+    PRESENCE_BATCH_SECONDS = 0.15     # 이 간격으로 모아 보낸다 - 로그인이 몰려도 사람마다 즉시 전원에게 보내지 않게
+
+    def _queue_presence(self, username: str) -> None:
+        """username 의 접속 상태가 바뀌었다 → 다음 묶음에 (그 사이 여러 번 바뀌면 마지막 상태 한 번만)"""
+        with self._presence_lock:
+            self._presence_pending[username] = now_iso()
+        self._presence_wake.set()
+
+    def _presence_loop(self) -> None:
+        while not self._stop.is_set():
+            self._presence_wake.wait(1.0)
+            if self._stop.is_set():
+                break
+            if not self._presence_wake.is_set():
+                continue
+            self._stop.wait(self.PRESENCE_BATCH_SECONDS)      # 첫 변화 뒤 잠깐 더 모은다
+            self._presence_wake.clear()
+            try:
+                self._flush_presence()
+            except Exception:
+                logger.exception('접속 알림 오류')
+
+    def _flush_presence(self) -> None:
+        """모아 둔 접속 상태를 보낸다: 사람마다 user_status_changed → user_updated (명세 §2), 받는 연결마다 한 번에 쓴다"""
+        with self._presence_lock:
+            pending, self._presence_pending = self._presence_pending, {}
+        if not pending or self._stop.is_set():
+            return
+        conns = self._all_joined_conns()
+        online = self._online_users()
+        blobs: dict[Connection, list[bytes]] = {conn: [] for conn in conns}
+        for username, stamp in pending.items():
+            status = 'online' if username in online else 'offline'
+            frame = encode_frame({'type': 'user_status_changed', 'username': username, 'status': status,
+                                  'timestamp': stamp})
+            if frame is None:
+                continue
+            for conn in conns:
+                if conn.username != username:            # 본인에게는 보내지 않는다 (예전과 같다)
+                    blobs[conn].append(frame)
+            for conn, line in self._user_updated_frames(username, conns, exclude_user=username):
+                blobs[conn].append(line)
+        for conn, lines in blobs.items():
+            if lines:
+                conn.send_frame(b''.join(lines))
 
     def _user_conns(self, usernames: Any) -> list[Connection]:
         with self._conns_lock:
@@ -1344,9 +1456,7 @@ class KakaoServer(AdminHandlers):
                         went_offline = True
         if went_offline and not self._stop.is_set():
             logger.info('%s 오프라인', username)
-            self._broadcast({'type': 'user_status_changed', 'username': username,
-                             'status': 'offline', 'timestamp': now_iso()})
-            self._broadcast_user(username)
+            self._queue_presence(username)    # 접속 종료 알림도 묶어서 (_flush_presence)
             self._leave_all_calls(username)   # 접속 종료 = 통화 나가기
 
     # ------------------------------------------------------------------ 공용 헬퍼
@@ -1430,6 +1540,7 @@ class KakaoServer(AdminHandlers):
     RAG_BACKLOG = 100                 # 작업 스레드 하나에 밀려 있을 수 있는 일의 수
     MAX_CONNECTIONS = 3000            # 동시에 열려 있는 연결 수
     MAX_PRELOGIN_PER_IP = 100         # 한 주소에서 로그인하지 않고 열어 둔 연결 수
+    MAX_CONNECTIONS_PER_USER = 20     # 한 계정의 동시 연결 수 - 넘으면 가장 오래된 연결을 닫는다 (2026-11-18, 명세 §2)
     PRELOGIN_SECONDS = 30.0           # 로그인하지 않은 연결을 열어 두는 시간
     PRELOGIN_MAX_CHARS = 64 * 1024    # 로그인 전 요청 한 건의 크기
     HEARTBEAT_SECONDS = 45.0          # 서버가 이만큼 아무것도 보내지 않은 연결에 ping 을 보낸다
@@ -1676,12 +1787,9 @@ class KakaoServer(AdminHandlers):
             first_conn = self._send_welcome(conn, msg, req_type, username, login_token)
         finally:
             conn.release_others()
-        if first_conn:
-            self._broadcast({'type': 'user_status_changed', 'username': username,
-                             'status': 'online', 'timestamp': now_iso()}, exclude_user=username)
         if created or first_conn:
-            # 신규 사용자 등록 / 접속 상태(presence) 변경 알림
-            self._broadcast_user(username, exclude_user=username)
+            # 접속 알림(user_status_changed + user_updated)은 묶어서 보낸다 (_flush_presence, 명세 §2)
+            self._queue_presence(username)
         if self.daily_briefing and first_conn and username != BOT_USERNAME \
                 and self.store.take_briefing_slot(username, date.today().isoformat()):
             self._rag_queue.put(lambda: self._send_briefing(username))
@@ -1695,19 +1803,42 @@ class KakaoServer(AdminHandlers):
             first_conn = not conns
             conns.add(conn)
             conn.username = username
+            # 로그인한 계정이 연결을 계속 열어 받는 버퍼(연결당 최대 MAX_BUFFER_CHARS)로 메모리를 채우지 못하게
+            excess = sorted((c for c in conns if c is not conn), key=lambda c: c.connected_at)
+            excess = excess[:max(0, len(conns) - max(1, int(self.MAX_CONNECTIONS_PER_USER)))]
+        for old in excess:
+            logger.warning('%s 의 연결이 %d개를 넘어 가장 오래된 연결을 닫습니다 (%s)', username,
+                           self.MAX_CONNECTIONS_PER_USER, old.address)
+            old.close(force=True)               # 읽기 스레드가 깨어나 접속 목록에서 뺀다
         conn.bucket = TokenBucket(self.REQUEST_RATE, self.REQUEST_BURST)
         conn.media_bucket = TokenBucket(self.MEDIA_RATE, self.MEDIA_BURST)
         try:
             conn.sock.settimeout(SOCKET_TIMEOUT)
         except OSError:
             pass
-        online = self._online_users()
         ctx = Ctx(conn=conn, username=username, req_type=req_type, req_id=msg.get('req_id'),
                   has_req_id='req_id' in msg)
-        self._reply(ctx, {
+        with self._welcome_gate:            # 로그인이 몰려도 만들기는 WELCOME_BUILDS 개씩 (보내기는 밖에서)
+            online = self._online_users()
+            text, usernames = self._welcome_text(ctx, username, online, login_token)
+        conn.send_frame((text + '\n').encode('utf-8', errors='replace'), wait=True)
+        conn.send({'type': 'all_users_list',
+                   'users': usernames,                  # welcome 의 users 와 같은 목록 · 같은 순서 (다시 조회하지 않는다)
+                   'online_users': sorted(online)})
+        return first_conn
+
+    # 동시에 만드는 welcome 수 (2026-11-18 측정): 파이썬 작업이라 여럿이 동시에 만들면 GIL 을 다퉈 모두 늦어진다 -
+    # 100명 동시 로그인의 로그인 p95 가 제한 없음 0.53~0.62초 / 1개 0.47~0.50초 (scripts/bench_server_requests.py,
+    # 방 목록 읽기를 줄인 뒤 1개로 0.34~0.40초)
+    WELCOME_BUILDS = 1
+
+    def _welcome_text(self, ctx: Ctx, username: str, online: set[str], login_token: Optional[str]) -> tuple[str, list[str]]:
+        """welcome 한 줄(JSON 글자, 줄바꿈 없음)과 사용자 이름 목록"""
+        users_json, usernames = self._users_json_for(username, online)
+        welcome = {
             'type': 'welcome',
             'me': self.store.get_user(username, online),
-            'users': self._users_for(username, online),
+            'users': self._USERS_MARK,          # 캐시로 만든 JSON 배열을 이 자리에 끼운다 (아래)
             'rooms': self.store.rooms_for_user(username),
             'org': self.store.org_payload(),
             'calls': self._calls_for_user(username),
@@ -1718,11 +1849,10 @@ class KakaoServer(AdminHandlers):
             'policy': {'open_registration': self.open_registration, 'email_editable': self.open_registration,
                        'display_name_editable': self.open_registration},
             **({'login_token': login_token} if login_token else {}),
-        })
-        conn.send({'type': 'all_users_list',
-                   'users': [u['username'] for u in self.store.list_users()],
-                   'online_users': sorted(online)})
-        return first_conn
+        }
+        if ctx.has_req_id:
+            welcome['req_id'] = ctx.req_id
+        return json.dumps(welcome, ensure_ascii=False).replace(self._USERS_MARK_JSON, users_json, 1), usernames
 
     def _h_legacy_message(self, ctx: Ctx, msg: dict) -> None:
         if self.require_password:      # 모두에게 가는 구버전 요청은 비밀번호 없는 구버전 · 테스트 서버에서만 (§4)

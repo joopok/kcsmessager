@@ -24,6 +24,10 @@ class QuickLimitsServer(KakaoServer):
     HEARTBEAT_TIMEOUT = 1.2
 
 
+class FewConnectionsServer(KakaoServer):
+    MAX_CONNECTIONS_PER_USER = 2
+
+
 class SmallRateServer(KakaoServer):
     REQUEST_RATE, REQUEST_BURST = 5.0, 20.0
     MEDIA_RATE, MEDIA_BURST = 5.0, 10.0
@@ -229,6 +233,21 @@ class RequestRateTests(CustomServerBase):
         self.assertEqual(bot.count(AI_BUSY), 1)
         self.assertEqual(len(bot), 3)                                            # 답 2개 + 안내 1개
         self.assertEqual(len(self.rag.questions), 2)
+
+
+class PerUserConnectionTests(CustomServerBase):
+    SERVER_CLASS = FewConnectionsServer
+
+    def test_oldest_connection_is_closed_past_the_per_user_cap(self):
+        name = 'per_user_cap'
+        first, second = self.connect(name), self.connect(name)
+        time.sleep(0.05)
+        third = self.connect(name)                                   # 한 계정 3번째 연결 → 가장 오래된 것을 닫는다
+        self.assertTrue(self.wait_closed(first))
+        self.assertFalse(second.closed or third.closed)
+        other = self.connect('per_user_other')                       # 다른 계정은 상관없다
+        self.assertEqual(third.request({'type': 'call_list'}, 'call_list')['calls'], [])
+        self.assertFalse(other.closed)
 
 
 class SendProgressTests(unittest.TestCase):

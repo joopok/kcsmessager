@@ -69,6 +69,86 @@ class ReadConnectionTests(unittest.TestCase):
         self.store.delete_message(last['msg_id'])
         self.assertEqual(self.store.search('b', '지울 글', None), [])
 
+    def test_login_lists_do_not_take_the_main_lock(self):
+        """로그인(welcome) · 화면을 여는 목록 조회도 읽기 전용 연결에서 (2026-11-18): 로그인이 몰려도 저장이 서지 않는다"""
+        self.say('안녕')
+        with self.store._lock:
+            rooms = self.in_thread(lambda: self.store.rooms_for_user('b'))
+            users = self.in_thread(lambda: self.store.list_users())
+            admin = self.in_thread(lambda: self.store.admin_user_list())
+            events = self.in_thread(lambda: self.store.list_events('b', '2000-01-01T00:00:00', '2100-01-01T00:00:00'))
+            calls = self.in_thread(lambda: self.store.call_history('b', 10))
+        self.assertEqual(rooms[0]['last_message']['content'], '안녕')
+        self.assertEqual({u['username'] for u in users} >= {'a', 'b'}, True)
+        self.assertEqual((len(admin) >= 2, events, calls), (True, [], []))
+
+    def test_reads_run_side_by_side_and_wait_for_a_free_connection(self):
+        self.assertEqual(len(self.store._read_all), Store.READ_CONNECTIONS)
+        self.say('동시에 찾기')
+        held = [self.store._readers.get() for _ in range(Store.READ_CONNECTIONS - 1)]
+        self.assertEqual(len(self.in_thread(lambda: self.store.search('b', '동시에', None))), 1)   # 하나 남은 연결로
+        held.append(self.store._readers.get())                                                   # 모두 쓰는 중이면
+        result = []
+        worker = threading.Thread(target=lambda: result.append(self.store.search('b', '동시에', None)), daemon=True)
+        worker.start()
+        worker.join(0.3)
+        self.assertTrue(worker.is_alive())                                                       # 하나가 돌아올 때까지 기다린다
+        for db in held:
+            self.store._readers.put(db)
+        worker.join(3)
+        self.assertEqual(len(result[0]), 1)
+
+    def test_one_call_sees_one_moment(self):
+        """한 번의 조회 안에서는 같은 시점: 방 목록을 만드는 사이에 읽음 · 새 메시지가 저장돼도 섞이지 않는다"""
+        first = self.say('처음')
+        started, release = threading.Event(), threading.Event()
+        original = self.store._rows_in
+
+        def slow_rows_in(*args, **kwargs):
+            started.set()
+            release.wait(3)
+            return original(*args, **kwargs)
+        self.store._rows_in = slow_rows_in
+        result = []
+        worker = threading.Thread(target=lambda: result.append(self.store.rooms_for_user('b')), daemon=True)
+        worker.start()
+        self.assertTrue(started.wait(3))
+        self.store.update_read(self.room, 'b', first['msg_id'])   # 안 읽은 수를 센 뒤에 b 가 읽었다
+        self.say('그 사이에 저장된 글')
+        release.set()
+        worker.join(3)
+        room = result[0][0]
+        self.assertEqual(room['last_message']['content'], '처음')
+        self.assertEqual((room['unread_count'], room['read_pointers']['b']), (1, 0))   # 둘 다 읽기 전 시점
+
+    def test_screen_queries_use_their_indexes(self):
+        """서랍 · 멘션 모아보기는 그 메시지만 담은 부분 색인을 훑고, 예전 방 색인은 더 넓은 색인으로 바뀐다 (2026-11-18)"""
+        names = {r['name'] for r in self.store._db.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        self.assertTrue({'idx_messages_room_sender', 'idx_messages_drawer_image', 'idx_messages_drawer_file',
+                         'idx_messages_drawer_link', 'idx_messages_mentioned'} <= names)
+        self.assertNotIn('idx_messages_room', names)
+        image = self.store.save_attachment('a.png', 'image/png', b'\x89PNG\r\n\x1a\n' + b'0' * 20, 'a')
+        self.store.add_message(self.room, 'a', 'image', 'a.png', attachment_id=image)
+        self.say('@b 확인 https://example.com', mentions=['b'])
+        self.store.add_message(self.room, 'a', 'file', 'x.pdf')
+        got = {kind: [m['kind'] for m in self.store.drawer('b', kind, 10)] for kind in ('image', 'file', 'link')}
+        self.assertEqual(got, {'image': ['image'], 'file': ['file'], 'link': ['text']})
+        self.assertEqual([m['content'] for m in self.store.mentions_of('b')], ['@b 확인 https://example.com'])
+
+    def test_old_room_index_is_replaced_on_restart(self):
+        path = os.path.join(self.dir, 'kakao.db')
+        self.store.close()
+        raw = sqlite3.connect(path)
+        raw.execute('DROP INDEX IF EXISTS idx_messages_room_sender')
+        raw.execute('CREATE INDEX idx_messages_room ON messages(room_id, msg_id)')    # 예전 서버가 만든 DB
+        raw.commit()
+        raw.close()
+        again = Store(path)
+        self.addCleanup(again.close)
+        names = {r['name'] for r in again._db.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        self.assertIn('idx_messages_room_sender', names)
+        self.assertNotIn('idx_messages_room', names)
+
     def test_read_connection_cannot_write(self):
         self.assertIsNotNone(self.store._read_db)
         with self.assertRaises(sqlite3.OperationalError):
