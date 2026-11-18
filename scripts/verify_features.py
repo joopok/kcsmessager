@@ -88,6 +88,7 @@ MAPPING = [
     (r'test_kakao_review_1118\.SplitRooms', 'room_list'),
     (r'test_kakao_review_1118\.ProgressiveRender', 'room_list'),
     (r'test_kakao_review_1118\.BigRoomRead', 'read_count'),
+    (r'test_kakao_review_1118\.MessageBurst', 'room_list'),
     (r'test_kakao_review_1118\.', 'platforms'),
     # 전체 점검(2026-11-17) 뒤 강화한 클라이언트 규칙 (test_kakao_hardening)
     (r'test_kakao_hardening\.ImageDecode', 'attach'),

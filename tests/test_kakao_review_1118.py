@@ -300,18 +300,32 @@ def _text_message(msg_id, sender, content, room_id='r1', minutes_ago=0):
 
 
 class ProgressiveRenderTests(unittest.TestCase):
-    """채팅방은 말풍선을 RENDER_STEP 개씩 나눠 그린다 (느린 PC 에서 채팅방 열기 · 이전 대화가 1초 가까이 걸렸다)"""
+    """채팅방은 말풍선을 RENDER_STEP 개씩 나눠 그린다 (느린 PC 에서 채팅방 열기 · 이전 대화가 1초 가까이 걸렸다).
+    느린 PC 를 흉내 내어(말풍선 하나에 4ms 더) 나눠 그리는 도중에 새 메시지 · 수정 · 이전 대화가 끼어들어도
+    끝나고 나면 한 번에 그린 것과 같아야 한다. 기다림은 시간이 아니라 '나눠 그리기가 끝날 때까지'"""
+
+    SLOW_MS = 4
 
     def setUp(self):
         from client.kakao.chat_room import ChatRoomWindow
         app()
         self.state, self.conn = make_demo_state()
-        for i in range(60):                       # 이틀에 걸친 메시지 60개 (날짜 구분선이 생기게)
+        # 데모 메시지(어제 · 오늘) 뒤에 이어지는 메시지 60개. 번호가 클수록 나중 (서버와 같게 - 날짜 구분선은 날짜마다 하나)
+        for i in range(60):
             self.conn.push('msg_new', message=_text_message(100 + i, '김철수' if i % 3 else '이영희', f'메시지 {i}',
-                                                             minutes_ago=(60 - i) * 60))
+                                                             minutes_ago=(60 - i) / 20))
         self.Win = ChatRoomWindow
         self.addCleanup(setattr, ChatRoomWindow, 'RENDER_STEP', ChatRoomWindow.RENDER_STEP)
         ChatRoomWindow.RENDER_STEP = 10
+        original = ChatRoomWindow._make_row
+
+        def slow_make_row(win, m):               # 느린 PC: 말풍선 하나 만드는 데 시간이 더 걸린다
+            import time
+            time.sleep(self.SLOW_MS / 1000)
+            return original(win, m)
+        patcher = mock.patch.object(ChatRoomWindow, '_make_row', slow_make_row)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def open(self):
         win = self.Win(self.state, 'r1')
@@ -320,35 +334,73 @@ class ProgressiveRenderTests(unittest.TestCase):
         win.show()
         return win
 
+    @staticmethod
+    def wait_rendered(win, timeout=15.0):
+        import time
+        end = time.monotonic() + timeout
+        while win.rendering() and time.monotonic() < end:
+            pump(5)
+        return not win.rendering()
+
     def ids(self, win):
         return [m['msg_id'] for m in win._order]
 
-    def test_first_screen_then_the_rest_in_steps(self):
-        win = self.open()
+    def expected(self, win):
         timeline = [m['msg_id'] for m in self.state.timeline_messages('r1')]
-        first = self.ids(win)                                       # 처음에는 맨 아래부터 몇 덩어리만 (덩어리 = 10개)
-        self.assertLess(len(first), len(timeline))
-        self.assertLessEqual(len(first), 20)
-        self.assertEqual(first, timeline[-len(first):])
-        pump(200)
-        self.assertEqual(self.ids(win), timeline[-win._render_count:])   # 이벤트 사이에 나머지를 위로 붙였다
+        return timeline[-win._render_count:]
+
+    def check_layout(self, win):
+        """행 · 날짜 구분선이 순서대로 하나씩 (같은 날짜 구분선은 그 날 첫 메시지 바로 위)"""
         self.assertEqual(sorted(win.rows), sorted(self.ids(win)))
-        # 같은 날짜 구분선은 하나씩, 날짜가 바뀌는 메시지 바로 위에
         lay = win.list_layout
-        seps = [lay.itemAt(i).widget() for i in range(lay.count()) if lay.itemAt(i).widget() in win._seps.values()]
-        self.assertEqual(len(seps), len(set(win._msg_date(m) for m in win._order)))
+        widgets = [lay.itemAt(i).widget() for i in range(lay.count()) if lay.itemAt(i).widget() is not None]
+        rows = [w for w in widgets if w not in win._seps.values()]
+        self.assertEqual([w.msg['msg_id'] for w in rows], self.ids(win))
+        self.assertEqual(len(widgets), len(set(map(id, widgets))))
+        self.assertEqual(len(win._seps), len({win._msg_date(m) for m in win._order}))
         for d, sep in win._seps.items():
             first = next(m for m in win._order if win._msg_date(m) == d)
             self.assertEqual(lay.indexOf(sep) + 1, lay.indexOf(win.rows[first['msg_id']]))
 
+    def test_first_screen_then_the_rest_in_steps(self):
+        win = self.open()
+        first = self.ids(win)                     # 처음에는 맨 아래부터 몇 덩어리만 (덩어리 = 10개)
+        self.assertLess(len(first), len(self.expected(win)))
+        self.assertEqual(first, self.expected(win)[-len(first):])
+        self.assertTrue(win.rendering())
+        self.assertTrue(self.wait_rendered(win))
+        self.assertEqual(self.ids(win), self.expected(win))       # 끝나면 빠진 것 없이 전부
+        self.check_layout(win)
+
     def test_same_result_as_drawing_at_once(self):
         win = self.open()
-        pump(200)
-        stepped = (self.ids(win), [(r.first, r.last) for r in (win.rows[i] for i in self.ids(win)) if hasattr(r, 'first')])
+        self.assertTrue(self.wait_rendered(win))
+        stepped = (self.ids(win), [(win.rows[i].first, win.rows[i].last) for i in self.ids(win)
+                                   if hasattr(win.rows[i], 'first')])
         self.Win.RENDER_STEP = 0
         whole = self.open()
-        self.assertEqual(stepped, (self.ids(whole), [(r.first, r.last) for r in (whole.rows[i] for i in self.ids(whole))
-                                                      if hasattr(r, 'first')]))
+        self.assertFalse(whole.rendering())
+        self.assertEqual(stepped, (self.ids(whole), [(whole.rows[i].first, whole.rows[i].last) for i in self.ids(whole)
+                                                     if hasattr(whole.rows[i], 'first')]))
+
+    def test_messages_and_older_history_arriving_mid_way(self):
+        """나눠 그리는 도중: 새 메시지 · 아직 안 그린 오래된 메시지의 수정 · 서버에서 받은 이전 대화"""
+        win = self.open()
+        self.assertTrue(win.rendering())
+        self.conn.push('msg_new', message=_text_message(500, '이영희', '도중에 온 새 메시지'))
+        pump(5)
+        old = dict(self.state.find_message('r1', 101), content='고친 오래된 메시지')
+        self.conn.push('msg_updated', message=old)
+        pump(5)
+        win._loading_older = True                 # 위로 올려 서버에서 이전 대화를 받는 중
+        self.conn.push('history', room_id='r1', has_more=False,
+                       messages=[_text_message(50 + i, '김철수', f'더 오래된 {i}', minutes_ago=3.5 - i / 10) for i in range(12)])
+        self.assertTrue(self.wait_rendered(win))
+        self.assertEqual(self.ids(win), self.expected(win))
+        self.assertIn(500, win.rows)
+        self.assertIn(50, win.rows)
+        self.assertIn('고친 오래된 메시지', win.rows[101].text_label.text())
+        self.check_layout(win)
 
     def test_finding_an_old_message_draws_it_at_once(self):
         win = self.open()
@@ -356,6 +408,8 @@ class ProgressiveRenderTests(unittest.TestCase):
         self.assertNotIn(target, win.rows)
         self.assertTrue(win.focus_message(target))
         self.assertIn(target, win.rows)
+        self.assertFalse(win.rendering())
+        self.check_layout(win)
 
 
 class BigRoomReadTests(unittest.TestCase):
@@ -416,9 +470,75 @@ class BigRoomReadTests(unittest.TestCase):
         pump()
         for i in range(RENDER_PAGE * 2 + 5):
             self.conn.push('msg_new', message=_text_message(1000 + i, '김철수', f'공지 뒤 {i}'))
+        win.flush_new_messages()
+        self.assertTrue(self.wait_rendered(win) if hasattr(self, 'wait_rendered') else True)
         self.assertLessEqual(len(win._order), win.RENDER_MAX)
         self.assertEqual(win._order[-1]['msg_id'], 1000 + RENDER_PAGE * 2 + 4)
         self.assertGreater(win._hidden_older, 0)                   # 정리한 메시지는 받아 둔 채로 - 위로 올리면 다시 그린다
+
+
+class MessageBurstTests(unittest.TestCase):
+    """새 메시지가 몰리면 첫 건은 바로, 이어서 온 것은 모아 한 번에 붙인다 (메시지마다 목록을 다시 배치하지 않게)"""
+
+    def test_burst_is_batched_and_nothing_is_lost(self):
+        from client.kakao.chat_room import ChatRoomWindow
+        app()
+        state, conn = make_demo_state()
+        win = ChatRoomWindow(state, 'r1')
+        self.addCleanup(win.close)
+        win.show()
+        pump()
+        win.flush_new_messages()
+        conn.push('msg_new', message=_text_message(700, '김철수', '첫 건'))
+        self.assertIn(700, win.rows)                               # 첫 건은 바로
+        for i in range(1, 6):
+            conn.push('msg_new', message=_text_message(700 + i, '김철수', f'이어서 {i}'))
+        self.assertNotIn(701, win.rows)                            # 이어서 온 것은 모았다가
+        pump(win.APPEND_COALESCE_MS * 3)
+        self.assertEqual([m['msg_id'] for m in win._order][-6:], list(range(700, 706)))   # 순서대로 빠짐없이
+        conn.push('msg_updated', message=dict(_text_message(705, '김철수', '고침')))       # 모아 둔 뒤 고친 것도
+        self.assertIn('고침', win.rows[705].text_label.text())
+
+    def test_huge_burst_redraws_only_the_last_page(self):
+        from client.kakao.chat_room import ChatRoomWindow, RENDER_PAGE
+        app()
+        state, conn = make_demo_state()
+        win = ChatRoomWindow(state, 'r1')
+        self.addCleanup(win.close)
+        win.show()
+        pump()
+        conn.push('msg_new', message=_text_message(2000, '김철수', '시작'))
+        for i in range(1, win.RENDER_MAX + 50):
+            conn.push('msg_new', message=_text_message(2000 + i, '김철수', f'폭주 {i}'))
+        win.flush_new_messages()
+        win.finish_rendering()
+        self.assertLessEqual(len(win._order), RENDER_PAGE)
+        self.assertEqual(win._order[-1]['msg_id'], 2000 + win.RENDER_MAX + 49)
+
+
+class ProcessExitTests(unittest.TestCase):
+    """앱 · 점검 스크립트는 파이썬 마무리 정리 · PyQt 종료 처리기 없이 끝낸다 (남은 Qt 객체를 정리하다 가끔 Bus error) -
+    그래도 출력은 남고 앱이 건 종료 처리(osenv.on_exit)는 돈다"""
+
+    def test_finish_process_runs_exit_handlers_and_keeps_output(self):
+        import subprocess
+        mark = os.path.join(tempfile.mkdtemp(prefix='kcs_exit_'), 'atexit.txt')
+        code = ("import atexit, sys\n"
+                f"sys.path.insert(0, {ROOT!r})\n"
+                "from client.kakao import osenv\n"
+                f"osenv.on_exit(lambda: open({mark!r}, 'w').write('ran'))\n"
+                f"atexit.register(lambda: open({mark!r} + '.qt', 'w').write('ran'))   # PyQt 정리처럼 atexit 에 건 것\n"
+                "from client.kakao.app import finish_process\n"
+                "print('출력이 남는다', end='')\n"
+                "finish_process(3)\n"
+                "print('여기는 오지 않는다')\n")
+        r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=60,
+                           env=dict(os.environ, QT_QPA_PLATFORM='offscreen', PYTHONIOENCODING='utf-8'))
+        self.assertEqual(r.returncode, 3)
+        self.assertEqual(r.stdout, '출력이 남는다')
+        with open(mark) as f:
+            self.assertEqual(f.read(), 'ran')                     # 앱이 건 종료 처리는 한다
+        self.assertFalse(os.path.exists(mark + '.qt'))             # atexit(PyQt 의 Qt 객체 정리)는 건너뛴다
 
 
 class ScreenDetailTests(unittest.TestCase):

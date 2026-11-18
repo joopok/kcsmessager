@@ -105,6 +105,33 @@ def resource_path(*parts):
     return os.path.join(base, *parts)
 
 
+_EXIT_HANDLERS = []
+
+
+def on_exit(fn, *args):
+    """앱이 끝날 때 할 일을 건다. 보통 종료(atexit)와 app.finish_process 둘 다에서 돈다.
+    finish_process 는 PyQt 가 건 종료 처리기(남은 Qt 객체 정리 - 가끔 Bus error)를 피하려고 atexit 를 돌리지 않으므로,
+    앱의 종료 처리는 atexit.register 대신 여기에 건다"""
+    _EXIT_HANDLERS.append((fn, args))
+    atexit.register(_run_one, fn, args)
+
+
+def _run_one(fn, args):
+    if (fn, args) in _EXIT_HANDLERS:
+        _EXIT_HANDLERS.remove((fn, args))
+        fn(*args)
+
+
+def run_exit_handlers():
+    """on_exit 로 건 일을 지금 (건 순서의 반대로) 한다 - 한 번만"""
+    while _EXIT_HANDLERS:
+        fn, args = _EXIT_HANDLERS.pop()
+        try:
+            fn(*args)
+        except Exception:
+            pass
+
+
 PRIVATE_SUBDIRS = ('logs', 'recordings', 'keys', 'opened', 'macos')   # 데이터 폴더 아래 기록 · 키 · 받은 파일
 
 
@@ -301,7 +328,7 @@ def opened_files_dir():
         except OSError:
             pass
     _opened_dir = tempfile.mkdtemp(prefix='run_', dir=parent)      # 만든 사람만 읽고 쓴다 (0700)
-    atexit.register(shutil.rmtree, _opened_dir, True)
+    on_exit(shutil.rmtree, _opened_dir, True)
     return _opened_dir
 
 

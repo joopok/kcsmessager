@@ -50,6 +50,15 @@ class ChatRoomTestBase(unittest.TestCase):
         self.state, self.conn = make_demo_state()
         self.win = ChatRoomWindow(self.state, self.room)
         self.win.confirm = lambda *a: True       # 확인창 자동 승인
+        # 새 메시지는 몰려오면 묶어서 붙인다(APPEND_COALESCE_MS). 여기 테스트는 행 내용을 보므로, 서버 이벤트 사이에
+        # 시간이 흐른 것처럼 메시지마다 묶음을 비운다 (묶기 자체는 test_kakao_review_1118.MessageBurstTests)
+        push = self.conn.push
+
+        def push_and_flush(msg_type, **payload):
+            push(msg_type, **payload)
+            if msg_type == 'msg_new':
+                self.win.flush_new_messages()
+        self.conn.push = push_and_flush
         self.win.resize(420, 720)
         self.win.show()
         self.win.activateWindow()

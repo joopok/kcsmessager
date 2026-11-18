@@ -566,5 +566,33 @@ def _run(args, app):
     return app.exec_()
 
 
+def finish_process(code=0):
+    """프로세스를 끝낸다 - 파이썬의 마무리 정리를 거치지 않고.
+    메모리 정리(GC)를 이벤트 사이에서만 하도록 자동 GC 를 꺼 두어서, 끝날 때 창 · 대화상자 · 연결 객체가 서로 물린 채로 남는다.
+    파이썬 마무리 정리는 이것들을 정해지지 않은 순서로 지우는데, Qt 가 먼저 정리된 뒤 남은 Qt 객체를 지우면 가끔
+    Bus error 로 죽었다 (macOS 실제 화면, 7~10번에 한 번 - 2026-11-18 ci_smoke native).
+    정확히는 PyQt 가 QApplication 을 만들 때 건 종료 처리기(atexit)가 남은 Qt 객체를 정리하다 죽는다 → atexit 는 돌리지 않고,
+    출력을 비우고 앱이 건 종료 처리(osenv.on_exit: 받은 파일 임시 폴더 정리 등)만 한 뒤 바로 끝낸다.
+    연결 닫기 · 설정 저장은 그 전에 끝나 있다 (aboutToQuit → session.close, 설정은 바꿀 때마다 저장)"""
+    try:
+        code = int(code or 0)
+    except (TypeError, ValueError):
+        code = 1
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.flush()
+        except Exception:
+            pass
+    osenv.run_exit_handlers()
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.flush()
+        except Exception:
+            pass
+    os._exit(code)
+
+
 if __name__ == '__main__':
-    sys.exit(main())
+    finish_process(main())

@@ -504,9 +504,8 @@ class IdleWatcher(QObject):
         self.poll_timer = QTimer(self)
         self.poll_timer.setInterval(self.POLL_MS)
         self.poll_timer.timeout.connect(self.poll)
-        app = QApplication.instance()
-        if app is not None:
-            app.installEventFilter(self)
+        from client.kakao.widgets import add_app_event_filter
+        add_app_event_filter(QApplication.instance(), self, self.INPUT_EVENTS)   # 앱 전체 필터 하나로 (AppEventHub)
         self.timer.start()
         self.poll_timer.start()
 
@@ -757,10 +756,20 @@ class MainWindow(QMainWindow):
         self._tab_timer.setSingleShot(True)
         self._tab_timer.timeout.connect(self._build_next_tab)
         self._tab_timer.start(self.TAB_BUILD_DELAY_MS)
+        # 통화 · 음성 메시지 모듈(numpy · QtMultimedia)은 처음 쓸 때 불러오면 느린 PC 에서 통화 창이 1초 넘게 늦게 떴다 →
+        # 첫 화면이 뜨고 한가해지면 미리 불러 둔다 (numpy 는 다른 스레드에서)
+        self._numpy_ready = None
+        self._prewarm_timer = QTimer(self)
+        self._prewarm_timer.setSingleShot(True)
+        self._prewarm_timer.timeout.connect(self._prewarm_call_modules)
+        self._prewarm_timer.start(self.PREWARM_DELAY_MS)
 
         # 상태 시그널
         state.room_opened.connect(self.open_room)
-        state.rooms_changed.connect(self.refresh_unread)
+        # 안 읽은 수 합계(방 수백 개)는 몰려오는 변경을 묶어서 (새 메시지 · 읽음마다 두 번씩 다시 셌다)
+        from client.kakao.chats_tab import _BurstRelay
+        self._unread_relay = _BurstRelay(self.refresh_unread, self)
+        state.rooms_changed.connect(self._unread_relay.fire)
         state.room_removed.connect(self._close_room_window)
         state.connection_lost.connect(self._on_connection_lost)
         state.welcomed.connect(self._on_welcomed)
@@ -922,6 +931,31 @@ class MainWindow(QMainWindow):
         if self.isVisible():
             QTimer.singleShot(0, self.update_minimum_size)
         return tab
+
+    PREWARM_DELAY_MS = 3000
+
+    def _prewarm_call_modules(self):
+        import sys
+        if 'client.kakao.call' in sys.modules:
+            return
+        if 'numpy' not in sys.modules and self._numpy_ready is None:
+            import threading
+            self._numpy_ready = False
+
+            def load():
+                try:
+                    import numpy  # noqa: F401
+                except Exception:          # numpy 가 없어도 통화는 numpy 없이 동작한다
+                    pass
+                self._numpy_ready = True
+            threading.Thread(target=load, name='kcs-prewarm', daemon=True).start()
+        if self._numpy_ready is False:     # 아직 불러오는 중 - 끝나면 이어서
+            self._prewarm_timer.start(300)
+            return
+        try:
+            import client.kakao.call  # noqa: F401
+        except Exception:
+            pass
 
     def _build_next_tab(self):
         """아직 만들지 않은 탭을 하나 만들고, 남았으면 다음 이벤트에 또"""

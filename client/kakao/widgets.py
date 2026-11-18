@@ -418,12 +418,56 @@ class FocusVisibleFilter(QObject):
         return False
 
 
+class AppEventHub(QObject):
+    """앱 전체 이벤트 필터는 이것 하나만 설치하고, 이벤트 종류별로 필요한 필터만 부른다.
+    필터마다 app.installEventFilter 를 하면 모든 위젯의 모든 이벤트마다 파이썬 함수가 필터 수만큼 불린다
+    (큰 방에 메시지가 몰리면 메시지 한 건에 이벤트 1,200개 × 필터 5개 - 1,000건에 1초 넘게 필터만 돌았다)"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._filters = []          # [(필터, 이벤트 종류들)]
+        self._types = frozenset()
+
+    def add(self, flt, types):
+        if any(f is flt for f, _t in self._filters):
+            return
+        self._filters.append((flt, frozenset(types)))
+        self._types = frozenset().union(*(t for _f, t in self._filters))
+        if isinstance(flt, QObject):
+            flt.destroyed.connect(lambda _obj=None, flt=flt: self.remove(flt))
+
+    def remove(self, flt):
+        self._filters = [(f, t) for f, t in self._filters if f is not flt]
+        self._types = frozenset().union(*(t for _f, t in self._filters)) if self._filters else frozenset()
+
+    def eventFilter(self, obj, event):
+        kind = event.type()
+        if kind not in self._types:
+            return False
+        for flt, types in list(self._filters):
+            if kind in types and flt.eventFilter(obj, event):
+                return True
+        return False
+
+
+def add_app_event_filter(app, flt, types):
+    """flt.eventFilter(obj, event) 를 types(QEvent 종류) 이벤트에만 부른다 - 앱 전체 필터 하나(AppEventHub)로"""
+    if app is None:
+        return None
+    hub = getattr(app, '_event_hub', None)
+    if hub is None:
+        hub = app._event_hub = AppEventHub(app)
+        app.installEventFilter(hub)
+    hub.add(flt, types)
+    return hub
+
+
 def install_focus_visible(app):
     """앱 전체에 한 번만 설치 (다시 불러도 그대로)"""
     if app is None or getattr(app, '_focus_visible_filter', None) is not None:
         return
     app._focus_visible_filter = FocusVisibleFilter(app)
-    app.installEventFilter(app._focus_visible_filter)
+    add_app_event_filter(app, app._focus_visible_filter, (QEvent.FocusIn, QEvent.FocusOut))
 
 
 # ---------------------------------------------------------------- 받은 글자는 서식으로 해석하지 않는다
@@ -451,7 +495,7 @@ def install_text_guard(app):
     if app is None or getattr(app, '_text_guard', None) is not None:
         return
     app._text_guard = TextGuard(app)
-    app.installEventFilter(app._text_guard)
+    add_app_event_filter(app, app._text_guard, (QEvent.Polish,))
 
 
 # ---------------------------------------------------------------- 메모리 정리(GC)는 화면 스레드에서만
@@ -752,7 +796,7 @@ def install_input_controls(app):
     if app is None or getattr(app, '_combo_delegate_filter', None) is not None:
         return
     app._combo_delegate_filter = ComboDelegateFilter(app)
-    app.installEventFilter(app._combo_delegate_filter)
+    add_app_event_filter(app, app._combo_delegate_filter, (QEvent.Wheel, QEvent.Polish, QEvent.Show))
 
 
 class DialogTitleBarFilter(QObject):
@@ -829,7 +873,7 @@ def install_dialog_title_bars(app):
         return
     if getattr(app, '_dialog_title_filter', None) is None:
         app._dialog_title_filter = DialogTitleBarFilter(app)
-        app.installEventFilter(app._dialog_title_filter)
+        add_app_event_filter(app, app._dialog_title_filter, (QEvent.Show,))
     for w in app.topLevelWidgets():
         if w.isVisible() and wants_matched_title_bar(w):
             match_dialog_title_bar(w)

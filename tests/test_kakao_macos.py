@@ -215,7 +215,7 @@ class ChatRoomWindowTitleBarTests(unittest.TestCase):
                 "state, _c = make_demo_state()\n"
                 "from client.kakao.chat_room import ChatRoomWindow\n"
                 "a = app(); avail = a.primaryScreen().availableGeometry()\n"
-                "x, y = avail.right() - 520, avail.top() + 60\n"
+                "x, y = avail.right() - 520, avail.top() + avail.height() // 4\n"
                 "r = ChatRoomWindow(state, sorted(state.rooms)[0]); r.move(x, y); r.show()\n"
                 "end = time.time() + 0.6\n"
                 "while time.time() < end: a.processEvents(); time.sleep(0.01)\n"
@@ -227,7 +227,10 @@ class ChatRoomWindowTitleBarTests(unittest.TestCase):
         if result.returncode != 0 or not result.stdout.strip():
             self.skipTest(f'GUI 세션이 없어 cocoa 창을 띄울 수 없음: {result.stderr.strip()[-80:]}')
         want_x, want_y, got_x, got_y = map(int, result.stdout.split())
-        self.assertEqual((got_x, got_y), (want_x, want_y))
+        # 고친 버그는 '모니터 왼쪽 끝으로 옮겨짐' → 가로 위치는 그대로여야 한다. 세로는 화면이 작은 가상 화면(CI 러너)에서
+        # macOS 가 창을 메뉴 막대 · 보이는 영역 안으로 조금 밀어 내리기도 해서(러너에서 +60px) 그만큼은 허용한다
+        self.assertEqual(got_x, want_x)
+        self.assertLessEqual(abs(got_y - want_y), 80, (want_y, got_y))
 
 
 class DialogTitleBarTests(unittest.TestCase):

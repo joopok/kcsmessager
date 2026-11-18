@@ -567,4 +567,9 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    code = main()
+    if sys.argv[1:2] == ['native-part']:
+        # 실제 화면을 띄운 묶음: 앱과 같이 파이썬 마무리 정리를 거치지 않고 끝낸다 (Qt 객체가 남은 채 정리되다 가끔 Bus error)
+        from client.kakao.app import finish_process
+        finish_process(code)
+    sys.exit(code)

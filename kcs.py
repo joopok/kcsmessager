@@ -37,8 +37,8 @@ DEPENDENCIES = [
 
 
 def run_client(args):
-    from client.kakao.app import main
-    return main(args)
+    from client.kakao.app import main, finish_process
+    return finish_process(main(args))       # 파이썬 마무리 정리 없이 끝낸다 (끝날 때 가끔 Bus error - app.finish_process)
 
 
 def run_server(args):

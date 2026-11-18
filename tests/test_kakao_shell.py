@@ -1296,6 +1296,7 @@ class UnreadBlinkTests(ShellTestBase):
         for rid, room in self.state.rooms.items():
             room['unread_count'] = counts.get(rid, 0)
         self.state.rooms_changed.emit()
+        win._unread_relay.flush()               # 몰려오는 변경은 묶어서 센다 - 여기서는 바로
 
     def test_blinks_while_unread_and_stops_when_read(self):
         win = self.make_window()

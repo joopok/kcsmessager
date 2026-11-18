@@ -2551,6 +2551,11 @@ class ChatRoomWindow(QWidget):
         if created is not None and room_id in created:
             created.discard(room_id)
             self.set_members_strip(True)    # 방금 만든 방: 누가 들어왔는지 펼쳐서 바로 보이게
+        self._pending_new = []               # 몰려와 모아 둔 새 메시지 (_on_message_added)
+        self._append_timer = QTimer(self)
+        self._append_timer.setSingleShot(True)
+        self._append_timer.setInterval(self.APPEND_COALESCE_MS)
+        self._append_timer.timeout.connect(self._flush_new_step)
         self._render_timer = QTimer(self)    # 나눠 그리는 말풍선 (_rebuild)
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._continue_render)
@@ -3473,10 +3478,16 @@ class ChatRoomWindow(QWidget):
         self._apply_runs()
         if more_later:
             self._render_timer.start(self.RENDER_GAP_MS)
+        else:
+            self._render_timer.stop()            # 다 그렸다 (한 번에 그린 경우 남은 이어 그리기는 없다)
 
     def _continue_render(self):
         if len(self._order) < min(self._render_count, len(self.state.timeline_messages(self.room_id))):
             self._rebuild()
+
+    def rendering(self):
+        """아직 나눠 그리는 중인가 (그리지 않은 말풍선이 남아 다음 이벤트에 이어 그린다)"""
+        return self._render_timer.isActive()
 
     def finish_rendering(self):
         """나눠 그리는 중인 말풍선을 지금 다 그린다 (테스트 · 메시지 찾아가기)"""
@@ -3779,24 +3790,70 @@ class ChatRoomWindow(QWidget):
             return
         self._anchor = None
 
+    APPEND_COALESCE_MS = 30     # 새 메시지가 몰릴 때: 첫 건은 바로, 이 시간 안에 이어 온 것은 끝에 한 번에 붙인다
+
     def _on_message_added(self, rid, m):
+        """새 메시지. 큰 방에 메시지가 쏟아지면 건마다 말풍선을 붙이고 목록을 다시 배치해 화면이 끊겼다 →
+        첫 건은 바로, 이어서 APPEND_COALESCE_MS 안에 온 것은 모아서 한 번에 (배치 계산 한 번)"""
         if rid != self.room_id:
             return
         if m.get('thread_root') is not None:   # 스레드 답글은 원글의 '답글 N개'로만 (§10.4)
             self._maybe_mark_read()
             return
-        mine = m.get('sender') == self.state.me
+        if self._append_timer.isActive():
+            self._pending_new.append(m)
+            return
+        self._add_new([m])
+        self._append_timer.start(self.APPEND_COALESCE_MS)
+
+    APPEND_STEP = 6             # 모아 둔 새 메시지를 이벤트 한 번에 붙이는 수 (나머지는 바로 다음 이벤트에)
+
+    def flush_new_messages(self, all_at_once=True):
+        """모아 둔 새 메시지를 붙인다. 타이머에서는 APPEND_STEP 개씩 (한 번에 수십 개를 붙이면 그동안 입력이 막힌다),
+        아주 많이 쌓였으면 맨 아래 한 쪽만 다시 그린다. all_at_once=True(테스트 · 직접 부를 때)는 남김없이"""
+        pending = self._pending_new
+        if not pending:
+            self._append_timer.stop()
+            return
+        if all_at_once or len(pending) > self.RENDER_MAX:
+            self._pending_new = []
+            self._add_new(pending)
+            self._append_timer.start(self.APPEND_COALESCE_MS)
+            return
+        batch, self._pending_new = pending[:self.APPEND_STEP], pending[self.APPEND_STEP:]
+        self._add_new(batch)
+        # 남았으면 바로 다음 이벤트에 이어서, 다 붙였으면 이어 오는 메시지를 다시 이 간격으로 모은다
+        self._append_timer.start(self.RENDER_GAP_MS if self._pending_new else self.APPEND_COALESCE_MS)
+
+    def _flush_new_step(self):
+        self.flush_new_messages(all_at_once=False)
+
+    def _add_new(self, msgs):
+        msgs = [m for m in msgs if m['msg_id'] not in self.rows]     # 그 사이 다시 그리며 이미 붙은 것은 빼고
+        if not msgs:
+            return
+        mine = any(m.get('sender') == self.state.me for m in msgs)
         follow = self._stick_bottom or self._near_bottom() or mine
-        if self._order and m['msg_id'] > self._order[-1]['msg_id']:
-            self._append(m)
-        elif not self._insert_before_failed(m):
+        if len(msgs) > self.RENDER_MAX:           # 한꺼번에 아주 많이: 맨 아래 한 쪽만 다시 그린다 (나머지는 위로 올리면)
+            self._render_count = RENDER_PAGE
+            self._order = []                      # 처음 열 때처럼 맨 아래부터 나눠 그린다 (지난 행은 _rebuild 가 정리)
             self._rebuild()
+        else:
+            for m in msgs:
+                if m['msg_id'] in self.rows:
+                    continue
+                if self._order and m['msg_id'] > self._order[-1]['msg_id']:
+                    self._append(m)
+                elif not self._insert_before_failed(m):
+                    self._rebuild()
         if follow:
             self._stick_bottom = True
             self._anchor = None
             QTimer.singleShot(0, self.scroll_to_bottom)
-        elif m.get('kind') != 'system':
-            self._show_new_pill(m)
+        else:
+            shown = [m for m in msgs if m.get('kind') != 'system']
+            if shown:
+                self._show_new_pill(shown[-1])
         self._maybe_mark_read()
 
     def _on_message_updated(self, rid, m):
