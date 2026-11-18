@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 
 from client.kakao import theme
 from client.kakao.state import parse_dt
+from client.kakao.widgets import decode_image
 
 STORY_COLORS = ['#2A386C', '#FF7A59', '#F2B705', '#6DCC7B', '#4CB6F2', '#B184F2', '#F27AB0', '#3C3C3C']
 STORY_TEXT_MAX = 200
@@ -431,7 +432,7 @@ class StoryViewer(QDialog):
         if aid not in self._images:
             cached = self.state.attachments.get(aid)
             if cached:
-                self._images[aid] = QImage.fromData(cached[0])
+                self._images[aid] = decode_image(cached[0]) or QImage()
             else:
                 self._images[aid] = None
                 self.state.request_attachment(aid)
@@ -439,7 +440,7 @@ class StoryViewer(QDialog):
 
     def _on_attachment(self, aid, data, _name, _mime):
         if aid in self._images:
-            self._images[aid] = QImage.fromData(data)
+            self._images[aid] = decode_image(data) or QImage()
             self.card.update()
 
     def progress(self):

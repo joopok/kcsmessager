@@ -50,6 +50,15 @@ class ChatRoomTestBase(unittest.TestCase):
         self.state, self.conn = make_demo_state()
         self.win = ChatRoomWindow(self.state, self.room)
         self.win.confirm = lambda *a: True       # 확인창 자동 승인
+        # 새 메시지는 몰려오면 묶어서 붙인다(APPEND_COALESCE_MS). 여기 테스트는 행 내용을 보므로, 서버 이벤트 사이에
+        # 시간이 흐른 것처럼 메시지마다 묶음을 비운다 (묶기 자체는 test_kakao_review_1118.MessageBurstTests)
+        push = self.conn.push
+
+        def push_and_flush(msg_type, **payload):
+            push(msg_type, **payload)
+            if msg_type == 'msg_new':
+                self.win.flush_new_messages()
+        self.conn.push = push_and_flush
         self.win.resize(420, 720)
         self.win.show()
         self.win.activateWindow()
@@ -266,6 +275,7 @@ class LiveUpdateTests(ChatRoomTestBase):
         self.conn.push('read_update', room_id='r1', username='홍길동', last_read_msg_id=11)
         self.assertEqual(row11.unread_label.text(), '1')
         self.conn.push('read_update', room_id='r1', username='이영희', last_read_msg_id=30)
+        self.win.flush_read_refresh()          # 몰려오는 읽음은 50ms 안에 묶어 한 번에 그린다
         self.assertTrue(row11.unread_label.isHidden())
 
     def test_new_message_marks_read_when_active(self):
@@ -1168,7 +1178,7 @@ class BoardTests(ChatRoomTestBase):
     def test_board_card_opens_post_and_menu(self):
         self.conn.push('msg_new', message=new_message(90, '김철수', '자료 모음', kind='board', post_id=2))
         card = self.win.rows[90].card
-        self.assertIn('📌 자료 모음', card.title.text())
+        self.assertEqual(card.title.text(), '자료 모음')   # 머리에 게시판 아이콘이 있어 제목에 이모지를 붙이지 않는다
         opened = []
         self.win.open_board = lambda post_id=None: opened.append(post_id)
         card.clicked.emit()

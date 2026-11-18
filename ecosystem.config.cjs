@@ -2,8 +2,11 @@
  * pm2 ecosystem — KCS Talk 채팅 서버 (.230 메인 서버).
  *
  * [2026-10-14] 이 서버를 KCS Talk 메인 서버로 운영. 설치형 클라이언트(Windows·macOS·Linux)가
- *   이 주소:9550 으로 접속한다. 프로토콜은 raw TCP NDJSON 이라 nginx(HTTP) 를 거치지 않고
- *   포트를 직접 노출한다 — 외부 개방 범위는 UFW 가 결정한다.
+ *   talk.kcins.co.kr:9550 으로 접속한다. 프로토콜은 TCP 위의 NDJSON 이라 nginx 의 http 가 아니라 stream 모듈이
+ *   9550 에서 TLS 를 종단해 이 프로세스(loopback 9551)로 넘긴다. 이 프로세스의 포트는 외부에 열지 않는다
+ *   (외부 개방 범위는 UFW 가 결정한다).
+ *   클라이언트는 서버 주소가 이 PC 가 아니면 따로 정하지 않아도 TLS 로 접속한다 (2026-11-17, 명세 §4.4).
+ *   평문으로 이 서버에 직접 붙는 설정은 없다.
  *
  *   네트워크 배치: 클라이언트 ─TLS─▶ talk.kcins.co.kr:9550 (nginx stream) ─PROXY v1─▶ 127.0.0.1:9551 (이 프로세스)
  *

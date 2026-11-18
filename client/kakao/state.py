@@ -7,12 +7,14 @@ UI는 소켓을 직접 다루지 않고 이 클래스의 액션 메서드만 호
 """
 
 import base64
+import bisect
 import mimetypes
 import os
 import re
+from collections import OrderedDict
 from datetime import datetime, date, timedelta
 
-from PyQt5.QtCore import QObject, pyqtSignal
+from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 
 MAX_ATTACHMENT = 10 * 1024 * 1024
 MAX_VOICE_SECONDS = 300   # 음성메시지 최대 5분 (명세 §9.3)
@@ -84,6 +86,22 @@ def parse_dt(value):
     return dt
 
 
+def sniff_image_mime(data):
+    """내용 앞부분으로 본 사진 형식 → 'image/png' 등. 채팅 화면이 사진으로 보여 주는 형식이 아니면 ''"""
+    head = bytes(data[:16])
+    if head.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'image/png'
+    if head.startswith(b'\xff\xd8\xff'):
+        return 'image/jpeg'
+    if head.startswith((b'GIF87a', b'GIF89a')):
+        return 'image/gif'
+    if head.startswith(b'BM'):
+        return 'image/bmp'
+    if head.startswith(b'RIFF') and head[8:12] == b'WEBP':
+        return 'image/webp'
+    return ''
+
+
 def _csv_safe(text):
     """엑셀이 수식으로 실행하지 않도록 = + - @ 로 시작하는 칸 앞에 ' 를 붙인다 (CSV 수식 주입 방지)"""
     text = text or ''
@@ -95,11 +113,51 @@ def birthday_md(value):
     return value[-5:] if isinstance(value, str) and len(value) in (5, 10) else None
 
 
+ATTACHMENT_CACHE_BYTES = 200 * 1024 * 1024
+
+
+class AttachmentCache(OrderedDict):
+    """받은 첨부 (attachment_id → (bytes, name, mime)). 전체 크기가 limit 을 넘으면 가장 오래 안 쓴 것부터 버린다.
+    버린 첨부는 다시 필요할 때 서버에서 받는다 (화면에 떠 있는 사진 · 프로필 사진은 자기 바이트를 따로 들고 있다).
+    방금 넣은 것은 limit 보다 커도 남긴다"""
+
+    def __init__(self, limit=ATTACHMENT_CACHE_BYTES):
+        super().__init__()
+        self.limit = limit
+        self.size = 0
+
+    def __setitem__(self, key, value):
+        if key in self:
+            del self[key]
+        super().__setitem__(key, value)
+        self.size += len(value[0])
+        while self.size > self.limit and len(self) > 1:
+            del self[next(iter(self))]
+
+    def __delitem__(self, key):
+        self.size -= len(super().__getitem__(key)[0])
+        super().__delitem__(key)
+
+    def get(self, key, default=None):
+        if key not in self:
+            return default
+        self.move_to_end(key)       # 방금 쓴 것은 나중에 버린다
+        return super().__getitem__(key)
+
+    def clear(self):
+        super().clear()
+        self.size = 0
+
+
 class AppState(QObject):
     welcomed = pyqtSignal()
-    login_failed = pyqtSignal(str)             # join 거절(아이디/비밀번호 오류 등) 사유
+    login_failed = pyqtSignal(str)             # join 거절(아이디/비밀번호 오류 등) 사유 - 구분 코드는 login_error 에
+    session_expired = pyqtSignal(str)          # 비밀번호가 바뀌어 이 접속이 끝남 → 로그인 창으로 (다시 붙지 않는다)
+    password_changed = pyqtSignal(dict)        # 내 비밀번호 변경 성공 {login_token?}
+    password_change_failed = pyqtSignal(str, str)   # (문구, 구분 코드)
     connection_lost = pyqtSignal(str)
     users_changed = pyqtSignal()
+    presence_changed = pyqtSignal(str)       # 접속 상태만 바뀐 사람 (users_changed 바로 앞에 나간다 - 목록이 그 사람 행만 다시 그리게)
     user_changed = pyqtSignal(str)
     rooms_changed = pyqtSignal()
     room_changed = pyqtSignal(str)
@@ -171,11 +229,17 @@ class AppState(QObject):
         self._history_oldest = {}   # room_id → history 로 받은 가장 오래된 msg_id (이전 대화 더 보기 기준)
         self.events = {}      # event_id -> Event
         self.todos = {}       # todo_id -> Todo
-        self.attachments = {}  # attachment_id -> (bytes, name, mime)
+        self.attachments = AttachmentCache()  # attachment_id -> (bytes, name, mime), 크기 상한이 있다
         self.avatars = {}      # username -> (avatar_id, bytes)
         self.rag_docs = []
         self.org = {}
+        self.policy = {}         # 서버 정책 (welcome.policy) - 예전 서버는 주지 않는다
+        self.login_error = {'code': '', 'retry_after': 0}   # 마지막 join · register 거절의 구분 코드 (예전 서버는 '')
+        self.session_password = None    # 이번 실행에서 바꾼 새 비밀번호 (다시 연결할 때 쓴다, 메모리에만)
+        self._new_password = None
+        self._ended_calls = set()   # 이번 연결에서 끝난 통화 번호 (늦게 온 call_updated 를 버린다)
         self.keyring = None      # 비밀채팅 키 (welcome 후 생성)
+        self.peer_keys = None    # 상대 공개키 기억 (처음 본 키를 믿고, 바뀌면 확인을 거친다)
         self.calls = {}          # call_id -> Call
         self.stories = {}        # story_id -> Story
         self.seen_stories = set()
@@ -195,13 +259,37 @@ class AppState(QObject):
         self.admin_scope = ''   # 대화 저장(zip)이 첨부를 모으는 동안: 만료 첨부마다 오류 알림을 띄우지 않는다
         self._failed_saved_at = -1e9
         self._failed_save_timer = None
-        self.active_rooms = set()  # 현재 창이 열려 화면에 보이는 방(알림 억제용)
+        self.active_rooms = set()  # 지금 보고 있는 방 (창이 앞에 있다 - 알림 억제용)
+        self.open_rooms = set()    # 창이 떠 있는 방 (앞이든 뒤든 - 다시 연결되면 먼저 대화를 받는다)
+        self._refill = []          # 다시 연결된 뒤 차례로 대화를 받을 나머지 방
+        self._refill_timer = QTimer(self)
+        self._refill_timer.timeout.connect(self._refill_next)
         self._pending_direct = set()
         self.created_rooms = set()   # 내가 방금 만든 그룹방 - 처음 열 때 참여자 줄을 펼쳐 보여 준다
         self._pending_groups = []
         if conn is not None:
             conn.event_received.connect(self.handle)
             conn.disconnected.connect(self.connection_lost)
+        self.connection_lost.connect(self._drop_unfinished)
+
+    def _drop_unfinished(self, _reason=''):
+        """연결이 끊기면 받다 만 것은 이어지지 않는다 - 다음 요청에 섞이지 않게 버린다"""
+        self._export_parts.clear()
+        self._refill = []
+        self._refill_timer.stop()
+
+    REFILL_INTERVAL_MS = 300
+
+    def _refill_next(self):
+        """다시 연결된 뒤 기다리던 방 하나의 최근 대화를 받는다 (그사이 창이 열려 이미 받은 방은 건너뛴다)"""
+        while self._refill:
+            rid = self._refill.pop(0)
+            if rid in self.rooms and rid not in self.history_requested:
+                if self._send('history', room_id=rid, limit=50) is not None:
+                    self.history_requested.add(rid)
+                break
+        if not self._refill:
+            self._refill_timer.stop()
 
     # ================= 수신 처리 =================
     def handle(self, msg_type, p):
@@ -221,9 +309,11 @@ class AppState(QObject):
         self.rooms = {r['room_id']: r for r in p.get('rooms', [])}
         self.org = p.get('org') or {}   # {'holding': {...}|None, 'companies': [...], 'groups': [...]}
         self.calls = {c['call_id']: c for c in p.get('calls', [])}
+        self._ended_calls = set()        # 새 연결: 서버가 준 목록이 기준 (서버를 다시 켜면 통화 번호가 처음부터일 수 있다)
         self.blocked = set(p.get('blocked', []))
         self.my_friends = list(p.get('friends', []))
         self.file_policy = dict(p.get('file_policy') or {})
+        self.policy = dict(p.get('policy') or {}) if isinstance(p.get('policy'), dict) else {}
         self._pending_direct.clear()           # 끊기기 전에 기다리던 방 열기는 다시 붙은 뒤에 오지 않는다
         self._pending_groups.clear()
         self._init_keyring()
@@ -240,28 +330,52 @@ class AppState(QObject):
         self._restore_failed()
         if reconnected:
             # 끊긴 사이 온 메시지: 받아 둔 방마다 최근 대화를 다시 받아 합친다 (열린 채팅방은 history_loaded 로 갱신)
+            waiting = []
+            self.history_requested.clear()      # 예전 연결에서 받은 표시는 새 연결에 통하지 않는다
             for rid in list(self._messages):
                 if rid in self.rooms:
                     known = [i for i in self._messages[rid] if isinstance(i, int) and i < FAILED_ID_BASE]
                     if known:   # 최근 50개가 예전 캐시와 이어지지 않으면 이어질 때까지 더 받는다
                         self._gap_fill[rid] = (max(known), self.has_more.get(rid, True))
-                    self._send('history', room_id=rid, limit=50)
+                    if rid in self.open_rooms or rid in self.active_rooms:
+                        if self._send('history', room_id=rid, limit=50) is not None:   # 떠 있는 방은 바로
+                            self.history_requested.add(rid)
+                    else:
+                        waiting.append(rid)
+            # 나머지 방은 한꺼번에 요청하지 않고 최근에 대화가 있던 방부터 하나씩 (방이 많아도 서버 · 화면이 몰리지 않게)
+            waiting.sort(key=lambda r: (self.rooms[r].get('last_message') or {}).get('msg_id') or 0, reverse=True)
+            self._refill = waiting
+            if waiting:
+                self._refill_timer.start(self.REFILL_INTERVAL_MS)
         self.calls_changed.emit()
 
     def _on_user_status_changed(self, p):
         user = self.users.get(p['username'])
         if user is not None:
             user['online'] = p['status'] == 'online'
+            self.presence_changed.emit(p['username'])
             self.user_changed.emit(p['username'])
             self.users_changed.emit()
 
+    PRESENCE_KEYS = ('online', 'presence')
+
     def _on_user_updated(self, p):
         user = p['user']
-        self.users[user['username']] = user
-        self._sync_avatar(user['username'])
-        self.user_changed.emit(user['username'])
+        name = user['username']
+        old = self.users.get(name)
+        self.users[name] = user
+        self._sync_avatar(name)
+        # 접속 · 자리비움만 바뀌었으면(서버는 접속할 때마다 user_status_changed 뒤에 user_updated 도 보낸다)
+        # 목록이 그 사람 행만 다시 그리게 presence_changed 를 먼저 알리고, 채팅방 목록 전체 갱신(rooms_changed)은 건너뛴다.
+        # 예전에는 이 경로로 조직도를 통째로 다시 만들어, 펼친 조직도에서는 접속 한 건에 0.27초씩 화면이 멈췄다
+        presence_only = old is not None and all(
+            old.get(k) == user.get(k) for k in set(old) | set(user) if k not in self.PRESENCE_KEYS)
+        if presence_only:
+            self.presence_changed.emit(name)
+        self.user_changed.emit(name)
         self.users_changed.emit()
-        self.rooms_changed.emit()
+        if not presence_only:
+            self.rooms_changed.emit()
 
     def _on_room_updated(self, p):
         room = p['room']
@@ -368,15 +482,30 @@ class AppState(QObject):
         if room is None:
             return
         pointers = room.setdefault('read_pointers', {})
-        pointers[p['username']] = max(pointers.get(p['username'], 0), p['last_read_msg_id'])
+        old = pointers.get(p['username'], 0)
+        pointers[p['username']] = max(old, p['last_read_msg_id'])
         if p['username'] == self.me:
-            mine = pointers[self.me]
-            loaded = self._messages.get(rid, {})
-            room['unread_count'] = sum(
-                1 for m in loaded.values()
-                if m['msg_id'] > mine and m['sender'] != self.me and m['kind'] != 'system')
+            count = p.get('unread_count')
+            if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+                room['unread_count'] = count        # 서버가 센 값 (다른 기기에서 일부만 읽은 경우도 맞는다)
+            else:                                   # 예전 서버: 받아 둔 메시지로 센다
+                mine = pointers[self.me]
+                loaded = self._messages.get(rid, {})
+                room['unread_count'] = sum(
+                    1 for m in loaded.values()
+                    if m['msg_id'] > mine and m['sender'] != self.me and m['kind'] != 'system')
             self.rooms_changed.emit()
-        self.read_changed.emit(rid)
+        # 이 사람의 읽은 위치가 old → new 로 옮겨졌다: 채팅방은 그 사이 메시지의 읽음 숫자만 다시 센다 (read_span)
+        self._read_span = (rid, old, pointers[p['username']])
+        try:
+            self.read_changed.emit(rid)
+        finally:
+            self._read_span = None
+
+    def read_span(self, room_id):
+        """read_changed 를 처리하는 동안: 읽음 숫자가 바뀐 메시지 범위 (lo, hi] - lo < msg_id <= hi. 모르면 None (전부)"""
+        span = getattr(self, '_read_span', None)
+        return span[1:] if span is not None and span[0] == room_id else None
 
     def _on_search_result(self, p):
         self.search_results.emit(p.get('query', ''), p.get('messages', []))
@@ -588,8 +717,22 @@ class AppState(QObject):
             # 방 열기가 거절되면 기다리던 표시를 지운다 - 남아 있으면 나중에 관계없는 room_updated 가 창을 띄웠다
             self._pending_direct.clear()
             self._pending_groups.clear()
+        code = p.get('code') if isinstance(p.get('code'), str) else ''
+        if code == 'session_expired':          # 비밀번호가 바뀌었다 (다른 기기 · 재설정 · 관리자) - 서버가 곧 연결을 끊는다
+            self.login_error = {'code': code, 'retry_after': 0}
+            self.session_expired.emit(p.get('message') or '비밀번호가 바뀌어 다시 로그인해야 합니다.')
+            return
         if p.get('req_type') in ('join', 'register'):
+            try:
+                retry_after = max(0, int(p.get('retry_after') or 0))
+            except (TypeError, ValueError):
+                retry_after = 0
+            self.login_error = {'code': code, 'retry_after': retry_after}
             self.login_failed.emit(p.get('message', '로그인할 수 없습니다.'))
+            return
+        if p.get('req_type') == 'password_change':
+            self._new_password = None
+            self.password_change_failed.emit(p.get('message', '비밀번호를 바꾸지 못했습니다.'), code)
             return
         if p.get('req_type') == 'attachment_get':
             quiet = self.quiet_attachment_errors   # 먼저 읽는다: 신호를 받은 저장 작업이 마지막 첨부면 바로 끝내며 끈다
@@ -597,6 +740,33 @@ class AppState(QObject):
             if quiet:
                 return
         self.error.emit(p.get('message', '알 수 없는 오류'))
+
+    # ================= 서버 정책 · 내 비밀번호 =================
+    def email_editable(self):
+        """프로필에서 이메일을 직접 바꿀 수 있는가 (서버가 막았을 때만 False - 예전 서버는 정책이 없어 True)"""
+        return self.policy.get('email_editable') is not False
+
+    def display_name_editable(self):
+        """표시 이름을 직접 바꿀 수 있는가 (실명으로 고정한 서버만 False - 예전 서버는 정책이 없어 True)"""
+        return self.policy.get('display_name_editable') is not False
+
+    def change_password(self, old_password, new_password, remember=False):
+        """내 비밀번호 변경 요청 → password_changed 또는 password_change_failed. 요청을 보냈으면 True"""
+        payload = {'old_password': old_password, 'new_password': new_password}
+        if remember:
+            payload['remember'] = True          # 저장된 로그인이 있으면 새 자동 로그인 토큰을 받는다
+        if self._send('password_change', **payload) is None:
+            return False
+        self._new_password = new_password
+        return True
+
+    def _on_password_changed(self, p):
+        if p.get('login_token'):
+            self.login_token = p['login_token']
+        if self._new_password:
+            self.session_password = self._new_password
+        self._new_password = None
+        self.password_changed.emit(dict(p))
 
     # ================= 조회 =================
     def user(self, username):
@@ -815,8 +985,21 @@ class AppState(QObject):
         room = self.rooms.get(room_id)
         if room is None:
             return 0
+        # 읽은 위치를 정렬해 두고 이진 탐색: 300명 방에서 행마다 300명을 훑으면 읽음 한 건에 수십 ms 가 걸렸다
+        return bisect.bisect_left(self._sorted_read_pointers(room_id, room), message['msg_id'])
+
+    def _sorted_read_pointers(self, room_id, room):
+        """구성원들의 읽은 위치(오름차순). 구성원 · 읽은 위치가 그대로면 지난번 목록을 그대로 쓴다"""
+        members = tuple(room.get('members', []))
         pointers = room.get('read_pointers', {})
-        return sum(1 for u in room.get('members', []) if pointers.get(u, 0) < message['msg_id'])
+        key = (members, len(pointers), sum(pointers.values()))
+        cache = self.__dict__.setdefault('_unread_cache', {})
+        hit = cache.get(room_id)
+        if hit is not None and hit[0] is room and hit[1] == key:
+            return hit[2]
+        values = sorted(pointers.get(u, 0) for u in members)
+        cache[room_id] = (room, key, values)
+        return values
 
     def unread_members(self, room_id, message):
         """이 메시지를 아직 읽지 않은 사람 (이름순) - 읽음 숫자를 누르면 보인다 (§10.6)"""
@@ -1111,9 +1294,10 @@ class AppState(QObject):
         if err:
             return err
         name = os.path.basename(path)
-        mime = mimetypes.guess_type(name)[0] or 'application/octet-stream'
-        kind = 'image' if mime.startswith('image/') else 'file'
-        return self._send_attachment(room_id, kind, name, mime, data)
+        # 사진인지는 이름이 아니라 내용으로 본다 (서버 · 받는 쪽 화면과 같은 기준: PNG · JPEG · GIF · BMP · WEBP)
+        photo = sniff_image_mime(data)
+        mime = photo or mimetypes.guess_type(name)[0] or 'application/octet-stream'
+        return self._send_attachment(room_id, 'image' if photo else 'file', name, mime, data)
 
     def _send_attachment(self, room_id, kind, name, mime, data):
         from client.kakao.file_guard import FILE_BLOCKED, precheck
@@ -1400,10 +1584,12 @@ class AppState(QObject):
     # ================= v3: 비밀채팅 (§8.1) =================
     def _init_keyring(self):
         try:
-            from client.kakao.secret import SecretKeyring
+            from client.kakao.secret import SecretKeyring, PeerKeys
             self.keyring = SecretKeyring(self.me)
+            self.peer_keys = PeerKeys(self.me)
         except Exception:
             self.keyring = None
+            self.peer_keys = None
             return
         if self.user(self.me).get('public_key') != self.keyring.public_key_b64:
             self._send('key_publish', public_key_b64=self.keyring.public_key_b64)
@@ -1416,11 +1602,64 @@ class AppState(QObject):
     def _decrypt(self, m):
         if m.get('kind') != 'secret' or m.get('deleted') or 'secret_text' in m:
             return
-        peer = self.secret_peer(m['room_id'])
-        key = self.user(peer).get('public_key') if peer else None
-        text = self.keyring.decrypt(m['room_id'], key, m.get('content', '')) if (self.keyring and key) else None
-        m['secret_text'] = text if text is not None else '🔒 이 기기에서는 읽을 수 없는 비밀 메시지입니다'
+        text = None
+        if self.keyring:
+            for key in self._secret_read_keys(self.secret_peer(m['room_id'])):
+                text = self.keyring.decrypt(m['room_id'], key, m.get('content', ''))
+                if text is not None:
+                    break
+        if text is not None:
+            m['secret_text'] = text
+        elif self.secret_key_changed(m['room_id']):
+            m['secret_text'] = '🔒 상대의 암호 키가 바뀌었습니다. 채팅방 위의 안내에서 확인하면 읽을 수 있습니다'
+        else:
+            m['secret_text'] = '🔒 이 기기에서는 읽을 수 없는 비밀 메시지입니다'
         m['secret_ok'] = text is not None
+
+    def _peer_public_key(self, peer):
+        return self.user(peer).get('public_key') if peer else None
+
+    def _secret_read_keys(self, peer):
+        """받은 비밀 메시지를 풀 때 써 볼 상대 공개키: 지금 믿는 키부터, 예전에 믿었던 키까지.
+        처음 보는 상대의 키는 이때 기억한다. 믿는 키와 다른 새 키는 확인 전에는 쓰지 않는다"""
+        key = self._peer_public_key(peer)
+        if self.peer_keys is None:
+            return [key] if key else []
+        if key and self.peer_keys.status(peer, key) == 'new':
+            self.peer_keys.remember(peer, key)
+        return list(reversed(self.peer_keys.trusted(peer)))
+
+    def secret_key_changed(self, room_id):
+        """상대 공개키가 내가 믿는 키와 달라졌는가 (다른 PC 에서 접속 · 키 재발급, 또는 누군가 키를 바꿔치기)"""
+        peer = self.secret_peer(room_id)
+        key = self._peer_public_key(peer)
+        return bool(key and self.peer_keys is not None and self.peer_keys.status(peer, key) == 'changed')
+
+    def secret_fingerprint(self, room_id):
+        """이 비밀채팅의 확인 번호 (나와 상대의 지금 키로 만든다, 키가 없으면 '')"""
+        key = self._peer_public_key(self.secret_peer(room_id))
+        if not (self.keyring and key):
+            return ''
+        from client.kakao.secret import fingerprint
+        try:
+            return fingerprint(self.keyring.public_key_b64, key)
+        except ValueError:
+            return ''
+
+    def trust_secret_key(self, room_id):
+        """사용자가 확인함: 상대의 새 키를 믿는다. 그 키로 와 있던 메시지를 다시 푼다"""
+        peer = self.secret_peer(room_id)
+        key = self._peer_public_key(peer)
+        if not (key and self.peer_keys is not None):
+            return
+        self.peer_keys.remember(peer, key)
+        for m in (self._messages.get(room_id) or {}).values():
+            if m.get('kind') == 'secret' and not m.get('secret_ok') and not m.get('deleted'):
+                m.pop('secret_text', None)
+                self._decrypt(m)
+                self.message_updated.emit(room_id, m)
+        self.room_changed.emit(room_id)
+        self.rooms_changed.emit()
 
     def open_secret(self, username):
         for room in self.rooms.values():
@@ -1436,9 +1675,14 @@ class AppState(QObject):
         if not text:
             return None
         peer = self.secret_peer(room_id)
-        key = self.user(peer).get('public_key') if peer else None
+        key = self._peer_public_key(peer)
         if not (self.keyring and key):
             return '상대방이 아직 비밀채팅을 사용할 수 없습니다.'
+        if self.peer_keys is not None:
+            if self.peer_keys.status(peer, key) == 'new':
+                self.peer_keys.remember(peer, key)
+            elif self.secret_key_changed(room_id):
+                return '상대의 암호 키가 바뀌었습니다. 채팅방 위의 안내에서 확인한 뒤 보내 주세요.'
         if self._send('send', room_id=room_id, kind='secret', content=self.keyring.encrypt(room_id, key, text)) is None:
             return '서버 연결이 끊겨 비밀 메시지를 보내지 못했습니다. 연결된 뒤 다시 보내 주세요.'
         return None
@@ -1446,10 +1690,13 @@ class AppState(QObject):
     # ================= v3: 통화 (§8.2) =================
     def _on_call_updated(self, p):
         call = p['call']
+        if call['call_id'] in self._ended_calls:
+            return          # 끝난 통화의 예전 상태가 늦게 도착함 - 받아들이면 끝난 통화가 진행 중으로 되살아난다
         self.calls[call['call_id']] = call
         self.calls_changed.emit()
 
     def _on_call_ended(self, p):
+        self._ended_calls.add(p.get('call_id'))
         self.calls.pop(p.get('call_id'), None)
         self.calls_changed.emit()
         self.call_ended.emit(dict(p))
@@ -1741,6 +1988,7 @@ class AppState(QObject):
             extra['since'] = since.isoformat()
         if until is not None:
             extra['until'] = until.isoformat()
+        self._export_parts.pop(room_id, None)      # 앞선 내보내기가 끝나지 않고 남긴 조각
         self._send('room_export', room_id=room_id, **extra)
 
     def _on_room_export(self, p):
@@ -1816,9 +2064,9 @@ class AppState(QObject):
             sender = '' if kind == 'system' else self.member_name(room_id, m.get('sender'))
             body = m.get('content', '') if kind == 'system' else self.export_body(room_id, m)
             attachment = (m.get('attachment') or {}).get('name', '') if not m.get('deleted') else ''
-            writer.writerow([ts.strftime('%Y-%m-%d'), ts.strftime('%H:%M:%S'), sender,
+            writer.writerow([ts.strftime('%Y-%m-%d'), ts.strftime('%H:%M:%S'), _csv_safe(sender),
                              self.EXPORT_KIND_NAMES.get(kind, kind), _csv_safe(body),
-                             files.get(m.get('msg_id'), attachment)])
+                             _csv_safe(files.get(m.get('msg_id'), attachment))])
         return '\ufeff' + out.getvalue()
 
     def org_text(self, username, sep=' · '):

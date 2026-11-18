@@ -124,6 +124,7 @@ def claude_summary(client, messages, name_of):
         max_tokens=2000,
         system=SYSTEM_PROMPT,
         messages=[{'role': 'user', 'content': f'<chat>\n{transcript}\n</chat>\n\n위 대화를 요약해 주세요.'}],
+        timeout=60.0,
     )
     if response.stop_reason == 'refusal':
         raise RuntimeError('refusal')

@@ -1,0 +1,172 @@
+# -*- coding: utf-8 -*-
+"""무거운 조회는 읽기 전용 두 번째 연결에서 (명세 §5, 2026-11-17): 검색 한 번이 다른 요청을 세우지 않는다"""
+
+import os
+import shutil
+import sqlite3
+import tempfile
+import threading
+import time
+import unittest
+
+from server.kakao.store import Store
+
+
+class ReadConnectionTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix='kcs_read_')
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.store = Store(os.path.join(self.dir, 'kakao.db'))
+        self.addCleanup(self.store.close)
+        for user in ('a', 'b'):
+            self.store.ensure_user(user)
+        self.room = self.store.create_group('a', '방', ['b'])
+
+    def say(self, text, **extra):
+        return self.store.add_message(self.room, 'a', 'text', text, **extra)
+
+    def in_thread(self, func, timeout=3.0):
+        result = []
+        worker = threading.Thread(target=lambda: result.append(func()), daemon=True)
+        worker.start()
+        worker.join(timeout)
+        self.assertFalse(worker.is_alive(), '끝나지 않았습니다 (다른 잠금을 기다리는 중)')
+        return result[0]
+
+    def test_heavy_reads_do_not_take_the_main_lock(self):
+        self.say('회의 일정 공유 https://example.com/a', mentions=['b'])
+        with self.store._lock:                       # 다른 요청이 쓰기용 잠금을 쥐고 있어도
+            found = self.in_thread(lambda: self.store.search('b', '일정', None))
+            links = self.in_thread(lambda: self.store.drawer('b', 'link', 10))
+            mine = self.in_thread(lambda: self.store.mentions_of('b'))
+        self.assertEqual([len(found), len(links), len(mine)], [1, 1, 1])
+
+    def test_a_long_read_does_not_hold_up_writes(self):
+        with self.store._read_lock:                  # 검색이 오래 도는 중이라고 치고
+            started = time.monotonic()
+            self.in_thread(lambda: self.say('검색 중에도 저장된다'))
+            self.in_thread(lambda: self.store.update_read(self.room, 'b', 1))
+            self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_search_rules_are_unchanged(self):
+        for text in ('한글 두 글자', 'Mixed CASE text', '100% 진행_완료', '다른 이야기'):
+            self.say(text)
+        contents = lambda query: [m['content'] for m in self.store.search('b', query, None)]  # noqa: E731
+        self.assertEqual(contents('두 글'), ['한글 두 글자'])
+        self.assertEqual(contents('글자'), ['한글 두 글자'])                     # 한글 2글자
+        self.assertEqual(contents('mixed case'), ['Mixed CASE text'])          # 영문 대소문자 무시
+        self.assertEqual(contents('100%'), ['100% 진행_완료'])                  # % 와 _ 는 글자 그대로
+        self.assertEqual(contents('행_완'), ['100% 진행_완료'])
+        self.assertEqual(contents('없는말'), [])
+        self.assertEqual(contents('이야기'), ['다른 이야기'])
+        self.assertEqual([m['content'] for m in self.store.search('b', '글자', self.room)], ['한글 두 글자'])
+
+    def test_what_was_just_written_is_found_at_once(self):
+        for i in range(50):
+            self.say(f'방금 쓴 글 {i}')
+            self.assertEqual(self.store.search('b', f'쓴 글 {i}', None)[0]['content'], f'방금 쓴 글 {i}')
+        last = self.say('지울 글')
+        self.store.delete_message(last['msg_id'])
+        self.assertEqual(self.store.search('b', '지울 글', None), [])
+
+    def test_login_lists_do_not_take_the_main_lock(self):
+        """로그인(welcome) · 화면을 여는 목록 조회도 읽기 전용 연결에서 (2026-11-18): 로그인이 몰려도 저장이 서지 않는다"""
+        self.say('안녕')
+        with self.store._lock:
+            rooms = self.in_thread(lambda: self.store.rooms_for_user('b'))
+            users = self.in_thread(lambda: self.store.list_users())
+            admin = self.in_thread(lambda: self.store.admin_user_list())
+            events = self.in_thread(lambda: self.store.list_events('b', '2000-01-01T00:00:00', '2100-01-01T00:00:00'))
+            calls = self.in_thread(lambda: self.store.call_history('b', 10))
+        self.assertEqual(rooms[0]['last_message']['content'], '안녕')
+        self.assertEqual({u['username'] for u in users} >= {'a', 'b'}, True)
+        self.assertEqual((len(admin) >= 2, events, calls), (True, [], []))
+
+    def test_reads_run_side_by_side_and_wait_for_a_free_connection(self):
+        self.assertEqual(len(self.store._read_all), Store.READ_CONNECTIONS)
+        self.say('동시에 찾기')
+        held = [self.store._readers.get() for _ in range(Store.READ_CONNECTIONS - 1)]
+        self.assertEqual(len(self.in_thread(lambda: self.store.search('b', '동시에', None))), 1)   # 하나 남은 연결로
+        held.append(self.store._readers.get())                                                   # 모두 쓰는 중이면
+        result = []
+        worker = threading.Thread(target=lambda: result.append(self.store.search('b', '동시에', None)), daemon=True)
+        worker.start()
+        worker.join(0.3)
+        self.assertTrue(worker.is_alive())                                                       # 하나가 돌아올 때까지 기다린다
+        for db in held:
+            self.store._readers.put(db)
+        worker.join(3)
+        self.assertEqual(len(result[0]), 1)
+
+    def test_one_call_sees_one_moment(self):
+        """한 번의 조회 안에서는 같은 시점: 방 목록을 만드는 사이에 읽음 · 새 메시지가 저장돼도 섞이지 않는다"""
+        first = self.say('처음')
+        started, release = threading.Event(), threading.Event()
+        original = self.store._rows_in
+
+        def slow_rows_in(*args, **kwargs):
+            started.set()
+            release.wait(3)
+            return original(*args, **kwargs)
+        self.store._rows_in = slow_rows_in
+        result = []
+        worker = threading.Thread(target=lambda: result.append(self.store.rooms_for_user('b')), daemon=True)
+        worker.start()
+        self.assertTrue(started.wait(3))
+        self.store.update_read(self.room, 'b', first['msg_id'])   # 안 읽은 수를 센 뒤에 b 가 읽었다
+        self.say('그 사이에 저장된 글')
+        release.set()
+        worker.join(3)
+        room = result[0][0]
+        self.assertEqual(room['last_message']['content'], '처음')
+        self.assertEqual((room['unread_count'], room['read_pointers']['b']), (1, 0))   # 둘 다 읽기 전 시점
+
+    def test_screen_queries_use_their_indexes(self):
+        """서랍 · 멘션 모아보기는 그 메시지만 담은 부분 색인을 훑고, 예전 방 색인은 더 넓은 색인으로 바뀐다 (2026-11-18)"""
+        names = {r['name'] for r in self.store._db.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        self.assertTrue({'idx_messages_room_sender', 'idx_messages_drawer_image', 'idx_messages_drawer_file',
+                         'idx_messages_drawer_link', 'idx_messages_mentioned'} <= names)
+        self.assertNotIn('idx_messages_room', names)
+        image = self.store.save_attachment('a.png', 'image/png', b'\x89PNG\r\n\x1a\n' + b'0' * 20, 'a')
+        self.store.add_message(self.room, 'a', 'image', 'a.png', attachment_id=image)
+        self.say('@b 확인 https://example.com', mentions=['b'])
+        self.store.add_message(self.room, 'a', 'file', 'x.pdf')
+        got = {kind: [m['kind'] for m in self.store.drawer('b', kind, 10)] for kind in ('image', 'file', 'link')}
+        self.assertEqual(got, {'image': ['image'], 'file': ['file'], 'link': ['text']})
+        self.assertEqual([m['content'] for m in self.store.mentions_of('b')], ['@b 확인 https://example.com'])
+
+    def test_old_room_index_is_replaced_on_restart(self):
+        path = os.path.join(self.dir, 'kakao.db')
+        self.store.close()
+        raw = sqlite3.connect(path)
+        raw.execute('DROP INDEX IF EXISTS idx_messages_room_sender')
+        raw.execute('CREATE INDEX idx_messages_room ON messages(room_id, msg_id)')    # 예전 서버가 만든 DB
+        raw.commit()
+        raw.close()
+        again = Store(path)
+        self.addCleanup(again.close)
+        names = {r['name'] for r in again._db.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        self.assertIn('idx_messages_room_sender', names)
+        self.assertNotIn('idx_messages_room', names)
+
+    def test_read_connection_cannot_write(self):
+        self.assertIsNotNone(self.store._read_db)
+        with self.assertRaises(sqlite3.OperationalError):
+            self.store._read_db.execute("DELETE FROM messages")
+
+    def test_memory_database_still_works(self):
+        store = Store(':memory:')
+        self.addCleanup(store.close)
+        self.assertIsNone(store._read_db)
+        store.ensure_user('a')
+        room = store.create_group('a', '방', [])
+        store.add_message(room, 'a', 'text', '메모리에서도 검색')
+        self.assertEqual(len(store.search('a', '검색', None)), 1)
+
+    def test_close_and_reopen(self):
+        self.say('다시 열어도 그대로')
+        self.store.close()
+        self.store.close()                           # 두 번 닫아도 된다
+        again = Store(os.path.join(self.dir, 'kakao.db'))
+        self.addCleanup(again.close)
+        self.assertEqual(len(again.search('b', '다시 열어도', None)), 1)

@@ -63,10 +63,10 @@ class BirthDateClientTests(unittest.TestCase):
     def test_birthday_profile_view_shows_birth_date(self):
         self.state.users['최지우']['birthday'] = '1983-12-25'
         dlg = ProfileDialog(self.state, '최지우')
-        self.assertEqual(dlg.birthday_label.text(), '🎂 생년월일 1983년 12월 25일')
+        self.assertEqual(dlg.birthday_label.text(), '생년월일 1983년 12월 25일')
         self.state.users['최지우']['birthday'] = '12-25'
         dlg2 = ProfileDialog(self.state, '최지우')
-        self.assertEqual(dlg2.birthday_label.text(), '🎂 생일 12월 25일')
+        self.assertEqual(dlg2.birthday_label.text(), '생일 12월 25일')
 
     def test_birthday_profile_edit_sends_birth_date(self):
         dlg = ProfileEditDialog(self.state)

@@ -164,6 +164,8 @@ class CallWindowBase(unittest.TestCase):
     def open(self, call_id):
         w = show_call(self.state, call_id)
         self.windows.append(w)
+        self.assertFalse(w._devices_started)       # 장치는 창을 먼저 그린 뒤에 연다 (DEVICE_START_DELAY_MS)
+        w._start_devices_once()                    # 여기서는 바로 열어 예전과 같은 상태에서 시험한다
         self.conn.sent.clear()
         return w
 

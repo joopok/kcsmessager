@@ -13,10 +13,10 @@ from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel, QMenu, Q
                              QMessageBox, QFrame, QGridLayout, QAbstractButton, QScrollArea, QApplication)
 
 from client.kakao import theme
-from client.kakao.widgets import Avatar, make_icon
+from client.kakao.widgets import Avatar, make_icon, ContentScrollArea, fit_dialog_to_screen, exec_and_release
 from client.kakao.chats_tab import (ElidedLabel, StatusPill, RowList, TabHeader, CreateGroupDialog,
                                     make_search_edit, search_box_qss, user_pixmap, InviteToRoomDialog, presence_of,
-                                    set_presence, foreign_company, CompanyChip, connect_avatar_changed,
+                                    set_presence, foreign_company, CompanyChip, connect_avatar_changed, connect_users_changed, RefreshWhenVisible,
                                     presence_dot_pixmap, PRESENCE_CHOICES, PRESENCE_LABELS,
                                     PRESENCE_COLORS)
 
@@ -298,13 +298,13 @@ class StoryBar(QWidget):
     def open_story(self, username):
         from client.kakao.story import StoryViewer
         viewer = StoryViewer(self.state, username, self.window())
-        viewer.exec_()
+        exec_and_release(viewer)
         return viewer
 
     def compose(self):
         from client.kakao.story import StoryComposeDialog
         dlg = StoryComposeDialog(self.state, self.window())
-        dlg.exec_()
+        exec_and_release(dlg)
         return dlg
 
     def apply_theme(self):
@@ -347,8 +347,13 @@ class ProfileEditDialog(QDialog):
         self.setWindowTitle('프로필 편집')
         self.setMinimumWidth(theme.px(400))
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 22, 24, 18)
+        # 본문은 스크롤 영역 안, 오류 문구 · 단추는 밖: 낮은 화면(노트북 · 확대 표시)에서도 [저장]이 화면 안에 남는다
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(24, 22, 24, 8)
         layout.setSpacing(12)
 
         # 맨 위: 사번 (로그인 아이디 - 보기만, 바꾸려면 관리자)
@@ -395,6 +400,9 @@ class ProfileEditDialog(QDialog):
         form.setVerticalSpacing(10)
         self.name_edit = QLineEdit(me.get('display_name') or state.me)
         self.name_edit.setMaxLength(20)
+        if not state.display_name_editable():      # 이름을 실명으로 고정한 서버: 보기만 한다
+            self.name_edit.setReadOnly(True)
+            self.name_edit.setToolTip('이름은 조직도에 등록된 이름으로 고정되어 바꿀 수 없습니다.')
         self.status_edit = QLineEdit(me.get('status_message') or '')
         self.status_edit.setMaxLength(60)
         self.status_edit.setPlaceholderText('상태메시지를 입력해 주세요')
@@ -422,6 +430,16 @@ class ProfileEditDialog(QDialog):
         self.email_edit.setMaxLength(120)
         form.addRow('전화번호', self.mobile_edit)
         form.addRow('이메일', self.email_edit)
+        # 서버가 이메일 변경을 막았으면(이메일이 로그인 아이디인 운영 서버) 보기만 하고 안내를 붙인다
+        self.email_hint = QLabel('이메일은 로그인 아이디라 직접 바꿀 수 없습니다. 관리자에게 변경을 요청해 주세요.')
+        self.email_hint.setWordWrap(True)
+        self.email_hint.setStyleSheet(f"color: {theme.c('text_hint')}; font-size: {theme.fs('caption')}px;")
+        email_locked = not state.email_editable()
+        self.email_edit.setReadOnly(email_locked)
+        if email_locked:
+            form.addRow('', self.email_hint)
+        else:
+            self.email_hint.hide()
         from client.kakao.deputies import DeputyEditor
         self.deputy_editor = DeputyEditor(state, me.get('deputies') or [])
         form.addRow('대직자', self.deputy_editor)
@@ -430,12 +448,16 @@ class ProfileEditDialog(QDialog):
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {theme.c('text_hint')}; font-size: {theme.fs('caption')}px;")
         layout.addWidget(hint)
+        outer.addWidget(ContentScrollArea(body), 1)
 
+        footer = QVBoxLayout()
+        footer.setContentsMargins(24, 4, 24, 18)
+        footer.setSpacing(12)
         self.error_label = QLabel('')
         self.error_label.setStyleSheet(f"color: {theme.c('danger_text')}; font-size: {theme.fs('meta')}px;")
         self.error_label.setWordWrap(True)
         self.error_label.hide()
-        layout.addWidget(self.error_label)
+        footer.addWidget(self.error_label)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
@@ -445,7 +467,8 @@ class ProfileEditDialog(QDialog):
         self.ok_button.setDefault(True)
         buttons.addWidget(cancel)
         buttons.addWidget(self.ok_button)
-        layout.addLayout(buttons)
+        footer.addLayout(buttons)
+        outer.addLayout(footer)
 
         cancel.clicked.connect(self.reject)
         self.ok_button.clicked.connect(self.accept)
@@ -453,6 +476,7 @@ class ProfileEditDialog(QDialog):
         self.clear_photo_button.clicked.connect(self.clear_photo)
         connect_avatar_changed(state, self._refresh_avatar)
         self._refresh_avatar()
+        fit_dialog_to_screen(self)
         if self.birthday_hint.isVisibleTo(self):
             self.birthday_edit.setFocus()
             QTimer.singleShot(0, self._caret_before_birthday)   # 창이 뜬 뒤 (포커스가 글자를 전체 선택하므로)
@@ -511,6 +535,8 @@ class ProfileEditDialog(QDialog):
         me = self.state.user(self.state.me)
         out = {}
         for key, edit in (('mobile', self.mobile_edit), ('email', self.email_edit)):
+            if edit.isReadOnly():           # 바꿀 수 없는 칸은 보내지 않는다
+                continue
             value = edit.text().strip()
             if value != (me.get(key) or ''):
                 out[key] = value
@@ -687,7 +713,7 @@ class AddFriendDialog(QDialog):
         org = self.state.org_text(user['username'])
         self.card_sub.setText(org or user.get('status_message') or '')
         self.card.show()
-        self._show_message('이미 친구로 등록되어 있어요.' if already else '친구로 추가했어요! 🎉')
+        self._show_message('이미 친구로 등록되어 있어요' if already else '친구로 추가했어요')
 
     def _on_error(self, text):
         if self.isVisible() or self.message.text() == '찾는 중…':
@@ -720,6 +746,7 @@ class ProfileDialog(QDialog):
         layout.addSpacing(6)
 
         name = QLabel(state.display_name(username))
+        name.setTextFormat(Qt.PlainText)
         name.setAlignment(Qt.AlignCenter)
         name.setStyleSheet(f"font-size: {theme.fs('headline')}px; font-weight: bold;")
         layout.addWidget(name)
@@ -738,6 +765,7 @@ class ProfileDialog(QDialog):
         layout.addWidget(info)
 
         status = QLabel(user.get('status_message') or '상태메시지가 없습니다')
+        status.setTextFormat(Qt.PlainText)
         status.setAlignment(Qt.AlignCenter)
         status.setWordWrap(True)
         status.setStyleSheet(f"color: {theme.c('text') if user.get('status_message') else theme.c('text_hint')};"
@@ -746,7 +774,7 @@ class ProfileDialog(QDialog):
 
         self.birthday_label = None
         if user.get('birthday'):
-            bday = self.birthday_label = QLabel(f"🎂 {birthday_text(user['birthday'])}")
+            bday = self.birthday_label = QLabel(birthday_text(user['birthday']))
             bday.setAlignment(Qt.AlignCenter)
             bday.setStyleSheet(f"color: {theme.c('text_sub')}; font-size: {theme.fs('meta')}px;")
             layout.addWidget(bday)
@@ -951,7 +979,7 @@ class FriendRow(QWidget):
             if text:
                 self.sub = ElidedLabel(text, 'meta', 'text_sub')
         elif kind == 'birthday':
-            self.sub = ElidedLabel('🎂 오늘 생일이에요', 'meta', 'text_sub')
+            self.sub = ElidedLabel('오늘 생일이에요', 'meta', 'text_sub')
         if self.sub is not None:
             sub_row.addWidget(self.sub, 1)
         else:
@@ -1008,6 +1036,8 @@ class SectionHeader(QWidget):
         self.chevron = QLabel()
         self.chevron.setPixmap(self._chevron_pixmap())
         row.addWidget(self.chevron)
+        # 화면낭독기: 목록 행 이름 (RowList 가 읽는다) - 접힘 · 펼침 상태까지
+        self.setAccessibleName(f"{title} {count}명, {'접힘' if collapsed else '펼침'}")
 
     def _chevron_pixmap(self):
         from PyQt5.QtGui import QPixmap, QPen
@@ -1033,7 +1063,7 @@ def _pts(points):
 
 
 # ================================================================ 친구 탭
-class FriendsTab(QWidget):
+class FriendsTab(RefreshWhenVisible, QWidget):
     def __init__(self, state, settings, parent=None):
         super().__init__(parent)
         self.state = state
@@ -1102,17 +1132,21 @@ class FriendsTab(QWidget):
         # clicked 는 checked(False)를 넘기므로 감싸서 부른다 (그대로 연결하면 exec_=False 가 되어 창이 안 뜬다)
         self.add_friend_button.clicked.connect(lambda _checked=False: self.show_add_friend())
         if hasattr(state, 'my_friends_changed'):
-            state.my_friends_changed.connect(self.refresh)
+            state.my_friends_changed.connect(self.refresh_when_visible)
         self.search_edit.textChanged.connect(lambda _t: self.refresh())
         self.list.row_activated.connect(self._activate)
         self.list.itemClicked.connect(self._clicked)
         self.list.customContextMenuRequested.connect(self._show_context_menu)
 
-        state.users_changed.connect(self.refresh)
-        state.user_changed.connect(lambda _u: self.refresh())
+        # 바뀐 것은 refresh() 가 행 단위로 맞춘다 (RowList.sync_rows). 다른 탭 뒤에 가려져 있으면 보일 때까지 미룬다
+        self._users_relay = connect_users_changed(state, self.refresh_when_visible)
         settings.changed.connect(self._on_setting)
-        connect_avatar_changed(state, self.refresh)
+        connect_avatar_changed(state, self.refresh_when_visible)
         self.apply_theme()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh_if_stale()
 
     # ---- 데이터 ----
     def _matches(self, user, query):
@@ -1172,36 +1206,59 @@ class FriendsTab(QWidget):
             self.collapsed.add(key)
         self.refresh()
 
-    def refresh(self):
+    def refresh(self, full=False):
+        """목록을 지금 상태에 맞춘다. 달라진 행만 다시 만든다 (한 사람의 접속 상태가 바뀌면 그 사람의 행과 구역 머리글만).
+        full=True: 색 · 글자 크기 · 설정처럼 모든 행의 모양이 바뀔 때 전부 다시 만든다"""
         if not self.state.me:
             return
+        self._stale = False
         friends = self.state.friends()
         online = sum(1 for f in friends if self.state.is_online(f['username']))
         self.header.set_subtitle(f'친구 {len(friends)}명 · 온라인 {online}명')
         scroll = self.list.verticalScrollBar().value()
-        self.list.clear()
+        if full:
+            self.list.clear()
         query = self.search_edit.text().strip()
         self.sections = self.build_sections(query)
+        rows = []
         if not query:
-            self.list.add_row(MyProfileRow(self.state), ('me', self.state.me))
+            rows.append((('me', self.state.me), self._row_signature(self.state.me, 'me'),
+                         lambda: MyProfileRow(self.state), True))
         for key in ('bot', 'team', 'favorites', 'registered', 'birthday', 'online', 'offline'):
             members = self.sections[key]
             if not members and (query or key in ('bot', 'team', 'birthday', 'favorites', 'registered')):
                 continue
             collapsed = key in self.collapsed and not query
-            self.list.add_row(SectionHeader(SECTION_TITLES[key], len(members), collapsed),
-                              ('section', key), selectable=False)
+            rows.append((('section', key), (SECTION_TITLES[key], len(members), collapsed),
+                         lambda k=key, n=len(members), c=collapsed: SectionHeader(SECTION_TITLES[k], n, c), False))
             if collapsed:
                 continue
             kind = {'bot': 'bot', 'birthday': 'birthday', 'team': 'team'}.get(key, 'friend')
             for name in members:
-                self.list.add_row(FriendRow(self.state, name, kind, on_gift=self.send_gift),
-                                  ('friend', name, key))
+                rows.append((('friend', name, key), self._row_signature(name, kind),
+                             lambda n=name, k=kind: self._friend_row(n, k), True))
+        self.list.sync_rows(rows)
         self.list.verticalScrollBar().setValue(scroll)
         # 친구가 아니게 된 사람은 고른 목록에서 뺀다 (검색으로 가려진 사람은 그대로 둔다)
         friends_now = {f['username'] for f in friends}
         self.picked = {n: True for n in self.picked if n in friends_now}
         self._apply_picks()
+
+    def _friend_row(self, name, kind):
+        row = FriendRow(self.state, name, kind, on_gift=self.send_gift)
+        if name in self.picked:              # 스크롤해서 나중에 만든 행도 고른 표시를 그대로
+            row.set_picked(True)
+        return row
+
+    def _row_signature(self, name, kind):
+        """친구 행이 보여 주는 것 전부 (이름 · 상태 · 접속 · 사진 · 소속 · 진행 중인 일정) - 같으면 그 행은 다시 만들지 않는다"""
+        state = self.state
+        avatar = (getattr(state, 'avatars', {}).get(name) or (None,))[0]
+        event = None
+        if kind == 'team' and hasattr(state, 'current_event_of'):
+            current = state.current_event_of(name) or {}
+            event = (current.get('event_id'), current.get('end'))
+        return (kind, repr(state.user(name)), presence_of(state, name), avatar, foreign_company(state, name), event)
 
     # ---- 여러 명 골라 대화방 만들기 (Shift+클릭 · Shift+끌기) ----
     @staticmethod
@@ -1244,7 +1301,7 @@ class FriendsTab(QWidget):
 
     def _apply_picks(self):
         for item in self.list.items():
-            widget = self.list.itemWidget(item)
+            widget = self.list.built_widget(item)        # 아직 안 만든 행은 만들 때 _friend_row 가 표시한다
             if isinstance(widget, FriendRow):
                 widget.set_picked(widget.username in self.picked)
         names = list(self.picked)
@@ -1355,10 +1412,10 @@ class FriendsTab(QWidget):
     # ---- 동작 ----
     def _on_setting(self, key):
         if key == 'favorites':
-            self.refresh()
+            self.refresh(full=True)
         elif key == 'social_features':
             self.story_bar.setVisible(bool(self.settings.get('social_features')))
-            self.refresh()
+            self.refresh(full=True)
 
     def _clicked(self, item):
         data = item.data(Qt.UserRole)
@@ -1377,18 +1434,18 @@ class FriendsTab(QWidget):
         self.state.open_direct(username)
 
     def edit_profile(self):
-        ProfileEditDialog(self.state, self.window()).exec_()
+        exec_and_release(ProfileEditDialog(self.state, self.window()))
 
     def show_profile(self, username):
-        ProfileDialog(self.state, username, self.window()).exec_()
+        exec_and_release(ProfileDialog(self.state, username, self.window()))
 
     def show_create_dialog(self):
-        CreateGroupDialog(self.state, self.window()).exec_()
+        exec_and_release(CreateGroupDialog(self.state, self.window()))
 
     def show_add_friend(self, exec_=True):
         dlg = AddFriendDialog(self.state, self.window())
         if exec_:
-            dlg.exec_()
+            exec_and_release(dlg)
         return dlg
 
     def _add_pick_actions(self, menu, name=None):
@@ -1475,7 +1532,7 @@ class FriendsTab(QWidget):
             + theme.button_qss('pickChat', 'primary', size='meta', pad='6px 12px'))
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet(f"FriendsTab {{ background: {theme.c('bg')}; }}")
-        self.refresh()
+        self.refresh(full=True)      # 색 · 글자 크기가 바뀌었다 → 행을 전부 다시 만든다
 
 
 def _supports_bots(state):

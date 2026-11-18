@@ -316,6 +316,7 @@ class FriendsTabTests(ShellTestBase):
 
     def test_bot_section_on_top(self):
         add_org(self.state, self.conn)
+        self.tab._users_relay.flush()        # 연달아 온 구성원 변경은 묶어서 한 번 더 그린다
         self.assertEqual(self.tab.section_members('bot'), ['AI 비서'])
         data = rows(self.tab.list)
         self.assertEqual(data[1], ('section', 'bot'))
@@ -324,6 +325,7 @@ class FriendsTabTests(ShellTestBase):
 
     def test_company_chip_for_other_company(self):
         add_org(self.state, self.conn)
+        self.tab._users_relay.flush()
         widgets = {}
         for i in range(self.tab.list.count()):
             w = self.tab.list.itemWidget(self.tab.list.item(i))
@@ -657,10 +659,10 @@ class ChatFolderTests(ShellTestBase):
 
     def test_chips_match_folders(self):
         self.assertEqual([c.folder for c in self.tab.folder_bar.chips], ['전체', '안읽음', '즐겨찾기', '통화'])
-        self.assertEqual(self.tab.folder_bar.labels(), ['전체', '안읽음 2', '즐겨찾기 0', '통화'])
+        self.assertEqual(self.tab.folder_bar.labels(), ['전체', '안읽음 2', '즐겨찾기', '통화'])
         self.assertTrue(self.tab.folder_bar.chip('전체').isChecked())
         self.assertIsNone(self.state.save_chat_folder('회사', ['r1']))
-        self.assertEqual(self.tab.folder_bar.labels(), ['전체', '안읽음 2', '즐겨찾기 0', '통화', '회사 1'])
+        self.assertEqual(self.tab.folder_bar.labels(), ['전체', '안읽음 2', '즐겨찾기', '통화', '회사 1'])
 
     def test_select_unread_and_favorites(self):
         self.tab.folder_bar.chip('안읽음').click()
@@ -965,7 +967,7 @@ class DialogTests(ShellTestBase):
             self.assertIn('이메일과 비밀번호만으로', dlg.register_hint.text())
             dlg.reg_name_edit.setText('도승현')
             dlg.reg_email_edit.setText('do@kcs.test')
-            dlg.reg_password_edit.setText('pw1234')
+            dlg.reg_password_edit.setText('pw123456')                    # 새 비밀번호는 8자 이상
             self.assertFalse(dlg.login_button.isEnabled())               # 소속 회사는 반드시 선택
             dlg.accept()
             self.assertNotEqual(dlg.result(), LoginDialog.Accepted)
@@ -983,7 +985,7 @@ class DialogTests(ShellTestBase):
             dlg.accept()
             self.assertEqual(dlg.result(), LoginDialog.Accepted)
             self.assertEqual(dlg.registration(), {'company': 'KCS 물류', 'name': '도승현',
-                                                  'email': 'do@kcs.test', 'password': 'pw1234'})   # 사번은 보내지 않는다
+                                                  'email': 'do@kcs.test', 'password': 'pw123456'})   # 사번은 보내지 않는다
             self.assertEqual(dlg.values()[0], 'do@kcs.test')             # 다음부터의 로그인 아이디 = 이메일
             self.assertEqual(dlg.saved_token(), '')
             # 등록이 거절돼 다시 띄운 창은 입력값 그대로 등록 화면
@@ -1169,7 +1171,7 @@ class DialogTests(ShellTestBase):
             self.assertEqual(dlg.login_button.text(), '비밀번호 바꾸기')
             self.assertFalse(dlg.login_button.isEnabled())
             dlg.reset_email_edit.setText('not-email')
-            dlg.reset_password_edit.setText('new-pw')
+            dlg.reset_password_edit.setText('new-pw-12')
             self.assertFalse(dlg.login_button.isEnabled())                       # 재설정 코드가 있어야
             dlg.reset_code_edit.setText('ABCD-EF23')
             self.assertTrue(dlg.login_button.isEnabled())
@@ -1179,7 +1181,7 @@ class DialogTests(ShellTestBase):
             dlg.reset_email_edit.setText('kms@kcs.test')
             self.assertEqual(dlg.reset_password_edit.echoMode(), QLineEdit.Password)   # 눈 아이콘 있는 칸
             dlg.accept()
-            reset.assert_called_once_with('10.0.0.9', 6000, 'kms', 'kms@kcs.test', 'new-pw', code='ABCD-EF23')
+            reset.assert_called_once_with('10.0.0.9', 6000, 'kms', 'kms@kcs.test', 'new-pw-12', code='ABCD-EF23')
             self.assertEqual(dlg.reset_code_edit.text(), '')                      # 쓴 코드는 지운다
             self.assertEqual(dlg._mode, 'login')                                  # 로그인 화면으로 돌아옴
             self.assertEqual((dlg.name_edit.text(), dlg.password_edit.text()), ('kms', ''))
@@ -1190,7 +1192,7 @@ class DialogTests(ShellTestBase):
             dlg.set_mode('reset')
             dlg.reset_code_edit.setText('ABCD-EF23')
             dlg.reset_email_edit.setText('x@kcs.test')
-            dlg.reset_password_edit.setText('new-pw')
+            dlg.reset_password_edit.setText('new-pw-12')
             dlg.accept()
             self.assertTrue(dlg.is_reset())
             self.assertEqual(dlg.error_label.property('tone'), 'error')
@@ -1294,6 +1296,7 @@ class UnreadBlinkTests(ShellTestBase):
         for rid, room in self.state.rooms.items():
             room['unread_count'] = counts.get(rid, 0)
         self.state.rooms_changed.emit()
+        win._unread_relay.flush()               # 몰려오는 변경은 묶어서 센다 - 여기서는 바로
 
     def test_blinks_while_unread_and_stops_when_read(self):
         win = self.make_window()
@@ -1521,6 +1524,129 @@ class OrgHierarchyTests(ShellTestBase):
         win.set_tab('org')
         self.assertFalse(win.org_dock.isVisible())   # 조직도 탭과 중복 표시 안 함
         win.close()
+
+
+
+# ================================================================ 접근성 - 목록 행 이름 · 사이드바 탭
+def accessible_texts(lst):
+    """RowList 의 만들어진 행마다 (이름표, 화면낭독기가 읽을 문장)"""
+    out = []
+    for i in range(lst.count()):
+        item = lst.item(i)
+        if lst.built_widget(item) is not None:
+            out.append((item.data(Qt.UserRole), item.data(Qt.AccessibleTextRole)))
+    return out
+
+
+class RowAccessibilityTests(ShellTestBase):
+    """행 위젯은 setItemWidget 으로 얹혀 목록 접근성 트리에 글자가 보이지 않았다 - 화면낭독기와 자동화 도구(agent-desktop)가
+    친구 · 채팅방 · 조직도 행을 모두 '이름 없는 항목'으로 읽었다 (2026-11-18 실제 앱 접근성 트리에서 확인)"""
+
+    def setUp(self):
+        super().setUp()
+        add_org(self.state, self.conn)
+
+    def test_friend_rows_have_accessible_text(self):
+        tab = FriendsTab(self.state, self.settings)
+        tab.resize(400, 680)
+        tab.show()
+        QApplication.processEvents()
+        texts = accessible_texts(tab.list)
+        self.assertTrue(texts)
+        for data, text in texts:
+            self.assertTrue(text, f'이름 없는 행: {data}')
+        by_data = dict(texts)
+        friend = next(d for d in by_data if isinstance(d, tuple) and d[0] == 'friend' and d[1] == '김철수')
+        self.assertIn(self.state.display_name('김철수'), by_data[friend])
+        tab.hide()
+
+    def test_friend_section_reads_collapse_state(self):
+        tab = FriendsTab(self.state, self.settings)
+        tab.resize(400, 680)
+        tab.show()
+        QApplication.processEvents()
+        sections = [(d, t) for d, t in accessible_texts(tab.list) if isinstance(d, tuple) and d[0] == 'section']
+        self.assertTrue(sections)
+        key, text = sections[0][0][1], sections[0][1]
+        self.assertIn('펼침', text)
+        tab.toggle_section(key)
+        QApplication.processEvents()
+        text = dict(accessible_texts(tab.list))[('section', key)]
+        self.assertIn('접힘', text)
+        tab.hide()
+
+    def test_room_list_rows_have_accessible_text(self):
+        tab = ChatsTab(self.state, self.settings)
+        tab.resize(400, 680)
+        tab.show()
+        QApplication.processEvents()
+        texts = dict(accessible_texts(tab.list))
+        self.assertIn('프로젝트 팀', texts['r1'])
+        for data, text in texts.items():
+            self.assertTrue(text, f'이름 없는 행: {data}')
+        tab.hide()
+
+    def test_org_rows_have_accessible_text(self):
+        tab = OrgTab(self.state, self.settings)
+        tab.resize(400, 680)
+        tab.show()
+        QApplication.processEvents()
+        texts = accessible_texts(tab.list)
+        self.assertTrue(texts)
+        # 구분선은 읽을 내용이 없는 장식 행
+        empty = [data for data, text in texts if not text and not (isinstance(data, tuple) and data[0] == 'divider')]
+        self.assertEqual(empty, [])
+        tab.hide()
+
+    def test_rebuilt_row_does_not_keep_old_text(self):
+        """sync_rows 가 내용이 바뀐 행을 다시 만들 때 예전 문장을 읽지 않는다"""
+        from PyQt5.QtWidgets import QLabel
+        from client.kakao.chats_tab import RowList
+        lst = RowList()
+        lst.resize(300, 400)
+        lst.show()
+        lst.sync_rows([('a', 1, lambda: QLabel('처음 글자'), True)])
+        QApplication.processEvents()
+        self.assertEqual(dict(accessible_texts(lst))['a'], '처음 글자')
+        lst.sync_rows([('a', 2, lambda: QLabel('바뀐 글자'), True)])
+        lst.build_visible()
+        self.assertEqual(dict(accessible_texts(lst))['a'], '바뀐 글자')
+        lst.hide()
+        lst.deleteLater()
+
+
+class SidebarAccessibilityTests(ShellTestBase):
+    """화면낭독기 · 접근성 자동화의 '누르기'는 체크 버튼에서 click() 이 아니라 toggle() 로 들어온다.
+    탭 전환을 clicked 에만 연결해 두어 체크 표시만 바뀌고 탭은 그대로였고, 지금 탭을 누르면 선택이 아예 풀렸다"""
+
+    def test_toggle_switches_tab(self):
+        win = self.make_window()
+        win.show()
+        for key in ('org', 'chats', 'calendar', 'more', 'friends'):
+            win.sidebar.buttons[key].toggle()
+            self.assertEqual(win.current_tab(), key)
+            checked = [k for k, b in win.sidebar.buttons.items() if b.isChecked()]
+            self.assertEqual(checked, [key])
+
+    def test_toggle_current_tab_keeps_it_selected(self):
+        win = self.make_window()
+        win.show()
+        win.sidebar.buttons['friends'].toggle()
+        self.assertTrue(win.sidebar.buttons['friends'].isChecked())
+        self.assertEqual(win.current_tab(), 'friends')
+
+    def test_programmatic_switch_emits_once(self):
+        win = self.make_window()
+        win.show()
+        seen = []
+        win.sidebar.tab_selected.connect(seen.append)
+        win.set_tab('org')                       # 단축키 · 알림 등 프로그램이 바꾼 경우 - 버튼 표시만 맞춘다
+        self.assertEqual(seen, [])
+        self.assertTrue(win.sidebar.buttons['org'].isChecked())
+        self.assertFalse(win.sidebar.buttons['friends'].isChecked())
+        win.sidebar.buttons['chats'].click()     # 마우스 클릭은 그대로
+        self.assertEqual(seen, ['chats'])
+        self.assertEqual(win.current_tab(), 'chats')
 
 
 if __name__ == '__main__':

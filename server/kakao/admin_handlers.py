@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from . import file_policy
 from .protocol import (ACCOUNT_DISABLED, ADMIN_ONLY, EMAIL_RE, EMPLOYEE_NO_RE, ProtocolError, _opt_int, _opt_str,
-                       _req_int, _req_str)
+                       _opt_tag, _req_int, _req_str)
 from .store import BOT_USERNAME, ISO_FMT, now_iso
 
 if TYPE_CHECKING:
@@ -48,7 +48,7 @@ class AdminHandlers:
         if self.store.is_bot(username):
             raise ProtocolError('봇 계정은 관리할 수 없습니다.')
         self._check_scope(scope, self.store.user_company(username))
-        if scope and username != ctx.username and self.store.admin_scope(username) is not None:
+        if scope and username != ctx.username and self.store.is_admin(username):   # 삭제된 관리자 계정도
             # 회사 관리자가 같은 회사 소속 그룹 관리자 · 다른 관리자의 비밀번호를 바꾸거나 지우면 권한을 넘겨받을 수 있다
             raise ProtocolError('관리자 계정은 그룹 관리자만 관리할 수 있습니다.')
         return username
@@ -132,11 +132,10 @@ class AdminHandlers:
 
     def _h_admin_reset_password(self, ctx: Ctx, msg: dict) -> None:
         username = self._admin_target(ctx, msg)
-        password = msg.get('new_password')
-        if not isinstance(password, str) or not 4 <= len(password) <= 64:
-            raise ProtocolError('비밀번호는 4~64자로 입력해 주세요.')
+        password = self._new_password(msg.get('new_password'))
         self.store.set_password(username, password)
         self.store.revoke_all_login_tokens(username)
+        self._drop_sessions(username, keep=ctx.conn if username == ctx.username else None)
         self._admin_done(ctx, 'reset_password', '비밀번호 재설정', username=username)
 
     def _h_admin_clear_password(self, ctx: Ctx, msg: dict) -> None:
@@ -148,13 +147,13 @@ class AdminHandlers:
         """비밀번호 재설정 코드 발급 (§4.1): 관리자가 본인임을 확인하고 코드를 알려 주면, 그 사람이 로그인 창의
         [비밀번호 재설정]에서 이메일 + 코드로 직접 새 비밀번호를 정한다 (관리자는 새 비밀번호를 모른다)"""
         username = self._admin_target(ctx, msg)
-        if not self.store.password_hash(username):
-            raise ProtocolError('아직 등록하지 않은 계정입니다. [처음 사용 등록]부터 하면 됩니다.')
-        if self.store.admin_scope(username) is not None:
+        if self.store.is_admin(username):
             raise ProtocolError('관리자 계정은 [비밀번호 재설정…]으로 바꿔 주세요.')
+        # 비밀번호가 없는 계정에 발급하면 등록 코드다 (§4.1 '등록 방식' - 처음 사용 등록 · 비밀번호 재설정 화면에서 쓴다)
+        registered = bool(self.store.password_hash(username))
         code, expires_at = self.store.issue_reset_code(username, ctx.username)
-        self._admin_done(ctx, 'reset_code', '비밀번호 재설정 코드 발급', username=username, code=code,
-                         expires_at=expires_at)
+        self._admin_done(ctx, 'reset_code', '비밀번호 재설정 코드 발급' if registered else '등록 코드 발급',
+                         username=username, code=code, expires_at=expires_at, registered=registered)
 
     def _h_admin_set_disabled(self, ctx: Ctx, msg: dict) -> None:
         username = self._admin_target(ctx, msg)
@@ -206,6 +205,23 @@ class AdminHandlers:
     def _file_policy(self) -> dict:
         return self.store.file_policy() or file_policy.DEFAULT_POLICY
 
+    def _merge_file_policy_defaults(self) -> None:
+        """서버가 시작할 때: 저장된 정책에 새 기본 차단 형태를 한 번 더하고 로그에 남긴다 (명세 §10.10).
+        저장한 적 없으면 기본 정책을 그대로 쓰므로 할 일이 없다. 관리자가 뺀 형태는 다시 넣지 않는다"""
+        stored = self.store.file_policy()
+        if stored is None:
+            return
+        merged, added = file_policy.merge_new_defaults(stored)
+        if merged is stored:
+            return
+        self.store.set_file_policy(merged)
+        off = '' if merged.get('enabled') else ' - 정책이 꺼져 있어 켜기 전에는 막지 않습니다'
+        if added:
+            logger.info('파일 전송 보안: 새 기본 차단 형태 %d개를 저장된 정책에 더했습니다 (%s)%s', len(added),
+                        ', '.join(file_policy.CATEGORY_LABELS[t] for t in added), off)
+        else:
+            logger.info('파일 전송 보안: 새 기본 차단 형태 0개를 저장된 정책에 더했습니다 (이미 막혀 있음)%s', off)
+
     def _file_violation(self, username: str, name: str, data: bytes) -> Optional[dict]:
         """정책 위반이면 {rule, value, detail, category, sha256}. 관리자가 풀어 준 예외(사람 + 파일)면 None"""
         violation = file_policy.check(self._file_policy(), name, data)
@@ -245,6 +261,9 @@ class AdminHandlers:
         if meta['type'] == 'secret':
             raise ProtocolError('비밀채팅방에서는 파일을 보낼 수 없습니다.')
         name, mime, data = self._decode_attachment(msg.get('attachment'))
+        self._check_upload_quota(ctx.username, len(data))
+        kind, mime = self._checked_image_kind(kind, mime, data)
+        client_tmp_id = _opt_tag(msg, 'client_tmp_id')
         content = _opt_str(msg, 'content', 200) or name
         reason = _req_str(msg, 'reason', 300, label='요청 사유').strip()
         if not reason:
@@ -253,7 +272,7 @@ class AdminHandlers:
         if violation is None:                    # 막히지 않는 파일(정책이 바뀌었거나 예외)이면 바로 보낸다
             attachment_id = self.store.save_attachment(name, mime, data, ctx.username)
             self._deliver_message(meta['room_id'], ctx.username, kind, content, None, [], attachment_id,
-                                  msg.get('client_tmp_id'), ctx)
+                                  client_tmp_id, ctx)
             return
         if self.store.pending_file_request_count(ctx.username) >= self.FILE_REQUEST_PENDING_MAX:
             raise ProtocolError(f'승인을 기다리는 요청이 {self.FILE_REQUEST_PENDING_MAX}건입니다. '
@@ -276,7 +295,7 @@ class AdminHandlers:
             policy = file_policy.normalize_policy(msg.get('policy'))
         except file_policy.PolicyError as exc:
             raise ProtocolError(str(exc)) from None
-        self.store.set_file_policy(policy)
+        self.store.set_file_policy(file_policy.with_defaults_seen(policy))    # 관리자가 본 기본값 - 뺀 것은 다시 넣지 않는다
         self._broadcast({'type': 'file_policy', 'policy': file_policy.public_policy(policy)})
         self._admin_done(ctx, 'file_policy', '파일 전송 보안 정책 변경', enabled=policy['enabled'])
 
@@ -311,8 +330,13 @@ class AdminHandlers:
         except ValueError as exc:
             raise ProtocolError(str(exc)) from None
         if approve:
-            message = self._deliver_message(request['room_id'], request['username'], request['kind'],
-                                            request['content'], None, [], request['attachment_id'], None, None)
+            try:
+                message = self._deliver_message(request['room_id'], request['username'], request['kind'],
+                                                request['content'], None, [], request['attachment_id'], None, None)
+            except Exception:      # 보내지 못했으면 승인으로 남기지 않는다 - 다시 대기로 돌려 다시 결정할 수 있게
+                logger.exception('승인한 파일 전송 실패 (요청 %s)', request['request_id'])
+                self.store.reopen_file_request(request['request_id'])
+                raise ProtocolError('파일을 보내지 못했습니다. 잠시 후 다시 승인해 주세요.') from None
             decided = self.store.set_file_request_msg(request['request_id'], message['msg_id'])
             if allow_days:
                 self.store.add_file_exception(request['username'], request['sha256'], request['name'], '',

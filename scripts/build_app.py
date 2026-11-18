@@ -9,6 +9,12 @@
     python kcs.py build --onefile --deploy talk.kcins.co.kr:9550
                                      배포용 단일 실행 파일 + 운영 서버 주소(TLS) 를 앱 안에 번들
                                      (deploy/deploy.json → client.kakao.settings 가 server.json 다음 순위로 읽음)
+    python kcs.py build --dmg        (macOS) 앱 → 서명 → 배포용 DMG(→ 공증 · 스테이플) 까지
+
+macOS 배포: 인터넷(포털 · 메일 · 메신저)으로 받은 앱은 Gatekeeper 가 'Apple 이 악성 코드가 없음을 확인할 수 없습니다'로
+막는다. 막히지 않으려면 Developer ID Application 인증서로 서명하고 Apple 공증(notarization)을 받아야 한다.
+    KCS_SIGN_IDENTITY="Developer ID Application: 회사 (TEAMID)"   서명 인증서 (없으면 ad-hoc - 받은 PC 에서 막힘)
+    KCS_NOTARY_PROFILE=kcs-notary   xcrun notarytool store-credentials kcs-notary ... 로 만든 공증 프로필
 
 PyInstaller 는 교차 빌드를 하지 않는다: Windows 용은 Windows 에서, macOS 용은 macOS 에서, Linux 용은 Linux 에서 만든다.
 필요: python -m pip install pyinstaller  (requirements-kcs.txt 의 빌드 항목)
@@ -284,6 +290,7 @@ def main(argv=None):
     parser.add_argument('--server', action='store_true', help='채팅 서버를 만든다 (기본: 메신저)')
     parser.add_argument('--dry-run', action='store_true', help='PyInstaller 명령만 출력')
     parser.add_argument('--out', default=os.path.join(ROOT, 'dist'), help='결과 폴더 (기본 dist/)')
+    parser.add_argument('--dmg', action='store_true', help='(macOS) 서명한 배포용 DMG 까지 만든다 (공증: %s)' % NOTARY_ENV)
     parser.add_argument('--onefile', action='store_true',
                         help='단일 실행 파일로 (배포용. 시작 시 임시 폴더에 풀리므로 첫 실행이 조금 느리다)')
     parser.add_argument('--deploy', metavar='HOST:PORT', default=None,
@@ -330,6 +337,12 @@ def main(argv=None):
         print('완료 → ' + os.path.join(out_dir, SERVER_NAME if args.server else result))
         if deploy:
             print(f'번들된 접속 기본값: {deploy["host"]}:{deploy["port"]} ({"평문" if args.deploy_plain else "TLS"})')
+    if code == 0 and args.dmg:
+        try:
+            package_mac(out_dir, identity, os.environ.get(NOTARY_ENV))
+        except (OSError, subprocess.CalledProcessError) as e:
+            print(f'DMG 만들기 실패: {e}', file=sys.stderr)
+            return 1
     return code
 
 

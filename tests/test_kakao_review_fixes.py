@@ -96,21 +96,21 @@ class LoginHardeningTests(ServerTestBase):
 
 
 class RequirePasswordTests(ServerTestBase):
-    SERVER_KWARGS = {'require_password': True}
+    SERVER_KWARGS = {'require_password': True, 'open_registration': True}   # 등록 방식은 test_kakao_registration 에서
 
     def test_passwordless_join_rejected(self):
         name = uname('req')
         c = self.connect(name, join=False)
         self.assertEqual(c.expect_error({'type': 'join', 'username': name})['message'], '비밀번호를 입력해 주세요.')
-        self.register(name, 'pw-ok')
-        c.request({'type': 'join', 'username': name, 'password': 'pw-ok'}, 'welcome')
+        self.register(name, 'pw-ok-123')
+        c.request({'type': 'join', 'username': name, 'password': 'pw-ok-123'}, 'welcome')
 
     def test_admin_reset_script(self):
         from scripts.set_password import main as set_password
         name = uname('adm')
-        self.register(name, 'old-pw', remember=True)
-        self.assertEqual(set_password([name, '--db', self.db_path, '--password', 'new-pw']), 0)
-        self.assertTrue(self.server.store.check_password('new-pw', self.server.store.password_hash(name)))
+        self.register(name, 'old-pw-12', remember=True)
+        self.assertEqual(set_password([name, '--db', self.db_path, '--password', 'new-pw-12']), 0)
+        self.assertTrue(self.server.store.check_password('new-pw-12', self.server.store.password_hash(name)))
         self.assertEqual(set_password([name, '--db', self.db_path, '--clear']), 0)
         self.assertIsNone(self.server.store.password_hash(name))
         self.assertEqual(set_password(['없는사람', '--db', self.db_path, '--password', 'abcd']), 1)
@@ -155,6 +155,7 @@ class ClientReviewFixTests(unittest.TestCase):
         self.state.has_more[self.rid] = False
         welcome = {'me': self.state.users[self.state.me], 'users': list(self.state.users.values()),
                    'rooms': list(self.state.rooms.values())}
+        self.state.open_rooms.add(self.rid)                          # 창이 떠 있는 방 (나머지 방은 차례로 받는다)
         self.conn.sent.clear()
         self.conn.push('welcome', **welcome)                         # 재연결
         self.assertEqual(self.history_requests(), [{'room_id': self.rid, 'limit': 50}])

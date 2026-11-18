@@ -4,13 +4,15 @@
 아이콘은 24x24 좌표계의 선(stroke) 아이콘이며 어떤 크기·색상으로도 렌더링된다.
 """
 
+import gc
 import hashlib
 import math
 
-from PyQt5.QtCore import Qt, QRectF, QPoint, QPointF, QSize, QEvent, QObject, QTimer, pyqtSignal
-from PyQt5.QtGui import (QPainter, QPainterPath, QPen, QColor, QIcon, QPixmap, QBrush, QLinearGradient)
+from PyQt5.QtCore import (Qt, QRectF, QPoint, QPointF, QSize, QEvent, QObject, QTimer, QThread, QBuffer, QByteArray,
+                          QIODevice, QCoreApplication, QEventLoop, pyqtSignal)
+from PyQt5.QtGui import (QPainter, QPainterPath, QPen, QColor, QIcon, QPixmap, QBrush, QLinearGradient, QImageReader)
 from PyQt5.QtWidgets import (QWidget, QPushButton, QLabel, QSizePolicy, QAbstractButton, QComboBox,
-                             QStyledItemDelegate, QDialog, QApplication)
+                             QStyledItemDelegate, QDialog, QApplication, QScrollArea, QFrame, QStyle)
 
 from client.kakao import theme
 
@@ -215,6 +217,26 @@ def _icon_path(name):
         p.cubicTo(9, 3, 5, 6, 8.5, 9)
         p.moveTo(12, 9)
         p.cubicTo(15, 3, 19, 6, 15.5, 9)
+    elif name == 'cake':
+        # 생일: 케이크 몸통 + 크림 물결 + 초 + 불꽃 (이모지 🎂 대신, 2026-11-13)
+        p.addRoundedRect(QRectF(4.5, 11.5, 15, 9), 2, 2)
+        p.moveTo(4.5, 15.5)
+        p.quadTo(8.25, 17.5, 12, 15.5)
+        p.quadTo(15.75, 13.5, 19.5, 15.5)
+        p.moveTo(12, 11.5)
+        p.lineTo(12, 8)
+        p.moveTo(12, 3.5)
+        p.cubicTo(13.4, 4.9, 13.4, 6.2, 12, 6.2)
+        p.cubicTo(10.6, 6.2, 10.6, 4.9, 12, 3.5)
+    elif name == 'location':
+        # 장소: 물방울 핀 + 가운데 원 (이모지 📍 대신, 2026-11-13)
+        p.moveTo(12, 21)
+        p.cubicTo(8, 16.5, 5.5, 13, 5.5, 9.5)
+        p.cubicTo(5.5, 5.9, 8.4, 3, 12, 3)
+        p.cubicTo(15.6, 3, 18.5, 5.9, 18.5, 9.5)
+        p.cubicTo(18.5, 13, 16, 16.5, 12, 21)
+        p.closeSubpath()
+        p.addEllipse(QRectF(9.5, 7, 5, 5))
     elif name == 'star':
         for i in range(10):
             r = 9 if i % 2 == 0 else 4
@@ -310,6 +332,19 @@ class IconButton(QPushButton):
 
 
 # ---------------------------------------------------------------- 보이기/숨기기
+def exec_and_release(dialog):
+    """모달 대화상자를 띄우고 결과를 돌려준 뒤, 닫힌 대화상자를 지운다 (deleteLater - 지금 함수 안에서는 아직 쓸 수 있다).
+    메인 창 · 채팅방 창을 부모로 만든 대화상자는 닫아도 부모가 지울 때까지 남는다 - 직원 500명 대화상대 선택 창은
+    한 번에 약 20MB, 사진 보기 창은 원본 사진을 쥐고 있어 하루 종일 켜 두면 수백 MB 가 쌓였다"""
+    try:
+        return dialog.exec_()
+    finally:
+        try:
+            dialog.deleteLater()
+        except RuntimeError:          # 그 사이 이미 지워짐
+            pass
+
+
 def set_shown(widget, shown):
     """setVisible() 대신 쓴다 (2026-10-15). 부모가 아직 없는 위젯(레이아웃에 넣기 전, 생성자 안)에 setVisible(True) 를
     부르면 Qt 가 그 위젯을 최상위 창으로 띄워 Windows 에서 작은 창들이 번쩍였다가 사라진다(친구 목록 상태메시지 칩 ·
@@ -383,12 +418,213 @@ class FocusVisibleFilter(QObject):
         return False
 
 
+class AppEventHub(QObject):
+    """앱 전체 이벤트 필터는 이것 하나만 설치하고, 이벤트 종류별로 필요한 필터만 부른다.
+    필터마다 app.installEventFilter 를 하면 모든 위젯의 모든 이벤트마다 파이썬 함수가 필터 수만큼 불린다
+    (큰 방에 메시지가 몰리면 메시지 한 건에 이벤트 1,200개 × 필터 5개 - 1,000건에 1초 넘게 필터만 돌았다)"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._filters = []          # [(필터, 이벤트 종류들)]
+        self._types = frozenset()
+
+    def add(self, flt, types):
+        if any(f is flt for f, _t in self._filters):
+            return
+        self._filters.append((flt, frozenset(types)))
+        self._types = frozenset().union(*(t for _f, t in self._filters))
+        if isinstance(flt, QObject):
+            flt.destroyed.connect(lambda _obj=None, flt=flt: self.remove(flt))
+
+    def remove(self, flt):
+        self._filters = [(f, t) for f, t in self._filters if f is not flt]
+        self._types = frozenset().union(*(t for _f, t in self._filters)) if self._filters else frozenset()
+
+    def eventFilter(self, obj, event):
+        kind = event.type()
+        if kind not in self._types:
+            return False
+        for flt, types in list(self._filters):
+            if kind in types and flt.eventFilter(obj, event):
+                return True
+        return False
+
+
+def add_app_event_filter(app, flt, types):
+    """flt.eventFilter(obj, event) 를 types(QEvent 종류) 이벤트에만 부른다 - 앱 전체 필터 하나(AppEventHub)로"""
+    if app is None:
+        return None
+    hub = getattr(app, '_event_hub', None)
+    if hub is None:
+        hub = app._event_hub = AppEventHub(app)
+        app.installEventFilter(hub)
+    hub.add(flt, types)
+    return hub
+
+
 def install_focus_visible(app):
     """앱 전체에 한 번만 설치 (다시 불러도 그대로)"""
     if app is None or getattr(app, '_focus_visible_filter', None) is not None:
         return
     app._focus_visible_filter = FocusVisibleFilter(app)
-    app.installEventFilter(app._focus_visible_filter)
+    add_app_event_filter(app, app._focus_visible_filter, (QEvent.FocusIn, QEvent.FocusOut))
+
+
+# ---------------------------------------------------------------- 받은 글자는 서식으로 해석하지 않는다
+def plain(label):
+    """라벨을 일반 글자 전용으로 - 이름 · 상태메시지 · 방 이름 · 파일 이름에 꺾쇠가 있어도 글자 그대로 보인다.
+    라벨을 그대로 돌려준다: name = plain(QLabel(text))"""
+    label.setTextFormat(Qt.PlainText)
+    return label
+
+
+class TextGuard(QObject):
+    """앱의 모든 라벨 · 툴팁 · 알림 상자 글자는 기본이 일반 글자다.
+    Qt 라벨은 글자가 서식처럼 생겼으면 알아서 서식으로 해석하는데(자동 판별), 화면에 처음 그려지기 전에 그 자동 판별을 끈다.
+    서식이 필요한 라벨은 setTextFormat(Qt.RichText) 로 직접 밝히고, 넣는 글자는 html.escape 로 감싼다.
+    툴팁(Qt 가 라벨로 그린다) · QMessageBox · QInputDialog 안의 라벨도 같은 규칙을 따른다"""
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Polish and isinstance(obj, QLabel) and obj.textFormat() == Qt.AutoText:
+            obj.setTextFormat(Qt.PlainText)
+        return False
+
+
+def install_text_guard(app):
+    """앱 전체에 한 번만 설치 (다시 불러도 그대로)"""
+    if app is None or getattr(app, '_text_guard', None) is not None:
+        return
+    app._text_guard = TextGuard(app)
+    add_app_event_filter(app, app._text_guard, (QEvent.Polish,))
+
+
+# ---------------------------------------------------------------- 메모리 정리(GC)는 화면 스레드에서만
+class SafeGarbageCollector(QObject):
+    """파이썬의 순환 참조 정리(GC)를 화면 스레드의 이벤트와 이벤트 사이에서만 돌린다.
+    자동 GC 는 객체를 만드는 아무 순간에 돈다 - 읽기 · 쓰기 스레드 안에서, 또는 Qt 가 위젯을 다루는 도중(이벤트 필터 ·
+    스타일 다시 입히기)에. 그때 부모 없는 Qt 위젯이 함께 지워지면 앱이 죽는다 (가끔만 나서 찾기 어려운 종료).
+    그래서 자동 GC 를 끄고, 타이머가 울릴 때(= 이벤트 처리 사이) 여기서 대신 돌린다. 참조 수가 0 이 되어 바로 지워지는
+    대부분의 객체는 전과 같다.
+    대화상자 exec_() · 메뉴 · pump_events() 처럼 다른 이벤트 처리 안에서 도는 루프 중에는 미룬다
+    (바깥에서 처리 중이던 위젯이 지워지지 않게).
+    그 루프가 오래 이어져(자리를 비운 사이 뜬 알림 상자) 쌓인 양이 평소 기준의 NESTED_BACKLOG 배를 넘으면 그때는 정리한다"""
+
+    INTERVAL_MS = 2000
+    NESTED_BACKLOG = 50
+    pumping = 0             # pump_events() 가 돌고 있는 깊이 (화면 스레드에서만 바뀐다)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.thresholds = gc.get_threshold()
+        gc.disable()
+        self.timer = QTimer(self)
+        self.timer.setInterval(self.INTERVAL_MS)
+        self.timer.timeout.connect(self.collect)
+        self.timer.start()
+
+    def nested(self):
+        """다른 이벤트 처리 안에서 도는 이벤트 루프 중인가 (대화상자 exec_() · 메뉴 · 끌어다 놓기 · pump_events)"""
+        return SafeGarbageCollector.pumping > 0 or QThread.currentThread().loopLevel() > 1
+
+    def collect(self, force=False):
+        """쌓인 만큼만 정리 (자동 GC 와 같은 기준). force=True 면 전부"""
+        if force:
+            gc.collect()
+            return
+        counts = gc.get_count()
+        if self.nested() and counts[0] <= self.thresholds[0] * self.NESTED_BACKLOG:
+            return
+        for generation in (2, 1, 0):
+            if counts[generation] > self.thresholds[generation]:
+                gc.collect(generation)
+                return
+
+
+def install_safe_gc(app):
+    """앱 전체에 한 번만 설치 (다시 불러도 그대로)"""
+    if app is None or getattr(app, '_safe_gc', None) is not None:
+        return
+    app._safe_gc = SafeGarbageCollector(app)
+
+
+def pump_events(max_ms=None):
+    """쌓인 화면 이벤트를 지금 처리한다 (processEvents). max_ms 를 주면 그 시간(ms) 안에서만.
+    client/kakao 에서는 processEvents 를 직접 부르지 않고 이것을 쓴다: 단추 처리 같은 다른 이벤트 처리 안에서 불려도
+    그동안 메모리 정리(SafeGarbageCollector)가 미뤄진다"""
+    app = QCoreApplication.instance()
+    if app is None:
+        return
+    SafeGarbageCollector.pumping += 1
+    try:
+        if max_ms is None:
+            app.processEvents()
+        else:
+            app.processEvents(QEventLoop.AllEvents, max_ms)
+    finally:
+        SafeGarbageCollector.pumping -= 1
+
+
+# ---------------------------------------------------------------- 세로로 긴 대화상자
+class ContentScrollArea(QScrollArea):
+    """내용 크기를 그대로 권장 크기로 내놓는 스크롤 영역 (세로로 긴 대화상자의 본문용).
+    화면이 넉넉하면 스크롤 없이 다 보이고, 창이 내용보다 작아질 때만 본문이 스크롤된다 - 단추는 영역 밖에 둔다"""
+
+    def __init__(self, content, parent=None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setWidget(content)
+        self.viewport().setAutoFillBackground(False)     # 대화상자 바탕색이 그대로 보이게
+        content.setAutoFillBackground(False)
+
+    def sizeHint(self):
+        return self.widget().sizeHint()
+
+    def minimumSizeHint(self):
+        hint = self.widget().minimumSizeHint()
+        return QSize(hint.width(), min(hint.height(), theme.px(160)))
+
+
+def fit_dialog_to_screen(dialog):
+    """대화상자를 내용이 다 보이는 크기로 하되 화면보다 크지 않게 (넘치는 본문은 ContentScrollArea 가 스크롤한다)"""
+    hint = dialog.sizeHint()
+    height = hint.height()
+    screen = QApplication.primaryScreen()
+    if screen is not None:
+        chrome = dialog.style().pixelMetric(QStyle.PM_TitleBarHeight) + theme.px(16)    # 제목 표시줄 + 여유
+        height = min(height, screen.availableGeometry().height() - chrome)
+    dialog.resize(max(hint.width(), dialog.minimumWidth()), height)
+
+
+# ---------------------------------------------------------------- 받은 사진 풀기
+IMAGE_FORMATS = ('png', 'jpeg', 'gif', 'bmp', 'webp')      # 점으로 된 사진만 (벡터 · 문서형 이미지는 풀지 않는다)
+MAX_IMAGE_PIXELS = 50 * 1000 * 1000                         # 가로×세로 상한 (풀면 한 점에 4바이트)
+
+
+def decode_image(data, max_pixels=MAX_IMAGE_PIXELS, formats=IMAGE_FORMATS):
+    """받은 사진 바이트 → QImage. 내용으로 형식을 확인해 허용한 형식만, 크기를 먼저 읽어 상한 안일 때만 푼다.
+    형식이 다르거나 너무 크거나 깨졌으면 None"""
+    if not data:
+        return None
+    buf = QBuffer()
+    buf.setData(QByteArray(bytes(data)))
+    if not buf.open(QIODevice.ReadOnly):
+        return None
+    reader = QImageReader(buf)
+    if bytes(reader.format()).decode('ascii', 'replace').lower() not in formats:
+        return None
+    size = reader.size()
+    if not size.isValid() or size.width() * size.height() > max_pixels:
+        return None
+    image = reader.read()
+    return None if image.isNull() else image
+
+
+def decode_pixmap(data, max_pixels=MAX_IMAGE_PIXELS, formats=IMAGE_FORMATS):
+    """decode_image 와 같은 규칙으로 QPixmap (실패 시 None)"""
+    image = decode_image(data, max_pixels, formats)
+    return None if image is None else QPixmap.fromImage(image)
 
 
 # ---------------------------------------------------------------- 공용 도우미
@@ -560,7 +796,7 @@ def install_input_controls(app):
     if app is None or getattr(app, '_combo_delegate_filter', None) is not None:
         return
     app._combo_delegate_filter = ComboDelegateFilter(app)
-    app.installEventFilter(app._combo_delegate_filter)
+    add_app_event_filter(app, app._combo_delegate_filter, (QEvent.Wheel, QEvent.Polish, QEvent.Show))
 
 
 class DialogTitleBarFilter(QObject):
@@ -637,7 +873,7 @@ def install_dialog_title_bars(app):
         return
     if getattr(app, '_dialog_title_filter', None) is None:
         app._dialog_title_filter = DialogTitleBarFilter(app)
-        app.installEventFilter(app._dialog_title_filter)
+        add_app_event_filter(app, app._dialog_title_filter, (QEvent.Show,))
     for w in app.topLevelWidgets():
         if w.isVisible() and wants_matched_title_bar(w):
             match_dialog_title_bar(w)
@@ -741,9 +977,8 @@ def _dot(p, size, color):
 
 def photo_avatar_pixmap(data, size):
     """사진 바이트 → 가운데 정사각형으로 잘라 squircle 마스크 적용. 실패 시 None"""
-    from PyQt5.QtGui import QImage
-    image = QImage()
-    if not image.loadFromData(data):
+    image = decode_image(data)
+    if image is None:
         return None
     side = min(image.width(), image.height())
     image = image.copy((image.width() - side) // 2, (image.height() - side) // 2, side, side)

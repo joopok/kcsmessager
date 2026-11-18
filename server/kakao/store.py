@@ -15,12 +15,14 @@ import hashlib
 import hmac
 import json
 import os
+import queue
 import secrets
 import sqlite3
 import threading
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Callable, Iterable, Optional
+from pathlib import Path
 
 ISO_FMT = '%Y-%m-%dT%H:%M:%S'
 
@@ -33,6 +35,16 @@ SECRET_PREVIEW = '비밀채팅 메시지'
 DRAWER_KINDS = ('image', 'file', 'link')
 # 차단한 사람이 보낸 메시지를 제외하는 SQL 조건 (매개변수: 조회자)
 _NOT_BLOCKED = 'sender NOT IN (SELECT blocked FROM blocks WHERE owner=?)'
+# 서랍 종류별 메시지 조건 = 부분 색인 idx_messages_drawer_* 의 조건 (조회와 색인이 같은 글자를 써야 색인을 쓴다)
+DRAWER_CONDITIONS = {'image': "kind='image'", 'file': "kind IN ('file', 'voice')",
+                     'link': "kind='text' AND (content LIKE '%http://%' OR content LIKE '%https://%')"}
+MENTIONED = "mentions<>'[]'"         # 누군가를 멘션한 메시지 = 부분 색인 idx_messages_mentioned 의 조건
+# 사용자 목록(_user_dict · 목록에 넣을지 · 순서)이 쓰는 users 칸 - 이 칸이 바뀌면 사용자 목록 캐시 버전이 오른다.
+# last_briefing · password_hash · org_locked 처럼 목록에 안 보이는 칸만 바뀌면 캐시는 그대로다
+USER_DIRECTORY_COLUMNS = ('username', 'display_name', 'status_message', 'birthday', 'created_at', 'avatar_id', 'presence',
+                          'company', 'department', 'title', 'is_bot', 'org_path', 'account', 'employee_no', 'extension',
+                          'mobile', 'email', 'concurrent', 'deputies', 'public_key', 'is_admin', 'admin_company',
+                          'removed')
 
 BOT_USERNAME = 'AI 비서'
 GUEST_COMPANY = '게스트'
@@ -154,7 +166,8 @@ CREATE TABLE IF NOT EXISTS messages (
     ladder          TEXT,
     post_id         INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_id, msg_id);
+-- 방 · 번호 순 (대화 기록) + 보낸 사람 · 종류: 안 읽은 수를 표를 읽지 않고 이 색인만으로 센다 (2026-11-18)
+CREATE INDEX IF NOT EXISTS idx_messages_room_sender ON messages(room_id, msg_id, sender, kind);
 CREATE INDEX IF NOT EXISTS idx_messages_attachment ON messages(attachment_id);
 CREATE TABLE IF NOT EXISTS events (
     event_id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -353,10 +366,54 @@ def _locked(func: Callable) -> Callable:
     return wrapper
 
 
+def _reads(func: Callable) -> Callable:
+    """읽기만 하는 조회(검색 · 서랍 · 멘션 모아보기 · 로그인 때의 방 목록 등): 읽기 전용 연결에서 돈다.
+    WAL 이라 쓰는 쪽을 막지 않고 전역 잠금도 잡지 않는다 - 큰 방을 훑는 조회 · 로그인이 몰려도 메시지 저장이 서지 않는다.
+    읽기 전용 연결은 READ_CONNECTIONS 개라 무거운 조회끼리도 그만큼 동시에 돈다 (2026-11-18). 한 번의 호출은
+    읽기 트랜잭션 하나 안에서 돌아 그 안의 여러 조회가 같은 시점의 내용을 본다. 읽기 전용 연결이 없으면(메모리 DB 등)
+    예전처럼 전역 잠금 안에서 돈다. 이 표시가 붙은 메서드는 쓰면 안 되고, _locked 메서드를 불러서도 안 된다"""
+    @functools.wraps(func)
+    def wrapper(self: 'Store', *args: Any, **kwargs: Any) -> Any:
+        if getattr(self._tls, 'db', None) is not None:      # _reads 안에서 다른 _reads 를 부르면 같은 연결 · 같은 시점
+            return func(self, *args, **kwargs)
+        db = self._take_reader()
+        if db is None:
+            with self._lock:
+                return func(self, *args, **kwargs)
+        self._tls.db = db
+        try:
+            db.execute('BEGIN')
+            return func(self, *args, **kwargs)
+        finally:
+            self._tls.db = None
+            try:
+                if db.in_transaction:
+                    db.rollback()                         # 읽기만 했다 - 잡고 있던 시점을 놓는다
+            except sqlite3.Error:
+                pass
+            self._readers.put(db)
+    return wrapper
+
+
 class Store:
     """SQLite 기반 스레드 안전 저장소."""
 
-    def __init__(self, db_path: str, retention_days: float = DEFAULT_RETENTION_DAYS) -> None:
+    TOOL_NEEDS_RESTART = 'DB 가 예전 버전입니다. 서버를 새 버전으로 한 번 다시 시작한 뒤 실행해 주세요.'
+
+    @classmethod
+    def open_for_tools(cls, db_path: str) -> 'Store':
+        """관리자 도구용 (명세 §4.2): 이미 만들어진 DB 는 표 만들기 · 구조 변경 · org.json 시드 없이 연다
+        (가동 중인 서버의 DB 에 도구가 구조 변경 · 시드를 쓰지 않게). DB 가 없으면 서버처럼 처음부터 만든다"""
+        fresh = True
+        if db_path != ':memory:' and os.path.isfile(db_path):
+            probe = sqlite3.connect(db_path)
+            try:
+                fresh = probe.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'").fetchone() is None
+            finally:
+                probe.close()
+        return cls(db_path, setup=fresh)
+
+    def __init__(self, db_path: str, retention_days: float = DEFAULT_RETENTION_DAYS, setup: bool = True) -> None:
         directory = os.path.dirname(os.path.abspath(db_path))
         os.makedirs(directory, exist_ok=True)
         self.db_path = db_path
@@ -365,22 +422,80 @@ class Store:
         self._lock = threading.Lock()
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
+        self._tls = threading.local()               # _reads 가 도는 동안 그 스레드의 조회를 읽기 전용 연결로 돌린다
+        self._read_lock = threading.Lock()
+        self._read_db: Optional[sqlite3.Connection] = None   # 읽기 전용 연결 중 첫 번째 (있으면 읽기 전용 연결을 쓴다)
+        self._read_all: list[sqlite3.Connection] = []
+        self._directory: Optional[tuple[int, list[tuple[dict, dict]]]] = None   # 사용자 목록 캐시 (user_directory)
+        self._readers: 'queue.Queue[sqlite3.Connection]' = queue.Queue()   # 지금 쉬고 있는 읽기 전용 연결
         with self._lock:
             self._db.execute('PRAGMA foreign_keys=ON')
-            self._db.execute('PRAGMA journal_mode=WAL')
-            self._db.executescript(_SCHEMA)
-            self._migrate()
             self.org_meta = {'holding': None, 'companies': []}
-            self._seed_users(self._load_seed(directory))
-            self._db.commit()
+            if setup:
+                self._db.execute('PRAGMA journal_mode=WAL')
+                self._db.executescript(_SCHEMA)
+                self._migrate()
+                self._seed_users(self._load_seed(directory))
+                self._db.commit()
+            else:                   # 도구: org.json 은 회사 목록(org_meta)을 알려고 읽기만 한다 - DB 에는 쓰지 않는다
+                self._load_seed(directory)
+        self._open_read_connection()
+
+    # 읽기 전용 연결 수 = 동시에 도는 조회 수 (2026-11-18 측정, scripts/bench_server_requests.py 규모):
+    #   1개 - 10명이 동시에 검색하면 한 건 p50 148ms / 2개 - 87ms / 4개 - 60ms
+    #   100명 동시 로그인의 로그인 한 건 p50: 1개 0.7초 / 2개 0.9초 / 4개 1.9초 (파이썬 작업이 GIL 을 다퉈 오히려 느려진다)
+    READ_CONNECTIONS = 2
+
+    def _open_read_connection(self) -> None:
+        """조회용 읽기 전용 연결들 (명세 §5). 열 수 없으면 없는 대로(전역 잠금 안에서) 돈다"""
+        if self.db_path == ':memory:':
+            return
+        opened: list[sqlite3.Connection] = []
+        try:
+            for _ in range(max(1, int(self.READ_CONNECTIONS))):
+                db = sqlite3.connect(Path(os.path.abspath(self.db_path)).as_uri() + '?mode=ro', uri=True,
+                                     check_same_thread=False, timeout=10, isolation_level=None)
+                opened.append(db)
+                db.row_factory = sqlite3.Row
+                db.execute('PRAGMA query_only=ON')
+                db.execute('SELECT 1 FROM users LIMIT 1').fetchone()
+        except sqlite3.Error:
+            for db in opened:
+                db.close()
+            return
+        self._read_all = opened
+        for db in opened:
+            self._readers.put(db)
+        self._read_db = opened[0]
+
+    def _take_reader(self) -> Optional[sqlite3.Connection]:
+        """쉬고 있는 읽기 전용 연결 하나 (모두 쓰는 중이면 하나가 돌아올 때까지 기다린다). 없거나 닫혔으면 None"""
+        while self._read_db is not None:
+            try:
+                return self._readers.get(timeout=0.5)
+            except queue.Empty:
+                continue
+        return None
 
     # ------------------------------------------------------------------ 공통
-    @_locked
     def close(self) -> None:
-        try:
-            self._db.close()
-        except sqlite3.Error:
-            pass
+        with self._read_lock:
+            readers, self._read_all = self._read_all, []
+            self._read_db = None
+        for _ in readers:                   # 조회 중인 연결은 그 조회가 끝나 돌아오면 닫는다
+            try:
+                reader = self._readers.get(timeout=10)
+            except queue.Empty:
+                break
+            try:
+                reader.close()
+            except sqlite3.Error:
+                pass
+        with self._lock:
+            try:
+                self._db.close()
+            except sqlite3.Error:
+                pass
 
     def _migrate(self) -> None:
         """v2 DB 에 v2.1 사용자 컬럼을 추가."""
@@ -429,6 +544,8 @@ class Store:
         self._add_columns('users', (('deputies', "TEXT NOT NULL DEFAULT '[]'"),))   # 대직자 username 목록 (§8.13)
         self._add_columns('messages', (('call_id', 'INTEGER'), ('ladder', 'TEXT'), ('post_id', 'INTEGER')))
         self._add_columns('room_members', (('nickname', 'TEXT'),))
+        # 나중에 들어온 사람은 들어온 뒤의 메시지만 본다 (§4.5): 들어올 때의 마지막 msg_id (0 = 전부 본다)
+        self._add_columns('room_members', (('since_msg_id', 'INTEGER NOT NULL DEFAULT 0'),))
         self._add_columns('attachments', (('expired', 'INTEGER NOT NULL DEFAULT 0'),))
         row = self._one("SELECT sql FROM sqlite_master WHERE type='table' AND name='rooms'")
         if row is not None and "'open'" not in (row['sql'] or ''):
@@ -442,6 +559,25 @@ class Store:
         self._db.execute('CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_root, msg_id)')
         self._db.execute('CREATE INDEX IF NOT EXISTS idx_attachments_expiry ON attachments(expired, created_at)')
         self._db.execute('CREATE INDEX IF NOT EXISTS idx_messages_post ON messages(post_id)')
+        self._db.execute('CREATE INDEX IF NOT EXISTS idx_attachments_uploader ON attachments(uploader, created_at)')
+        # 알림이 있는 일정을 시작 시각 범위로 찾는다 (매초 도는 due_reminders 가 전체 일정을 훑지 않게)
+        self._db.execute('CREATE INDEX IF NOT EXISTS idx_events_remind ON events(start) WHERE remind_minutes IS NOT NULL')
+        # 화면을 여는 조회 (2026-11-18, scripts/bench_server_requests.py): 서랍 · 멘션 모아보기는 그 메시지만 담은
+        # 부분 색인을 최신순으로 훑는다 (예전에는 내 방의 메시지 전체를 훑어 큰 방이 있으면 수백 ms).
+        # 예전 idx_messages_room(room_id, msg_id) 은 idx_messages_room_sender 의 앞부분이라 지운다
+        self._db.execute('DROP INDEX IF EXISTS idx_messages_room')
+        for kind, cond in DRAWER_CONDITIONS.items():
+            self._db.execute(f'CREATE INDEX IF NOT EXISTS idx_messages_drawer_{kind} ON messages(msg_id) WHERE {cond}')
+        self._db.execute(f'CREATE INDEX IF NOT EXISTS idx_messages_mentioned ON messages(msg_id) WHERE {MENTIONED}')
+        # 사용자 목록 캐시의 버전 (2026-11-18): users 의 목록에 보이는 칸이 바뀔 때마다 DB 트리거가 올린다 -
+        # 어느 코드(예전 서버 · 관리자 도구 포함)가 바꿔도 캐시가 틀리지 않게 DB 가 직접 센다
+        self._db.execute('CREATE TABLE IF NOT EXISTS cache_versions (name TEXT PRIMARY KEY, n INTEGER NOT NULL DEFAULT 0)')
+        self._db.execute("INSERT OR IGNORE INTO cache_versions(name, n) VALUES ('users', 0)")
+        bump = "BEGIN UPDATE cache_versions SET n=n+1 WHERE name='users'; END"
+        for name, event in (('ins', 'INSERT'), ('del', 'DELETE'),
+                            ('upd', f"UPDATE OF {', '.join(USER_DIRECTORY_COLUMNS)}")):
+            self._db.execute(f'DROP TRIGGER IF EXISTS trg_users_version_{name}')
+            self._db.execute(f'CREATE TRIGGER trg_users_version_{name} AFTER {event} ON users {bump}')
 
     def _add_columns(self, table: str, columns: Iterable[tuple[str, str]]) -> None:
         existing = {r['name'] for r in self._all(f'PRAGMA table_info({table})')}
@@ -555,15 +691,25 @@ class Store:
         for name in getattr(self, '_demo_hidden', ()):
             self._db.execute("UPDATE users SET company='게스트', department='', title='', org_path='[]' "
                              'WHERE username=? AND org_locked=0', (name,))
-        # org.json 의 admins 는 시작할 때마다 관리자로 올린다 (내리지는 않는다 - 명세 §4.2)
+        # org.json 의 admins 는 처음 한 번만 관리자로 올린다 (명세 §4.2) - 앱에서 해제 · 삭제한 사람을 재시작이 되돌리지 않게.
+        # 그룹 관리자가 한 명도 남지 않았으면(복구) 삭제되지 않은 admins 를 다시 올린다
+        row = self._one("SELECT value FROM org_settings WHERE key='seed_admins'")
+        applied = [n for n in self._json_list(row['value'] if row else '[]') if isinstance(n, str)]
+        recover = self._one("SELECT 1 FROM users WHERE is_admin=1 AND admin_company='' AND is_bot=0 AND removed=0") is None
         for name in getattr(self, '_seed_admins', ()):
-            self._db.execute('UPDATE users SET is_admin=1 WHERE username=? AND is_bot=0', (name,))
+            if name in applied and not recover:
+                continue
+            cur = self._db.execute('UPDATE users SET is_admin=1 WHERE username=? AND is_bot=0 AND removed=0', (name,))
+            if cur.rowcount == 1 and name not in applied:
+                applied.append(name)
+        self._db.execute("INSERT INTO org_settings(key, value) VALUES ('seed_admins', ?) "
+                         'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (json.dumps(applied, ensure_ascii=False),))
 
     def _one(self, sql: str, params: Iterable[Any] = ()) -> Optional[sqlite3.Row]:
-        return self._db.execute(sql, tuple(params)).fetchone()
+        return (getattr(self._tls, 'db', None) or self._db).execute(sql, tuple(params)).fetchone()
 
     def _all(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
-        return self._db.execute(sql, tuple(params)).fetchall()
+        return (getattr(self._tls, 'db', None) or self._db).execute(sql, tuple(params)).fetchall()
 
     # ------------------------------------------------------------------ 사용자
     @staticmethod
@@ -575,6 +721,7 @@ class Store:
             presence = 'vacation'   # 휴가 중은 접속하지 않아도 조직도·친구 목록에 보인다
         if is_bot:
             presence = 'online'
+        keys = row.keys()                   # 예전 DB 를 고려한 칸 확인은 한 번만 (사용자 목록은 로그인마다 수백 명분을 만든다)
         return {
             'username': row['username'],
             'display_name': row['display_name'],
@@ -589,19 +736,21 @@ class Store:
             'is_bot': is_bot,
             'org_path': Store._json_list(row['org_path']),
             'account': row['account'],
-            'employee_no': row['employee_no'] if 'employee_no' in row.keys() else '',
+            'employee_no': row['employee_no'] if 'employee_no' in keys else '',
             'extension': row['extension'],
             'mobile': row['mobile'],
-            'email': row['email'] if 'email' in row.keys() else '',
+            'email': row['email'] if 'email' in keys else '',
             'concurrent': Store._json_list(row['concurrent']),
-            'deputies': Store._json_list(row['deputies']) if 'deputies' in row.keys() else [],
+            'deputies': Store._json_list(row['deputies']) if 'deputies' in keys else [],
             'public_key': row['public_key'],
-            'is_admin': bool(row['is_admin']) if 'is_admin' in row.keys() else False,
-            'admin_company': (row['admin_company'] if 'admin_company' in row.keys() else '') if row['is_admin'] else '',
+            'is_admin': bool(row['is_admin']) if 'is_admin' in keys else False,
+            'admin_company': (row['admin_company'] if 'admin_company' in keys else '') if row['is_admin'] else '',
         }
 
     @staticmethod
     def _json_list(text) -> list:
+        if not text or text == '[]':        # 대부분 빈 목록 - json 해석을 건너뛴다
+            return []
         try:
             value = json.loads(text or '[]')
         except ValueError:
@@ -682,31 +831,63 @@ class Store:
     REGISTER_WRONG_EMAIL = '조직도에 등록된 이메일과 다릅니다. 회사 이메일을 확인하거나 관리자에게 문의해 주세요.'
     REGISTER_NEEDS_ORG_EMAIL = '조직도에 이메일이 등록되지 않아 직접 등록할 수 없습니다. 관리자에게 이메일 등록을 요청해 주세요.'
     REGISTER_ADMIN_BY_TOOL = '관리자 계정은 직접 등록할 수 없습니다. 서버 PC 에서 scripts/set_password.py 로 비밀번호를 정해 주세요.'
+    # 등록이 닫힌 서버(§4.1 '등록 방식')의 거절은 이 한 문구뿐이다 - 계정이 있는지 · 등록됐는지 알려 주지 않는다
+    REGISTER_CLOSED = ('등록할 수 없습니다. 이미 등록했다면 이메일과 비밀번호로 로그인하고, '
+                       '처음이라면 관리자에게 등록 코드나 초기 비밀번호를 요청해 주세요.')
 
-    def register_user(self, username: str, company: str, email: str, password: str, employee_no: str = '') -> bool:
+    def register_user(self, username: str, company: str, email: str, password: str, employee_no: str = '',
+                      code: Optional[str] = None, open_registration: bool = True) -> bool:
         """처음 사용 등록 (명세 §4.1). 새로 만들었으면 True. 안 되면 ValueError(사용자에게 보일 사유).
-        employee_no 는 선택(예전 클라이언트·관리자 도구) — 없으면 이메일이 로그인 아이디가 된다"""
+        employee_no 는 선택(예전 클라이언트·관리자 도구) — 없으면 이메일이 로그인 아이디가 된다.
+        open_registration=False(등록 닫힘)면 조직도에 있는 비밀번호 없는 계정 + 관리자가 발급한 등록 코드(code)만 받는다"""
+        if not open_registration:
+            self._check_closed_registration(username, company, code)   # 안 될 등록에 해싱(느림)을 쓰지 않는다
         return self._register_user(username, company, email, self.hash_password(password),   # 해싱은 잠금 밖
-                                   employee_no.strip())
+                                   employee_no.strip(), code, open_registration)
+
+    def _closed_registration_ok(self, username: str, company: str, code: Optional[str]) -> bool:
+        """등록이 닫힌 서버에서 등록할 수 있는 계정인가 (잠금 안에서 호출)"""
+        row = self._one('SELECT company, is_bot, password_hash, is_admin, disabled, removed FROM users WHERE username=?',
+                        (username,))
+        return bool(row is not None and not row['is_bot'] and not row['password_hash'] and not row['is_admin']
+                    and not row['disabled'] and not row['removed']
+                    and row['company'] in ('', GUEST_COMPANY, company)
+                    and isinstance(code, str) and self._reset_code_ok(username, code))
+
+    REGISTER_NAME_CONFLICT = '다른 사람의 로그인 아이디와 같은 이름은 쓸 수 없습니다. 관리자에게 문의해 주세요.'
+    EMAIL_TAKEN = '이미 다른 사람이 쓰는 이메일입니다.'
+
+    def _login_id_taken(self, value: Optional[str], username: str) -> bool:
+        """value 가 username 아닌 사람의 로그인 아이디(이름 · 사번 · 사내 계정 · 이메일, 대소문자 무시)와 같은가.
+        로그인 아이디는 서로 겹치지 않는다 (명세 §4.1) - 잠금 안에서 호출"""
+        value = (value or '').strip()
+        if not value:
+            return False
+        return self._one(
+            "SELECT 1 FROM users WHERE username<>? AND (lower(username)=lower(?) "
+            "OR (employee_no<>'' AND lower(employee_no)=lower(?)) OR (account<>'' AND lower(account)=lower(?)) "
+            "OR (email<>'' AND lower(email)=lower(?))) LIMIT 1", (username, value, value, value, value)) is not None
+
+    @_locked
+    def _check_closed_registration(self, username: str, company: str, code: Optional[str]) -> None:
+        if not self._closed_registration_ok(username, company, code):
+            raise ValueError(self.REGISTER_CLOSED)
 
     @_locked
     def _register_user(self, username: str, company: str, email: str, password_hash: str,
-                       employee_no: str = '') -> bool:
-        if employee_no:
-            # 사번은 로그인 아이디라 다른 사람의 사번·사내 계정·이름과 겹치면 안 된다
-            taken = self._one("SELECT username FROM users WHERE username<>? AND (username=? OR "
-                              "(employee_no<>'' AND lower(employee_no)=lower(?)) OR "
-                              "(account<>'' AND lower(account)=lower(?)))",
-                              (username, employee_no, employee_no, employee_no))
-            if taken is not None:
-                raise ValueError(self.REGISTER_TAKEN_EMPLOYEE_NO)
-        taken = self._one("SELECT username FROM users WHERE email<>'' AND lower(email)=lower(?) AND username<>?",
-                          (email, username))
-        if taken is not None:
+                       employee_no: str = '', code: Optional[str] = None, open_registration: bool = True) -> bool:
+        if not open_registration and not self._closed_registration_ok(username, company, code):
+            raise ValueError(self.REGISTER_CLOSED)
+        # 사번 · 이메일은 로그인 아이디라 다른 사람의 이름 · 사번 · 사내 계정 · 이메일과 겹치면 안 된다
+        if self._login_id_taken(employee_no, username):
+            raise ValueError(self.REGISTER_TAKEN_EMPLOYEE_NO)
+        if self._login_id_taken(email, username):
             raise ValueError(self.REGISTER_TAKEN_EMAIL)
         row = self._one('SELECT company, is_bot, password_hash, employee_no, email, is_admin FROM users WHERE username=?',
                         (username,))
         if row is None:
+            if self._login_id_taken(username, username):       # 새 이름도 마찬가지
+                raise ValueError(self.REGISTER_NAME_CONFLICT)
             self._db.execute(
                 'INSERT INTO users(username, display_name, status_message, birthday, created_at, company, email, '
                 "password_hash, employee_no) VALUES (?, ?, '', NULL, ?, ?, ?, ?, ?)",
@@ -735,6 +916,8 @@ class Store:
             "company=CASE WHEN company IN ('', ?) THEN ? ELSE company END "
             'WHERE username=? AND password_hash IS NULL',
             (password_hash, email, employee_no, employee_no, GUEST_COMPANY, company, username))
+        if cur.rowcount == 1:
+            self._db.execute('DELETE FROM reset_codes WHERE username=?', (username,))   # 등록 코드는 한 번만 쓴다
         self._db.commit()
         if cur.rowcount != 1:     # 그 사이 다른 연결이 먼저 등록했다
             raise ValueError(self.REGISTER_TAKEN_NAME)
@@ -822,17 +1005,18 @@ class Store:
 
     def reset_password(self, username: str, email: str, password: str, code: str = '') -> Optional[bool]:
         """비밀번호 재설정 (명세 §4.1): 등록된 계정이고 가입 이메일과 관리자가 발급한 재설정 코드가 맞으면
-        새 비밀번호 + 토큰 모두 폐기 + 코드 사용 처리.
-        → True 바꿈 / False 이메일 · 코드 불일치 · 없는 계정 / None 비밀번호를 등록한 적 없는 계정"""
+        새 비밀번호 + 토큰 모두 폐기 + 코드 사용 처리. 비밀번호가 없는 계정은 등록 코드가 맞으면 최초 등록.
+        → True 바꿈 / False 이메일 · 코드 불일치 · 없는 계정 / None 비밀번호를 등록한 적 없는 계정(코드 없음 · 틀림)"""
         return self._reset_password(username, email, self.hash_password(password), code)   # 해싱은 잠금 밖
 
     @_locked
     def _reset_password(self, username: str, email: str, password_hash: str, code: str = '') -> Optional[bool]:
-        row = self._one('SELECT email, password_hash, is_admin FROM users WHERE username=? AND is_bot=0', (username,))
+        row = self._one('SELECT email, password_hash, is_admin, disabled, removed FROM users '
+                        'WHERE username=? AND is_bot=0', (username,))
         if row is None:
             return False
         if not row['password_hash']:
-            return None
+            return self._activate_with_code(username, row, email, password_hash, code)
         if row['is_admin']:
             raise ValueError(self.RESET_ADMIN_BY_TOOL)
         if not row['email'] or row['email'].lower() != email.strip().lower():
@@ -844,6 +1028,25 @@ class Store:
         self._db.execute('DELETE FROM reset_codes WHERE username=?', (username,))   # 한 번만 쓴다
         self._db.commit()
         return True
+
+    def _activate_with_code(self, username: str, row: sqlite3.Row, email: str, password_hash: str,
+                            code: str) -> Optional[bool]:
+        """비밀번호가 없는 계정의 최초 등록을 등록 코드로 (명세 §4.1 '등록 방식', 잠금 안에서 호출).
+        → True 등록함 / False 이메일이 조직도와 다르거나 다른 사람이 쓰는 이메일 / None 코드가 맞지 않음"""
+        if row['is_admin'] or row['disabled'] or row['removed'] or not self._reset_code_ok(username, code):
+            return None
+        email = (email or '').strip()
+        if row['email']:
+            if row['email'].lower() != email.lower():
+                return False
+        elif not email or self._login_id_taken(email, username):
+            return False
+        cur = self._db.execute('UPDATE users SET password_hash=?, email=? WHERE username=? AND password_hash IS NULL',
+                               (password_hash, email, username))
+        self._db.execute('DELETE FROM login_tokens WHERE username=?', (username,))
+        self._db.execute('DELETE FROM reset_codes WHERE username=?', (username,))   # 한 번만 쓴다
+        self._db.commit()
+        return cur.rowcount == 1
 
     @_locked
     def revoke_all_login_tokens(self, username: str) -> None:
@@ -1058,6 +1261,13 @@ class Store:
         return self._file_request_dict(row)
 
     @_locked
+    def reopen_file_request(self, request_id: int) -> None:
+        """승인했지만 보내지 못한 요청을 다시 대기로 돌린다 (파일은 그대로 보관 중)"""
+        self._db.execute("UPDATE file_requests SET status='pending', decided_by=NULL, decided_at=NULL, note='' "
+                         "WHERE request_id=? AND status='approved' AND msg_id IS NULL", (request_id,))
+        self._db.commit()
+
+    @_locked
     def set_file_request_msg(self, request_id: int, msg_id: int) -> dict:
         self._db.execute('UPDATE file_requests SET msg_id=? WHERE request_id=?', (msg_id, request_id))
         self._db.commit()
@@ -1114,21 +1324,19 @@ class Store:
     # ---- 구성원 등록 · 수정 · 삭제 (명세 §4.3) ----
     MEMBER_FIELDS = ('company', 'department', 'title', 'account', 'employee_no', 'extension', 'mobile', 'email')
 
-    def _member_conflict(self, username: str, fields: dict) -> None:
+    def _member_conflict(self, username: str, fields: dict, creating: bool = False) -> None:
+        """로그인 아이디(이름 · 사번 · 사내 계정 · 이메일)는 서로 겹치지 않는다 (명세 §4.1)"""
+        if creating and self._login_id_taken(username, username):
+            raise ValueError('다른 구성원의 로그인 아이디(사번 · 사내 계정)와 같은 이름은 쓸 수 없습니다.')
         for key, label in (('employee_no', '사번'), ('account', '사내 계정'), ('email', '이메일')):
-            value = (fields.get(key) or '').strip()
-            if value and self._one(f"SELECT 1 FROM users WHERE {key}<>'' AND lower({key})=lower(?) AND username<>?",
-                                   (value, username)):
+            if self._login_id_taken(fields.get(key), username):
                 raise ValueError(f'이미 다른 구성원이 쓰는 {label}입니다.')
-        number = (fields.get('employee_no') or '').strip()
-        if number and self._one('SELECT 1 FROM users WHERE username=? AND username<>?', (number, username)):
-            raise ValueError('이미 다른 구성원이 쓰는 사번입니다.')
 
     @_locked
     def member_create(self, username: str, fields: dict) -> None:
         if self._one('SELECT 1 FROM users WHERE username=?', (username,)):
             raise ValueError('이미 있는 이름입니다.')
-        self._member_conflict(username, fields)
+        self._member_conflict(username, fields, creating=True)
         self._db.execute(
             'INSERT INTO users(username, display_name, status_message, birthday, created_at, company, department, '
             'title, account, employee_no, extension, mobile, email, org_path, org_locked) '
@@ -1160,11 +1368,14 @@ class Store:
 
     @_locked
     def member_set_removed(self, username: str, removed: bool) -> None:
-        """삭제(소프트) / 복원. 삭제하면 로그인도 막고 자동 로그인 토큰을 폐기한다"""
+        """삭제(소프트) / 복원. 삭제하면 로그인도 막고 관리자 권한 · 자동 로그인 토큰 · 발급된 코드를 없앤다
+        (복원하면 일반 구성원으로 돌아온다 - 관리자 지정은 그룹 관리자가 다시 한다)"""
         self._db.execute('UPDATE users SET removed=?, disabled=?, org_locked=1 WHERE username=?',
                          (int(removed), int(removed), username))
         if removed:
+            self._db.execute("UPDATE users SET is_admin=0, admin_company='' WHERE username=?", (username,))
             self._db.execute('DELETE FROM login_tokens WHERE username=?', (username,))
+            self._db.execute('DELETE FROM reset_codes WHERE username=?', (username,))
         self._db.commit()
 
     @_locked
@@ -1183,7 +1394,7 @@ class Store:
             return ''
         return path[1] if isinstance(path, list) and len(path) > 1 and isinstance(path[1], str) else ''
 
-    @_locked
+    @_reads
     def admin_user_list(self, online: Iterable[str] = ()) -> list[dict]:
         """관리자 계정 관리 화면용 (봇 제외, 이름순)"""
         online = set(online)
@@ -1202,6 +1413,7 @@ class Store:
         """관리자 초기화: 비밀번호·자동 로그인 토큰 삭제 → 그 사람은 [처음 사용 등록]을 다시 한다"""
         self._db.execute('UPDATE users SET password_hash=NULL WHERE username=?', (username,))
         self._db.execute('DELETE FROM login_tokens WHERE username=?', (username,))
+        self._db.execute('DELETE FROM reset_codes WHERE username=?', (username,))   # 재설정용으로 준 코드가 등록 코드가 되지 않게
         self._db.commit()
 
     @_locked
@@ -1219,7 +1431,23 @@ class Store:
         row = self._one('SELECT * FROM users WHERE username=?', (username,))
         return self._user_dict(row, set(online)) if row else None
 
-    @_locked
+    @_reads
+    def user_directory(self) -> tuple[int, list[tuple[dict, dict]]]:
+        """사용자 목록 캐시 → (버전, [(접속 중일 때의 dict, 접속하지 않았을 때의 dict)]) - list_users 와 같은 사람 · 순서 · 값.
+        users 의 목록 칸이 바뀌면 DB 트리거가 버전을 올리고, 그때만 다시 만든다 (로그인마다 수백 명분을 만들지 않게).
+        돌려준 dict 는 여럿이 함께 쓰므로 고치지 말 것 (덧씌울 때는 새 dict 를 만든다). 버전과 목록은 같은 시점에서 읽는다"""
+        row = self._one("SELECT n FROM cache_versions WHERE name='users'")
+        version = int(row['n']) if row is not None else -1
+        cached = self._directory
+        if cached is not None and version >= 0 and cached[0] == version:
+            return cached
+        rows = self._all('SELECT * FROM users WHERE removed=0 ORDER BY created_at, username')
+        cached = (version, [(self._user_dict(r, (r['username'],)), self._user_dict(r, ())) for r in rows])
+        if version >= 0:
+            self._directory = cached
+        return cached
+
+    @_reads
     def list_users(self, online: Iterable[str] = ()) -> list[dict]:
         online_set = set(online)
         rows = self._all('SELECT * FROM users WHERE removed=0 ORDER BY created_at, username')   # 삭제된 구성원 제외
@@ -1263,6 +1491,8 @@ class Store:
                 for k, v in fields.items() if k in allowed]
         if not sets:
             return
+        if self._login_id_taken(fields.get('email'), username):     # 이메일은 로그인 아이디 (§4.1)
+            raise ValueError(self.EMAIL_TAKEN)
         sql = 'UPDATE users SET ' + ', '.join(f'{k}=?' for k, _ in sets) + ' WHERE username=?'
         self._db.execute(sql, [v for _, v in sets] + [username])
         self._db.commit()
@@ -1311,10 +1541,11 @@ class Store:
         row = self._one('SELECT MAX(msg_id) AS m FROM messages WHERE room_id=?', (room_id,))
         return int(row['m'] or 0)
 
-    def _add_member(self, room_id: str, username: str, pointer: int, nickname: Optional[str] = None) -> None:
+    def _add_member(self, room_id: str, username: str, pointer: int, nickname: Optional[str] = None,
+                    since: int = 0) -> None:
         self._db.execute(
-            'INSERT OR IGNORE INTO room_members(room_id, username, joined_at, nickname) VALUES (?, ?, ?, ?)',
-            (room_id, username, now_iso(), nickname),
+            'INSERT OR IGNORE INTO room_members(room_id, username, joined_at, nickname, since_msg_id) '
+            'VALUES (?, ?, ?, ?, ?)', (room_id, username, now_iso(), nickname, since),
         )
         self._db.execute(
             'INSERT INTO read_pointers(room_id, username, last_read_msg_id) VALUES (?, ?, ?) '
@@ -1399,8 +1630,56 @@ class Store:
     def add_members(self, room_id: str, usernames: list[str]) -> None:
         last = self._last_msg_id(room_id)
         for u in usernames:
-            self._add_member(room_id, u, last)
+            self._add_member(room_id, u, last, since=last)    # 초대받은 사람은 지금부터의 메시지만 본다 (§4.5)
         self._db.commit()
+
+    def _since(self, room_id: str, username: Optional[str]) -> int:
+        """그 사람이 그 방에서 볼 수 있는 메시지의 시작 (이 번호보다 큰 msg_id 만 본다. 잠금 안에서 호출)"""
+        if username is None:
+            return 0
+        row = self._one('SELECT since_msg_id FROM room_members WHERE room_id=? AND username=?', (room_id, username))
+        return int(row['since_msg_id']) if row else 0
+
+    @_locked
+    def message_visible(self, msg_id: int, username: str) -> bool:
+        """username 이 그 메시지를 볼 수 있는가: 방 멤버이고 들어온 뒤의 메시지(또는 들어온 뒤 답글이 달린 스레드 원글)"""
+        row = self._one('SELECT rm.since_msg_id AS since FROM messages m JOIN room_members rm '
+                        'ON rm.room_id=m.room_id AND rm.username=? WHERE m.msg_id=?', (username, msg_id))
+        if row is None:
+            return False
+        since = int(row['since'])
+        return msg_id > since or self._one('SELECT 1 FROM messages WHERE thread_root=? AND msg_id>? LIMIT 1',
+                                           (msg_id, since)) is not None
+
+    @_locked
+    def hidden_from(self, room_id: str, msg_id: int) -> set[str]:
+        """그 메시지를 볼 수 없는 멤버 (그 메시지보다 나중에 들어온 사람)"""
+        hidden = set()
+        for row in self._all('SELECT username, since_msg_id FROM room_members WHERE room_id=? AND since_msg_id>=?',
+                             (room_id, msg_id)):
+            if self._one('SELECT 1 FROM messages WHERE thread_root=? AND msg_id>? LIMIT 1',
+                         (msg_id, int(row['since_msg_id']))) is None:
+                hidden.add(row['username'])
+        return hidden
+
+    @_locked
+    def poll_message_id(self, poll_id: int) -> Optional[int]:
+        row = self._one('SELECT msg_id FROM messages WHERE poll_id=? ORDER BY msg_id LIMIT 1', (poll_id,))
+        return int(row['msg_id']) if row else None
+
+    @_locked
+    def room_since_for_user(self, username: str) -> dict[str, int]:
+        """{방: 그 사람이 보기 시작하는 msg_id} - AI 비서의 근거 범위"""
+        return {r['room_id']: int(r['since_msg_id']) for r in
+                self._all('SELECT room_id, since_msg_id FROM room_members WHERE username=?', (username,))}
+
+    @_locked
+    def fix_display_names(self) -> int:
+        """표시 이름 · 멀티프로필 이름을 실명(username)으로 되돌린다 (§4.5 '표시 이름은 실명으로 고정') → 바꾼 개수"""
+        first = self._db.execute('UPDATE users SET display_name=username WHERE is_bot=0 AND display_name<>username')
+        second = self._db.execute('UPDATE multi_profiles SET display_name=owner WHERE display_name<>owner')
+        self._db.commit()
+        return first.rowcount + second.rowcount
 
     @_locked
     def remove_member(self, room_id: str, username: str) -> None:
@@ -1472,8 +1751,9 @@ class Store:
         ptrs = {r['username']: int(r['last_read_msg_id']) for r in ptr_rows}
         read_pointers = {u: ptrs.get(u, 0) for u in members}
         # 차단한 사람의 메시지는 마지막 메시지/안 읽은 수에서 제외 (명세 §8.6)
-        last = self._one(f'SELECT * FROM messages WHERE room_id=? AND {_NOT_BLOCKED} '
-                         'ORDER BY msg_id DESC LIMIT 1', (room_id, viewer))
+        since = self._since(room_id, viewer)
+        last = self._one(f'SELECT * FROM messages WHERE room_id=? AND msg_id>? AND {_NOT_BLOCKED} '
+                         'ORDER BY msg_id DESC LIMIT 1', (room_id, since, viewer))
         notice = None
         if row['notice_msg_id'] is not None:
             nrow = self._one('SELECT * FROM messages WHERE msg_id=?', (row['notice_msg_id'],))
@@ -1481,7 +1761,7 @@ class Store:
         unread = self._one(
             'SELECT COUNT(*) AS c FROM messages WHERE room_id=? AND msg_id>? AND sender!=? AND kind!=\'system\' '
             f'AND {_NOT_BLOCKED}',
-            (room_id, read_pointers.get(viewer, 0), viewer, viewer),
+            (room_id, max(read_pointers.get(viewer, 0), since), viewer, viewer),
         )['c']
         nick_rows = self._all('SELECT username, nickname FROM room_members WHERE room_id=? AND nickname IS NOT NULL',
                               (room_id,))
@@ -1505,11 +1785,80 @@ class Store:
     def room_dict(self, room_id: str, viewer: str) -> Optional[dict]:
         return self._room_dict(room_id, viewer)
 
-    @_locked
+    _IN_CHUNK = 500           # IN (...) 한 번에 넣는 값의 수
+
+    def _rows_in(self, sql: str, ids: list, before: tuple = ()) -> list[sqlite3.Row]:
+        """sql 의 {marks} 자리에 ids 를 IN 목록으로 넣어 조회 (많으면 나눠서)"""
+        rows: list[sqlite3.Row] = []
+        for start in range(0, len(ids), self._IN_CHUNK):
+            chunk = ids[start:start + self._IN_CHUNK]
+            rows += self._all(sql.format(marks=','.join('?' * len(chunk))), (*before, *chunk))
+        return rows
+
+    @_reads
     def rooms_for_user(self, username: str) -> list[dict]:
-        rows = self._all('SELECT room_id FROM room_members WHERE username=?', (username,))
-        rooms = [self._room_dict(r['room_id'], username) for r in rows]
-        rooms = [r for r in rooms if r is not None]
+        """내가 속한 모든 방의 Room (welcome). 방마다 따로 묻지 않고 종류별로 한 번씩 묶어 조회한다 -
+        _room_dict 와 같은 값을 낸다 (tests/test_kakao_room_list.py 가 둘을 비교한다)"""
+        # 방마다: 내가 보기 시작하는 번호, 마지막 메시지 번호, 안 읽은 수 (차단한 사람 · 들어오기 전 메시지 제외)
+        mine = self._all(
+            'SELECT rm.room_id, rm.since_msg_id AS since, '
+            '(SELECT m.msg_id FROM messages m WHERE m.room_id=rm.room_id AND m.msg_id>rm.since_msg_id '
+            f' AND m.{_NOT_BLOCKED} ORDER BY m.msg_id DESC LIMIT 1) AS last_id, '
+            '(SELECT COUNT(*) FROM messages m WHERE m.room_id=rm.room_id '
+            ' AND m.msg_id>MAX(COALESCE(rp.last_read_msg_id, 0), rm.since_msg_id) '
+            f" AND m.sender!=rm.username AND m.kind!='system' AND m.{_NOT_BLOCKED}) AS unread "
+            'FROM room_members rm LEFT JOIN read_pointers rp ON rp.room_id=rm.room_id AND rp.username=rm.username '
+            'WHERE rm.username=?', (username, username, username))
+        ids = [r['room_id'] for r in mine]
+        if not ids:
+            return []
+        room_rows = {r['room_id']: r for r in self._rows_in('SELECT * FROM rooms WHERE room_id IN ({marks})', ids)}
+        members: dict[str, list[str]] = {}
+        nicknames: dict[str, dict[str, str]] = {}
+        pointers: dict[str, dict[str, int]] = {}
+        # 구성원 · 별명 · 읽은 위치를 한 번에, 가벼운 튜플로 읽는다 (큰 방은 수백 명 - 로그인마다 수천 행이라 행 객체가 비싸다)
+        db = getattr(self._tls, 'db', None) or self._db
+        for start in range(0, len(ids), self._IN_CHUNK):
+            chunk = ids[start:start + self._IN_CHUNK]
+            cur = db.cursor()
+            cur.row_factory = None
+            cur.execute('SELECT rm.room_id, rm.username, rm.nickname, COALESCE(rp.last_read_msg_id, 0) '
+                        'FROM room_members rm LEFT JOIN read_pointers rp '
+                        'ON rp.room_id=rm.room_id AND rp.username=rm.username '
+                        f"WHERE rm.room_id IN ({','.join('?' * len(chunk))}) ORDER BY rm.joined_at, rm.rowid", chunk)
+            for room_id, user, nickname, pointer in cur.fetchall():
+                members.setdefault(room_id, []).append(user)
+                pointers.setdefault(room_id, {})[user] = int(pointer)
+                if nickname is not None:
+                    nicknames.setdefault(room_id, {})[user] = nickname
+        wanted = {int(r['last_id']) for r in mine if r['last_id'] is not None}
+        wanted |= {int(row['notice_msg_id']) for row in room_rows.values() if row['notice_msg_id'] is not None}
+        messages = {int(r['msg_id']): self._message_dict(r)
+                    for r in self._rows_in('SELECT * FROM messages WHERE msg_id IN ({marks})', sorted(wanted))}
+        rooms = []
+        for info in mine:
+            room_id = info['room_id']
+            row = room_rows.get(room_id)
+            if row is None:
+                continue
+            room_members = members.get(room_id, [])
+            ptrs = pointers.get(room_id, {})
+            notice_id = row['notice_msg_id']
+            rooms.append({
+                'room_id': room_id,
+                'type': row['type'],
+                'name': row['name'],
+                'members': room_members,
+                'owner': self._owner(row, room_members),
+                'created_at': row['created_at'],
+                'notice': messages.get(int(notice_id)) if notice_id is not None else None,
+                'last_message': messages.get(int(info['last_id'])) if info['last_id'] is not None else None,
+                'read_pointers': {u: ptrs.get(u, 0) for u in room_members},
+                'unread_count': int(info['unread']),
+                'description': row['description'],
+                'tags': self._json_list(row['tags']),
+                'nicknames': nicknames.get(room_id, {}),
+            })
         rooms.sort(key=lambda r: (r['last_message']['timestamp'] if r['last_message'] else r['created_at']),
                    reverse=True)
         return rooms
@@ -1666,17 +2015,22 @@ class Store:
         if viewer is not None:
             sql += f' AND {_NOT_BLOCKED}'
             params.append(viewer)
+            since = self._since(room_id, viewer)
+            if since:                       # 나중에 들어온 사람은 들어온 뒤의 메시지만 (§4.5)
+                sql += ' AND msg_id>?'
+                params.append(since)
         rows = self._all(sql + ' ORDER BY msg_id DESC LIMIT ?', params + [limit + 1])
         has_more = len(rows) > limit
         rows = list(reversed(rows[:limit]))
         return [self._message_dict(r) for r in rows], has_more
 
-    @_locked
+    @_reads
     def mentions_of(self, username: str, limit: int = 100) -> list[dict]:
         """내가 속한 방에서 나를 멘션한 메시지 (최신순, 삭제·차단 제외) - 멘션 모아보기 (§10.5)"""
-        rows = self._all(
-            'SELECT m.* FROM messages m JOIN room_members rm ON rm.room_id=m.room_id AND rm.username=? '
-            'WHERE m.deleted=0 AND m.sender!=? AND m.mentions LIKE ? '
+        rows = self._all(       # 멘션이 있는 메시지만 담은 부분 색인을 최신순으로 훑는다
+            'SELECT m.* FROM messages m INDEXED BY idx_messages_mentioned '
+            'JOIN room_members rm ON rm.room_id=m.room_id AND rm.username=? '
+            f'WHERE {MENTIONED} AND m.deleted=0 AND m.msg_id>rm.since_msg_id AND m.sender!=? AND m.mentions LIKE ? '
             'AND m.sender NOT IN (SELECT blocked FROM blocks WHERE owner=?) '
             'ORDER BY m.msg_id DESC LIMIT ?',
             (username, username, '%' + json.dumps(username, ensure_ascii=False) + '%', username, limit * 2))
@@ -1695,6 +2049,11 @@ class Store:
         if viewer is not None:
             sql += f' AND {_NOT_BLOCKED}'
             params.append(viewer)
+            root = self._one('SELECT room_id FROM messages WHERE msg_id=?', (root_id,))
+            since = self._since(root['room_id'], viewer) if root else 0
+            if since:
+                sql += ' AND msg_id>?'
+                params.append(since)
         rows = self._all(sql + ' ORDER BY msg_id DESC LIMIT ?', params + [limit])
         return [self._message_dict(r) for r in reversed(rows)]
 
@@ -1799,12 +2158,12 @@ class Store:
         self._db.commit()
         return self._get_message(msg_id)
 
-    @_locked
+    @_reads
     def search(self, username: str, query: str, room_id: Optional[str]) -> list[dict]:
         escaped = query.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
         sql = ('SELECT m.* FROM messages m JOIN room_members rm '
                'ON rm.room_id=m.room_id AND rm.username=? '
-               'WHERE m.kind=\'text\' AND m.deleted=0 AND m.content LIKE ? ESCAPE \'\\\' '
+               'WHERE m.kind=\'text\' AND m.deleted=0 AND m.msg_id>rm.since_msg_id AND m.content LIKE ? ESCAPE \'\\\' '
                'AND m.sender NOT IN (SELECT blocked FROM blocks WHERE owner=?)')
         params: list[Any] = [username, f'%{escaped}%', username]
         if room_id is not None:
@@ -1834,6 +2193,49 @@ class Store:
         return int(cur.lastrowid)
 
     @_locked
+    def uploaded_bytes_since(self, username: str, since: str) -> int:
+        """그 사람이 since(ISO) 뒤로 올린 첨부의 크기 합 (보관 기간이 지나 비운 것도 올린 크기로 센다)"""
+        row = self._one('SELECT COALESCE(SUM(size), 0) AS n FROM attachments WHERE uploader=? AND created_at>=?',
+                        (username, since))
+        return int(row['n'])
+
+    @_locked
+    def unread_count(self, room_id: str, username: str) -> int:
+        """그 방에서 username 이 아직 읽지 않은 메시지 수 (room 의 unread_count 와 같은 계산)"""
+        row = self._one('SELECT last_read_msg_id FROM read_pointers WHERE room_id=? AND username=?', (room_id, username))
+        pointer = int(row['last_read_msg_id']) if row else 0
+        return int(self._one(
+            "SELECT COUNT(*) AS c FROM messages WHERE room_id=? AND msg_id>? AND sender!=? AND kind!='system' "
+            f'AND {_NOT_BLOCKED}', (room_id, pointer, username, username))['c'])
+
+    @_locked
+    def purge_orphan_attachments(self, min_age_hours: float = 24.0) -> int:
+        """어디에서도 쓰지 않는 첨부의 데이터를 지운다 → 지운 개수. 쓰는 곳: 메시지 · 프로필/조직도 사진 · 멀티프로필 ·
+        펑 · 처리 전인 파일 전송 요청 · 아직 보내지 않은 예약 메시지. 올린 지 min_age_hours 가 안 된 것은 건드리지 않는다"""
+        cutoff = (datetime.now() - timedelta(hours=float(min_age_hours))).strftime(ISO_FMT)
+        scheduled = set()
+        for row in self._all('SELECT payload FROM scheduled_messages WHERE delivered=0'):
+            try:
+                value = json.loads(row['payload']).get('attachment_id')
+            except (ValueError, AttributeError):
+                continue
+            if isinstance(value, int):
+                scheduled.add(value)
+        rows = self._all(
+            'SELECT a.attachment_id FROM attachments a WHERE a.expired=0 AND a.created_at<=? '
+            'AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.attachment_id=a.attachment_id) '
+            'AND NOT EXISTS (SELECT 1 FROM users u WHERE a.attachment_id IN (u.avatar_id, u.org_avatar_id)) '
+            'AND NOT EXISTS (SELECT 1 FROM multi_profiles p WHERE p.avatar_id=a.attachment_id) '
+            'AND NOT EXISTS (SELECT 1 FROM stories s WHERE s.attachment_id=a.attachment_id) '
+            "AND NOT EXISTS (SELECT 1 FROM file_requests f WHERE f.attachment_id=a.attachment_id "
+            "AND (f.status='pending' OR (f.status='approved' AND f.msg_id IS NULL)))", (cutoff,))
+        ids = [int(r['attachment_id']) for r in rows if int(r['attachment_id']) not in scheduled]
+        if ids:
+            self._db.executemany("UPDATE attachments SET data=X'', expired=1 WHERE attachment_id=?", [(i,) for i in ids])
+            self._db.commit()
+        return len(ids)
+
+    @_locked
     def get_attachment_for(self, attachment_id: int, username: str) -> Optional[dict]:
         """사용자가 접근 가능한(업로더이거나 참조 메시지가 있는 방의 멤버) 첨부만 반환.
 
@@ -1857,7 +2259,7 @@ class Store:
         if row['uploader'] != username and not is_avatar:
             ok = self._one(
                 'SELECT 1 FROM messages m JOIN room_members rm ON rm.room_id=m.room_id '
-                'WHERE m.attachment_id=? AND m.deleted=0 AND rm.username=? LIMIT 1',
+                'WHERE m.attachment_id=? AND m.deleted=0 AND rm.username=? AND m.msg_id>rm.since_msg_id LIMIT 1',
                 (attachment_id, username))
             if ok is None:
                 return None
@@ -1982,7 +2384,7 @@ class Store:
         self._db.commit()
         return self._event_dict(event_id)
 
-    @_locked
+    @_reads
     def list_events(self, username: str, start: str, end: str) -> list[dict]:
         rows = self._all(
             'SELECT DISTINCT e.event_id FROM events e LEFT JOIN event_attendees a ON a.event_id=e.event_id '
@@ -1990,12 +2392,22 @@ class Store:
             (username, username, end, start))
         return [self._event_dict(r['event_id']) for r in rows]
 
+    MAX_REMIND_MINUTES = 60 * 24 * 30      # 서버가 받는 remind_minutes 의 최댓값 (30일)
+
     @_locked
     def due_reminders(self, now: datetime, grace: timedelta) -> list[tuple[dict, int]]:
         """알림 시각이 지났고 아직 발송하지 않은 일정을 발송 처리 후 (event, minutes) 목록으로 반환."""
         lower = (now - grace).strftime(ISO_FMT)
-        rows = self._all('SELECT event_id, start, remind_minutes FROM events '
-                         'WHERE remind_minutes IS NOT NULL AND start>=?', (lower,))
+        # 알림 시각(start - remind_minutes)이 이미 지난 것만: 시작 시각 범위는 색인(idx_events_remind)으로 좁힌다.
+        # 알림은 길어야 MAX_REMIND_MINUTES 전이므로 그보다 먼 일정은 볼 필요가 없다
+        upper = (now + timedelta(minutes=self.MAX_REMIND_MINUTES) + grace).strftime(ISO_FMT)
+        rows = self._all(
+            'SELECT event_id, start, remind_minutes FROM events '
+            'WHERE remind_minutes IS NOT NULL AND start>=? AND start<=? '
+            "AND strftime('%Y-%m-%dT%H:%M:%S', start, '-' || remind_minutes || ' minutes')<=? "
+            'AND NOT EXISTS (SELECT 1 FROM reminders_sent s WHERE s.event_id=events.event_id '
+            "AND s.remind_at=strftime('%Y-%m-%dT%H:%M:%S', events.start, '-' || events.remind_minutes || ' minutes'))",
+            (lower, upper, now.strftime(ISO_FMT)))
         result = []
         for r in rows:
             try:
@@ -2011,7 +2423,8 @@ class Store:
                 (r['event_id'], remind_at.strftime(ISO_FMT), now_iso()))
             if cur.rowcount == 1:
                 result.append((self._event_dict(r['event_id']), minutes))
-        self._db.commit()
+        if self._db.in_transaction:
+            self._db.commit()
         return result
 
     # ------------------------------------------------------------------ 할 일
@@ -2155,13 +2568,15 @@ class Store:
         return {r['owner'] for r in self._all('SELECT owner FROM blocks WHERE blocked=?', (username,))}
 
     # ------------------------------------------------------------------ v3: 톡서랍(전체)
-    @_locked
+    @_reads
     def drawer(self, username: str, kind: str, limit: int) -> list[dict]:
-        cond = {'image': "m.kind='image'", 'file': "m.kind IN ('file', 'voice')",
-                'link': "m.kind='text' AND (m.content LIKE '%http://%' OR m.content LIKE '%https://%')"}[kind]
+        cond = DRAWER_CONDITIONS[kind]
+        # 그 종류만 담은 부분 색인을 최신순으로 훑으며 내 방인지 본다 (방마다 전체를 훑고 모아 정렬하지 않게 색인을 정한다)
         rows = self._all(
-            'SELECT m.* FROM messages m JOIN room_members rm ON rm.room_id=m.room_id AND rm.username=? '
-            f'WHERE {cond} AND m.deleted=0 AND m.sender NOT IN (SELECT blocked FROM blocks WHERE owner=?) '
+            f'SELECT m.* FROM messages m INDEXED BY idx_messages_drawer_{kind} '
+            'JOIN room_members rm ON rm.room_id=m.room_id AND rm.username=? '
+            f'WHERE {cond} AND m.deleted=0 AND m.msg_id>rm.since_msg_id '
+            'AND m.sender NOT IN (SELECT blocked FROM blocks WHERE owner=?) '
             'ORDER BY m.msg_id DESC LIMIT ?', (username, username, limit))
         return [self._message_dict(r) for r in rows]
 
@@ -2383,7 +2798,7 @@ class Store:
                           json.dumps(participants, ensure_ascii=False)))
         self._db.commit()
 
-    @_locked
+    @_reads
     def call_history(self, username: str, limit: int) -> list[dict]:
         """내가 속한 방의 통화 기록 (최근 순)"""
         rows = self._all(

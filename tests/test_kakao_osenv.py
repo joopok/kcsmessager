@@ -367,13 +367,10 @@ class BuildTest(unittest.TestCase):
         self.assertIn('curl -fL', script)                                   # curl 은 다운로드 표시를 붙이지 않는다
         self.assertIn('xattr -dr com.apple.quarantine', script)
         self.assertIn('APP="KCS Talk.app"', script)
-        if shutil.which('bash'):
-            with tempfile.NamedTemporaryFile('w', suffix='.sh', delete=False) as f:
-                f.write(script)
-            try:
-                self.assertEqual(subprocess.call(['bash', '-n', f.name]), 0)  # 문법 오류 없음
-            finally:
-                os.unlink(f.name)
+        # 문법 검사는 맥 스크립트가 도는 POSIX 에서만: Windows 의 bash(Git · WSL)는 줄바꿈(CRLF로 쓴 임시 파일)과
+        # 경로(C:\...)를 다르게 받아 스크립트와 상관없이 실패한다. 파일 대신 표준 입력(바이트)으로 넘긴다
+        if os.name == 'posix' and shutil.which('bash'):
+            self.assertEqual(subprocess.run(['bash', '-n'], input=script.encode('utf-8')).returncode, 0)
 
     def test_dmg_only_mac_client(self):
         err = io.StringIO()
@@ -526,6 +523,48 @@ class SystemIdleTests(unittest.TestCase):
             with mock.patch.object(osenv.sys, 'platform', platform), \
                     mock.patch.object(osenv, fn, return_value=12.5):
                 self.assertEqual(osenv.system_idle_seconds(), 12.5)
+
+
+def load_ci_smoke():
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'scripts', 'ci_smoke.py')
+    spec = importlib.util.spec_from_file_location('ci_smoke_under_test', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class CiSmokeNativeTests(unittest.TestCase):
+    """scripts/ci_smoke.py native - 그 OS 의 실제 화면 플랫폼으로 도는 점검 (CI 가 세 OS 에서 돌린다)"""
+
+    def setUp(self):
+        self.smoke = load_ci_smoke()
+
+    def test_each_os_uses_its_real_screen_platform(self):
+        for platform, expected in (('darwin', 'cocoa'), ('win32', 'windows'), ('linux', 'xcb')):
+            with mock.patch.object(osenv.sys, 'platform', platform):
+                self.assertEqual(self.smoke.native_platform(), expected)
+
+    def test_parts_cover_the_six_areas_and_unknown_part_is_refused(self):
+        self.assertEqual([name for name, _title, _fn in self.smoke.NATIVE_PARTS],
+                         ['windows', 'files', 'single', 'paths', 'tls', 'screens', 'rtt'])
+        self.assertEqual(self.smoke.native_part(['없는묶음']), 2)
+        self.assertEqual(self.smoke.main(['모르는모드']), 2)
+
+    def test_tls_part_passes_without_a_screen(self):
+        with mock.patch('sys.stdout', io.StringIO()) as out:
+            self.assertTrue(self.smoke.part_tls())
+        self.assertNotIn('✗', out.getvalue())
+
+    def test_one_failing_part_fails_the_whole_run(self):
+        done = mock.Mock(returncode=0, stdout='✓ 항목\n', stderr='')
+        failed = mock.Mock(returncode=1, stdout='✗ 항목\n', stderr='Traceback …')
+        with mock.patch.object(self.smoke.subprocess, 'run', side_effect=[done, failed, done, done, done, done, done]) as run, \
+                mock.patch('sys.stdout', io.StringIO()) as out:
+            self.assertFalse(self.smoke.native())
+        self.assertEqual(run.call_count, 7)                                   # 하나가 실패해도 나머지 묶음은 돈다
+        self.assertIn('Traceback', out.getvalue())                            # 실패한 묶음의 오류 출력을 보여 준다
+        env = run.call_args.kwargs['env']
+        self.assertEqual(env['QT_QPA_PLATFORM'], self.smoke.native_platform())  # 화면 없는 플랫폼으로 돌지 않는다
 
 
 if __name__ == '__main__':

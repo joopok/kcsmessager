@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushBut
                              QListWidgetItem, QFileDialog, QSizePolicy, QMessageBox, QLineEdit)
 
 from client.kakao import theme
+from client.kakao.widgets import exec_and_release
 from client.kakao.widgets import Avatar, make_icon, FlowWidget, disconnect_signals
 from client.kakao.chats_tab import ElidedLabel, TabHeader, user_pixmap, connect_avatar_changed
 from client.kakao.friends_tab import ProfileEditDialog, PresenceButton
@@ -289,6 +290,8 @@ class MoreTab(QWidget):
         self.logout_button = ChevronButton('로그아웃')
         self.logout_button.setToolTip('로그아웃하고 로그인 화면으로 돌아갑니다')
         col.addWidget(SettingRow('현재 계정', self.logout_button, '로그아웃하면 저장된 로그인·자동 로그인도 해제'))
+        self.password_button = ChevronButton('비밀번호 변경')
+        col.addWidget(SettingRow('비밀번호', self.password_button, '로그인 비밀번호를 바꿉니다 (8자 이상)'))
         self.admin_button = ChevronButton('계정 관리')
         self.admin_button.setToolTip('관리자: 계정 비밀번호 재설정 · 사용 중지 · 관리자 지정 · 전체 공지 · 파일 전송 보안')
         self.admin_row = SettingRow('관리자', self.admin_button, '계정 관리 · 전체 공지 · 파일 전송 보안 (관리자에게만 보입니다)')
@@ -371,6 +374,7 @@ class MoreTab(QWidget):
         self.edit_button.clicked.connect(self.edit_profile)
         self.logout_button.clicked.connect(self._confirm_logout)
         self.admin_button.clicked.connect(lambda: self.open_admin())
+        self.password_button.clicked.connect(lambda: self.open_password_change())
         state.users_changed.connect(self._refresh_admin_row)
         state.welcomed.connect(self._refresh_admin_row)
         self.server_save_button.clicked.connect(self.save_server_address)
@@ -530,7 +534,14 @@ class MoreTab(QWidget):
         dlg = AdminDialog(self.state, self.window())
         self.admin_dialog = dlg
         if exec_:
-            dlg.exec_()
+            exec_and_release(dlg)
+        return dlg
+
+    def open_password_change(self, exec_=True):
+        dlg = PasswordChangeDialog(self.state, self.window())
+        self.password_dialog = dlg
+        if exec_:
+            exec_and_release(dlg)
         return dlg
 
     def _section(self, title):
@@ -602,38 +613,29 @@ class MoreTab(QWidget):
         self.presence_button.refresh()
 
     def edit_profile(self):
-        ProfileEditDialog(self.state, self.window()).exec_()
-
+        exec_and_release(ProfileEditDialog(self.state, self.window()))
     def open_wallpaper(self):
         try:
             from client.kakao.wallpaper import WallpaperDialog
         except ImportError:
             QMessageBox.information(self, '배경화면', '배경화면 모듈을 불러올 수 없습니다.')
             return
-        WallpaperDialog(self.settings, parent=self.window()).exec_()
-
+        exec_and_release(WallpaperDialog(self.settings, parent=self.window()))
     def open_rag_docs(self):
-        RagDocsDialog(self.state, self.window()).exec_()
-
+        exec_and_release(RagDocsDialog(self.state, self.window()))
     def open_multi_profile(self):
-        MultiProfileDialog(self.state, self.window()).exec_()
-
+        exec_and_release(MultiProfileDialog(self.state, self.window()))
     def open_friend_manage(self):
-        FriendManageDialog(self.state, self.window()).exec_()
-
+        exec_and_release(FriendManageDialog(self.state, self.window()))
     def open_keywords(self):
-        KeywordAlertDialog(self.settings, self.window()).exec_()
-
+        exec_and_release(KeywordAlertDialog(self.settings, self.window()))
     def open_dnd(self):
         from client.kakao.dnd import DndDialog
-        DndDialog(self.state, self.settings, self.window()).exec_()
-
+        exec_and_release(DndDialog(self.state, self.settings, self.window()))
     def open_bubble_style(self):
-        BubbleStyleDialog(self.settings, self.window()).exec_()
-
+        exec_and_release(BubbleStyleDialog(self.settings, self.window()))
     def open_lock_settings(self):
-        LockSettingsDialog(self.state, self.settings, self.window()).exec_()
-
+        exec_and_release(LockSettingsDialog(self.state, self.settings, self.window()))
     def open_feature_tour(self):
         win = self.window()
         if win is not self and hasattr(win, 'open_feature_tour'):
@@ -740,6 +742,9 @@ class MultiProfileDialog(QDialog):
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.name_edit = QLineEdit()
+        if not state.display_name_editable():      # 이름을 실명으로 고정한 서버: 멀티프로필 이름도 실명 그대로
+            self.name_edit.setReadOnly(True)
+            self.name_edit.setToolTip('이름은 조직도에 등록된 이름으로 고정되어 바꿀 수 없습니다.')
         self.name_edit.setMaxLength(20)
         self.name_edit.setPlaceholderText('예: 회사용, 동호회')
         self.display_edit = QLineEdit()
@@ -1386,6 +1391,98 @@ class BubbleStyleDialog(QDialog):
 
 
 # ================================================================ v3: 잠금모드 설정 (§8.11)
+class PasswordChangeDialog(QDialog):
+    """로그인 비밀번호 변경 (명세 §4.1 password_change). 바꾸면 다른 기기의 접속은 다시 로그인해야 한다.
+    이 요청을 모르는 예전 서버에서는 안내만 한다"""
+
+    def __init__(self, state, parent=None):
+        super().__init__(parent)
+        from PyQt5.QtWidgets import QFormLayout, QLineEdit
+        from client.kakao.login import NEW_PASSWORD_MIN, PASSWORD_MAX
+        self.state = state
+        self.min_length, self.max_length = NEW_PASSWORD_MIN, PASSWORD_MAX
+        self.setWindowTitle('비밀번호 변경')
+        self.setMinimumWidth(theme.px(360))
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 18, 22, 16)
+        layout.setSpacing(10)
+        title = QLabel('비밀번호 변경')
+        title.setStyleSheet(f"font-size: {theme.fs('lead')}px; font-weight: bold;")
+        layout.addWidget(title)
+        hint = QLabel('바꾸면 다른 PC 에 로그인되어 있던 접속은 다시 로그인해야 합니다.')
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {theme.c('text_sub')}; font-size: {theme.fs('meta')}px;")
+        layout.addWidget(hint)
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.current_edit, self.new_edit, self.confirm_edit = QLineEdit(), QLineEdit(), QLineEdit()
+        for edit, placeholder in ((self.current_edit, '지금 쓰는 비밀번호'),
+                                  (self.new_edit, f'{self.min_length}~{self.max_length}자'),
+                                  (self.confirm_edit, '한 번 더 입력')):
+            edit.setEchoMode(QLineEdit.Password)
+            edit.setMaxLength(self.max_length)
+            edit.setPlaceholderText(placeholder)
+        form.addRow('현재 비밀번호', self.current_edit)
+        form.addRow('새 비밀번호', self.new_edit)
+        form.addRow('비밀번호 확인', self.confirm_edit)
+        layout.addLayout(form)
+        self.message = QLabel('')
+        self.message.setWordWrap(True)
+        layout.addWidget(self.message)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton('취소')
+        self.ok_button = QPushButton('변경')
+        self.ok_button.setProperty('primary', True)
+        self.ok_button.setDefault(True)
+        buttons.addWidget(cancel)
+        buttons.addWidget(self.ok_button)
+        layout.addLayout(buttons)
+        cancel.clicked.connect(self.reject)
+        self.ok_button.clicked.connect(self.submit)
+        state.password_changed.connect(self._on_changed)
+        state.password_change_failed.connect(self._on_failed)
+
+    def _say(self, text, error=True):
+        self.message.setText(text)
+        self.message.setStyleSheet(f"color: {theme.c('danger_text') if error else theme.c('text_sub')};"
+                                   f" font-size: {theme.fs('meta')}px;")
+
+    def submit(self):
+        old, new, again = self.current_edit.text(), self.new_edit.text(), self.confirm_edit.text()
+        if not old:
+            self.current_edit.setFocus()
+            return self._say('현재 비밀번호를 입력해 주세요.')
+        if not self.min_length <= len(new) <= self.max_length:
+            self.new_edit.setFocus()
+            return self._say(f'새 비밀번호는 {self.min_length}~{self.max_length}자로 입력해 주세요.')
+        if new != again:
+            self.confirm_edit.setFocus()
+            return self._say('새 비밀번호가 서로 다릅니다.')
+        if new == old:
+            self.new_edit.setFocus()
+            return self._say('새 비밀번호가 현재 비밀번호와 같습니다.')
+        from client.kakao import login
+        if not self.state.change_password(old, new, remember=login.load_saved_login() is not None):
+            return self._say('서버에 연결되어 있지 않습니다. 연결된 뒤 다시 시도해 주세요.')
+        self.ok_button.setEnabled(False)
+        self._say('바꾸는 중…', error=False)
+
+    def _on_changed(self, _p):
+        self.accept()
+
+    def _on_failed(self, message, _code):
+        self.ok_button.setEnabled(True)
+        if '알 수 없는 요청' in (message or ''):        # 예전 서버: 이 요청을 모른다
+            message = '이 서버는 메신저에서 비밀번호 변경을 지원하지 않습니다. 관리자에게 문의해 주세요.'
+        self._say(message)
+
+    def done(self, result):
+        disconnect_signals((self.state.password_changed, self._on_changed),
+                           (self.state.password_change_failed, self._on_failed))
+        super().done(result)
+
+
 class LockSettingsDialog(QDialog):
     """잠금 비밀번호 설정/변경/해제, 자동 잠금 시간, 지금 잠그기"""
 

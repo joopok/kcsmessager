@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTabWidg
 from client.kakao import theme
 from client.kakao import osenv
 from client.kakao.state import parse_dt, URL_RE
-from client.kakao.widgets import make_icon, human_size as _human_size
+from client.kakao.widgets import make_icon, decode_pixmap, plain, human_size as _human_size
 
 KINDS = ('image', 'file', 'link')
 KIND_LABELS = {'image': '사진', 'file': '파일', 'link': '링크'}
@@ -73,7 +73,7 @@ class FileRow(QWidget):
         row.addWidget(icon)
         col = QVBoxLayout()
         col.setSpacing(2)
-        self.name_label = QLabel(att.get('name') or message.get('content') or '파일')
+        self.name_label = plain(QLabel(att.get('name') or message.get('content') or '파일'))
         self.name_label.setObjectName('cardTitle')
         meta = [human_size(att.get('size')), dialog.room_name(message), short_time(message.get('timestamp'))]
         self.meta_label = QLabel(' · '.join(x for x in meta if x))
@@ -271,8 +271,8 @@ class TalkDrawerDialog(QDialog):
                 self.links.setItemWidget(item, row)
 
     def _set_thumb(self, aid, data):
-        pm = QPixmap()
-        if not pm.loadFromData(data):
+        pm = decode_pixmap(data)
+        if pm is None:
             return
         pm = pm.scaled(THUMB, THUMB, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
         x, y = max(0, (pm.width() - THUMB) // 2), max(0, (pm.height() - THUMB) // 2)
@@ -318,6 +318,7 @@ class TalkDrawerDialog(QDialog):
         try:
             with open(path, 'wb') as f:
                 f.write(data)
+            osenv.mark_from_network(path)
         except OSError as e:
             self.status_label.setText(f'저장하지 못했습니다: {e}')
             return

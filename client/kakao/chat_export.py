@@ -6,7 +6,10 @@
 UI 는 소켓을 직접 만지지 않는다: 기록은 AppState.request_export, 첨부는 AppState.request_attachment 로 받는다.
 """
 
+import os
 import re
+import shutil
+import tempfile
 import zipfile
 from datetime import date, timedelta
 
@@ -159,13 +162,19 @@ class AttachmentCollector(QObject):
         self.state = state
         self.queue = attachment_messages(messages)
         self.total = len(self.queue)
-        self.files, self.notes = {}, {}
+        self.files, self.notes = {}, {}       # files: {msg_id: (zip 안 경로, 받은 원본을 잠시 둔 디스크 경로)}
         self._current = None
         self._used_names = set()
+        self._in_next = False
+        self._again = False
+        self._spool = None                    # 받은 원본을 모아 두는 임시 폴더 (메모리에 다 들고 있지 않는다)
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(timeout_ms or ATTACHMENT_TIMEOUT_MS)
-        self._timer.timeout.connect(lambda: self._skip('받지 못함(응답 없음)'))
+        self._timer.timeout.connect(self._on_timeout)     # 람다가 아니라 메서드: 수집기가 사라지면 연결도 사라진다
+
+    def _on_timeout(self):
+        self._skip('받지 못함(응답 없음)')
 
     def start(self):
         self.state.quiet_attachment_errors = True
@@ -184,25 +193,50 @@ class AttachmentCollector(QObject):
         그 뒤로 어느 방에서도 첨부 받기 오류가 보이지 않았다"""
         self.queue = []
         self._stop()
+        self.cleanup()
+
+    def cleanup(self):
+        """임시로 받아 둔 원본을 지운다 (zip 을 다 쓴 뒤 · 그만둘 때)"""
+        if self._spool:
+            shutil.rmtree(self._spool, ignore_errors=True)
+            self._spool = None
 
     def _done(self):
         self._stop()
         self.finished.emit(self.files, self.notes)
 
     def _next(self):
-        self.progress.emit(len(self.files) + len(self.notes), self.total)
-        while self.queue:
-            m = self.queue.pop(0)
-            meta = m['attachment']
-            if meta.get('expired'):
-                self.notes[m['msg_id']] = '포함되지 않음: 보관 기간 만료'
-                continue
-            self._current = m
-            self._timer.start()
-            self.state.request_attachment(meta['attachment_id'])
+        """다음 첨부를 요청한다. 이미 받아 둔 첨부는 request_attachment 안에서 바로 attachment_loaded 가 와서
+        _on_loaded → _next 로 다시 들어온다 - 그때는 표시만 하고 여기 반복문이 이어 받는다
+        (예전에는 받아 둔 첨부 수백 개가 이어지면 호출이 그만큼 겹쳐 RecursionError 로 저장이 멈췄다)"""
+        if self._in_next:
+            self._again = True
             return
-        self._current = None
-        self._done()
+        self._in_next = True
+        try:
+            while True:
+                self._again = False
+                self.progress.emit(len(self.files) + len(self.notes), self.total)
+                requested = False
+                while self.queue:
+                    m = self.queue.pop(0)
+                    meta = m['attachment']
+                    if meta.get('expired'):
+                        self.notes[m['msg_id']] = '포함되지 않음: 보관 기간 만료'
+                        continue
+                    self._current = m
+                    self._timer.start()
+                    self.state.request_attachment(meta['attachment_id'])
+                    requested = True
+                    break
+                if not requested:
+                    self._current = None
+                    self._done()
+                    return
+                if not self._again:          # 서버 응답을 기다린다
+                    return
+        finally:
+            self._in_next = False
 
     def _file_path(self, m, name):
         base = safe_name(name or (m['attachment'].get('name')), f"attachment_{m['msg_id']}")
@@ -217,9 +251,22 @@ class AttachmentCollector(QObject):
         if m is None or m['attachment'].get('attachment_id') != attachment_id:
             return
         self._timer.stop()
-        self.files[m['msg_id']] = (self._file_path(m, name), bytes(data))
+        rel = self._file_path(m, name)
+        try:
+            self.files[m['msg_id']] = (rel, self._keep(m['msg_id'], data))
+        except OSError as e:
+            self.notes[m['msg_id']] = f'포함되지 않음: 임시 저장 실패 ({e.__class__.__name__})'
         self._current = None
         self._next()
+
+    def _keep(self, msg_id, data):
+        """받은 원본을 임시 폴더에 써 두고 그 경로 (사진 · 파일이 수천 개여도 메모리에 쌓지 않는다)"""
+        if self._spool is None:
+            self._spool = tempfile.mkdtemp(prefix='kcs_export_')
+        path = os.path.join(self._spool, f'{msg_id}.bin')
+        with open(path, 'wb') as f:
+            f.write(data)
+        return path
 
     def _on_failed(self, reason):
         if self._current is not None:
@@ -241,7 +288,10 @@ def write_zip(path, text, csv_text, files):
         zf.writestr('대화.txt', text)
         zf.writestr('대화.csv', csv_text.encode('utf-8'))
         for rel, data in files.values():
-            zf.writestr(rel, data)
+            if isinstance(data, (bytes, bytearray)):
+                zf.writestr(rel, data)
+            else:                               # AttachmentCollector 가 임시 폴더에 써 둔 원본
+                zf.write(data, rel)
 
 
 def file_marks(files, notes):

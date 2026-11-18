@@ -204,6 +204,34 @@ class ChatRoomWindowTitleBarTests(unittest.TestCase):
         # 분할 화면 안에서는 원래 여백, 별도 창으로 꺼내면 신호등 높이만큼 헤더를 내린다(헤더가 창 맨 위까지)
         self.assertEqual(values, ['False', '10', 'True', str(10 + macos.TITLE_BAR_HEIGHT)])
 
+    @unittest.skipUnless(sys.platform == 'darwin', 'macOS 전용')
+    def test_cocoa_room_window_opens_where_it_was_placed(self):
+        """showEvent 안에서 제목 표시줄을 바꾸면(아직 화면에 놓이기 전) macOS 가 창을 그 모니터 왼쪽 끝으로 옮겼다 -
+        메인 창 오른쪽에 열려야 할 채팅방 창이 700px 넘게 떨어진 곳에 떴다 (2026-11-18, 보조 모니터에서 확인)"""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        code = ("import os, time\n"
+                "os.environ['QT_QPA_PLATFORM'] = 'cocoa'\n"
+                "from tests.kakao_fakes import make_demo_state, app\n"
+                "state, _c = make_demo_state()\n"
+                "from client.kakao.chat_room import ChatRoomWindow\n"
+                "a = app(); avail = a.primaryScreen().availableGeometry()\n"
+                "x, y = avail.right() - 520, avail.top() + avail.height() // 4\n"
+                "r = ChatRoomWindow(state, sorted(state.rooms)[0]); r.move(x, y); r.show()\n"
+                "end = time.time() + 0.6\n"
+                "while time.time() < end: a.processEvents(); time.sleep(0.01)\n"
+                "print(x, y, r.pos().x(), r.pos().y(), flush=True)\n"
+                "os._exit(0)\n")
+        env = dict(os.environ, QT_QPA_PLATFORM='cocoa')
+        result = subprocess.run([sys.executable, '-c', code], cwd=root, env=env, capture_output=True,
+                                text=True, timeout=60)
+        if result.returncode != 0 or not result.stdout.strip():
+            self.skipTest(f'GUI 세션이 없어 cocoa 창을 띄울 수 없음: {result.stderr.strip()[-80:]}')
+        want_x, want_y, got_x, got_y = map(int, result.stdout.split())
+        # 고친 버그는 '모니터 왼쪽 끝으로 옮겨짐' → 가로 위치는 그대로여야 한다. 세로는 화면이 작은 가상 화면(CI 러너)에서
+        # macOS 가 창을 메뉴 막대 · 보이는 영역 안으로 조금 밀어 내리기도 해서(러너에서 +60px) 그만큼은 허용한다
+        self.assertEqual(got_x, want_x)
+        self.assertLessEqual(abs(got_y - want_y), 80, (want_y, got_y))
+
 
 class DialogTitleBarTests(unittest.TestCase):
     """모든 팝업: macOS 제목 표시줄을 본문과 같은 색으로 (시스템 다크 모드 + 앱 밝은 테마여도 검게 그리지 않는다)"""

@@ -138,7 +138,8 @@ class AddFriendE2ETest(unittest.TestCase):
             outsider.update_profile(mobile='010-4321-8765', email='partner@kct.co.kr')
             self.assertTrue(pump(lambda: hong.user('외부파트너').get('mobile') == '010-4321-8765'))
             self.assertEqual(hong.user('외부파트너').get('email'), '')          # 다른 사람의 이메일은 오지 않는다
-            self.assertEqual(outsider.user('외부파트너').get('email'), 'partner@kct.co.kr')   # 본인에게는 온다
+            # 본인에게는 온다 (두 연결의 도착 순서는 정해져 있지 않으므로 본인 쪽도 기다린다)
+            self.assertTrue(pump(lambda: outsider.user('외부파트너').get('email') == 'partner@kct.co.kr'))
             added = []
             hong.friend_added.connect(lambda u, already: added.append((u['username'], already)))
             self.assertIsNone(hong.add_friend('010 4321 8765'))

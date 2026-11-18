@@ -30,7 +30,8 @@ def _attach_log_when_no_console():
         return None
     from client.kakao import osenv as _osenv           # (PyQt 를 부르지 않는 가벼운 모듈)
     try:
-        os.makedirs(_osenv.app_path('logs'), exist_ok=True)
+        _osenv.make_private_dir(_osenv.app_home())
+        _osenv.make_private_dir(_osenv.app_path('logs'))
         log = open(_osenv.app_path('logs', 'kcs_talk.log'), 'a', encoding='utf-8', buffering=1)
     except OSError:
         return None
@@ -66,9 +67,31 @@ def parse_args(argv=None):
     parser.add_argument('--password', default='', help='비밀번호 (틀리거나 필요하면 로그인 창)')
     parser.add_argument('--no-auto-login', action='store_true',
                         help='저장된 자동 로그인을 쓰지 않고 항상 로그인 창 (런처에서 여러 사람으로 창을 열 때)')
+    parser.add_argument('--new-instance', action='store_true',
+                        help='이미 실행 중이어도 창을 하나 더 띄운다 (기본: 같은 PC 에서는 하나만 실행)')
+    parser.add_argument('--after-relaunch', action='store_true', help=argparse.SUPPRESS)   # 로그아웃 뒤 다시 실행
     parser.add_argument('--self-check', action='store_true',
                         help='창을 띄우지 않고 OS · 글꼴 · 로고 · 데이터 폴더를 점검하고 끝낸다 (빌드한 앱 확인용)')
     return parser.parse_args(argv)
+
+
+def single_instance_wanted(args):
+    """보통의 실행(아이콘 더블클릭)만 하나로 제한한다. 사람을 지정해 띄우는 실행(--user · --no-auto-login: 런처 · 데모가
+    여러 사람 창을 띄울 때), --new-instance, 점검 모드는 제한하지 않는다"""
+    return not (args.user.strip() or args.no_auto_login or args.new_instance or args.self_check)
+
+
+def show_running_app(app):
+    """다른 실행이 '창을 보여 달라'고 알렸을 때: 메인 창(트레이로 숨었으면 다시 꺼내서) 또는 떠 있는 로그인 창을 앞으로"""
+    session = getattr(app, '_kcs_session', None)
+    window = getattr(session, 'window', None)
+    if window is not None:
+        window.bring_to_front()
+        return
+    for w in app.topLevelWidgets():
+        if w.isVisible():
+            w.raise_()
+            w.activateWindow()
 
 
 def self_check(out=print):
@@ -92,19 +115,32 @@ def setup_high_dpi():
     osenv.prepare_process()
 
 
-def ask_connection_failure(host, port, error):
+def ask_connection_failure(host, port, error, tls=False):
     """연결 실패 안내. 'retry' / 'quit' (서버 주소는 그룹 관리자만 더보기 → 정보에서 바꾼다)"""
     box = QMessageBox()
     box.setIcon(QMessageBox.Warning)
     box.setWindowTitle('서버 연결 실패')
     box.setText('서버에 연결할 수 없습니다.')
-    box.setInformativeText(f'{host}:{port}\n잠시 후 다시 시도해 보고, 계속 안 되면 관리자에게 문의해 주세요.')
+    hint = ''
+    if tls and any(word in str(error).upper() for word in ('SSL', 'TLS', 'CERTIFICATE')):
+        # 다른 컴퓨터의 서버에는 기본으로 TLS 로 붙는다 - 서버가 TLS 를 쓰지 않으면 여기서 실패한다
+        hint = '\nTLS(암호화) 연결을 맺지 못했습니다. 서버가 TLS 를 쓰지 않는다면 관리자에게 이 PC 의 접속 설정을 확인해 달라고 해 주세요.'
+    box.setInformativeText(f'{host}:{port}\n잠시 후 다시 시도해 보고, 계속 안 되면 관리자에게 문의해 주세요.' + hint)
     box.setDetailedText(str(error))
     retry = box.addButton('다시 시도', QMessageBox.AcceptRole)
     box.addButton('종료', QMessageBox.RejectRole)
     box.setDefaultButton(retry)
     box.exec_()
     return 'retry' if box.clickedButton() is retry else 'quit'
+
+
+KEEP_LOGIN_CODES = ('throttled', 'server_error', 'rate_limited')
+
+
+def keeps_saved_login(code):
+    """join 이 거절됐지만 잠깐 막힌 것뿐인가 (시도가 너무 많음 · 서버 쪽 문제) - 저장된 로그인을 지우지 않고 조금 뒤 다시 시도한다.
+    구분 코드가 없으면(예전 서버) False: 지금까지처럼 로그인 창으로 돌아간다"""
+    return code in KEEP_LOGIN_CODES
 
 
 class Session:
@@ -135,11 +171,19 @@ class Session:
         self._retry_timer = QTimer()
         self._retry_timer.setSingleShot(True)
         self._retry_timer.timeout.connect(self._auto_reconnect)
+        # 연결만 되고 서버가 답(welcome)하지 않는 경우: 기다리다 끊고 다시 시도한다 (간격은 계속 늘어난다)
+        self._reconnecting = False     # 소켓을 여는 중 (그동안 화면은 계속 돌므로 다시 들어오지 않게)
+        self._welcome_timer = QTimer()
+        self._welcome_timer.setSingleShot(True)
+        self._welcome_timer.timeout.connect(self._on_welcome_timeout)
+        self.state.welcomed.connect(self._on_welcomed)
         self.state.connection_lost.connect(self._schedule_reconnect)
         self.state.login_failed.connect(self._on_login_failed)
         self.state.account_disabled.connect(self._on_login_failed)   # 관리자가 사용 중지 → 재연결하지 않고 로그인 창
+        self.state.session_expired.connect(self._on_login_failed)    # 비밀번호가 바뀜 → 재연결하지 않고 로그인 창
 
     RETRY_DELAYS = (1, 2, 4, 8, 10)
+    WELCOME_TIMEOUT_MS = 15000
 
     def retry_delay(self):
         return self.RETRY_DELAYS[min(self._retry, len(self.RETRY_DELAYS) - 1)]
@@ -153,35 +197,60 @@ class Session:
         self._retry_timer.start(delay * 1000)
 
     def _auto_reconnect(self):
-        if self._closing or self.conn.is_connected:
+        if self._closing or self.conn.is_connected or self._reconnecting:
             return
-        ok, _msg = self.reconnect()
-        if ok:
-            self._retry = 0
-        else:
-            self._retry += 1
+        self._retry += 1            # 간격은 서버가 welcome 으로 답해야 처음으로 돌아간다 (_on_welcomed).
+        ok, _msg = self.reconnect()  # 앞단(nginx)만 살아 있어 연결은 되고 바로 끊기는 동안에도 간격이 늘어난다
+        if not ok:
             self._schedule_reconnect()
+
+    def _on_welcomed(self):
+        self._retry = 0
+        self._welcome_timer.stop()
+
+    def _on_welcome_timeout(self):
+        if not self._closing and self.conn.is_connected:
+            self.conn.drop('서버가 응답하지 않습니다')    # 끊김 신호 → 자동 재연결
 
     def _credentials(self):
         """재연결은 받은 토큰 → 저장된 토큰 → 비밀번호 순으로 쓴다"""
         token = self.state.login_token or self.token
-        return {'token': token} if token else {'password': self.password}
+        return {'token': token} if token else {'password': self.state.session_password or self.password}
+
+    def _open_socket(self):
+        """서버 소켓을 연다 → (소켓, '') 또는 (None, 오류 문구). 연결을 기다리는 동안에도 화면은 멈추지 않는다"""
+        from client.kakao.net import open_socket_responsive
+        return open_socket_responsive(self.host, self.port, tls=self.tls)
 
     def connect(self):
+        """처음 연결. 실패하면 OSError"""
+        sock, error = self._open_socket()
+        if sock is None:
+            raise OSError(error)
         if self.registration:      # 재연결은 등록된 비밀번호로 join 한다
-            self.conn.connect_to(self.host, self.port, self.username, registration=self.registration,
-                                 remember=self.remember, tls=self.tls)
+            self.conn.attach(sock, self.username, registration=self.registration, remember=self.remember)
         elif self.token:
-            self.conn.connect_to(self.host, self.port, self.username, token=self.token, tls=self.tls)
+            self.conn.attach(sock, self.username, token=self.token)
         else:
-            self.conn.connect_to(self.host, self.port, self.username, password=self.password,
-                                 remember=self.remember, tls=self.tls)
+            self.conn.attach(sock, self.username, password=self.password, remember=self.remember)
 
     def reconnect(self):
         """같은 host/port/user로 새 연결을 만들어 상태에 붙인다 → (성공, 메시지)
         join 이 거절되면 login_failed → _on_login_failed 가 처리한다"""
         from client.kakao.net import ChatConnection
         from client.kakao.widgets import disconnect_signals
+        if self._reconnecting:
+            return False, '재연결하는 중입니다'
+        self._reconnecting = True
+        try:
+            sock, error = self._open_socket()     # 화면은 계속 돈다 (서버가 응답하지 않아도 창이 멈추지 않는다)
+        finally:
+            self._reconnecting = False
+        if sock is None:
+            return False, f'재연결 실패: {error}'
+        if self._closing:                         # 기다리는 사이 로그아웃 · 종료
+            sock.close()
+            return False, '연결을 닫는 중입니다'
         conn = ChatConnection()
         old = self.conn
         # join 을 보내기 전에 붙인다: 읽기 스레드가 welcome 을 받는 순간 아무도 듣고 있지 않으면 그 응답은 사라진다.
@@ -190,28 +259,35 @@ class Session:
         conn.disconnected.connect(self.state.connection_lost)
         self.state.conn = conn
         self.state.history_requested.clear()  # 열려 있는 방은 다시 히스토리를 받는다
-        try:
-            conn.connect_to(self.host, self.port, self.state.me or self.username, tls=self.tls, **self._credentials())
-        except OSError as e:
-            disconnect_signals((conn.event_received, self.state.handle),
-                               (conn.disconnected, self.state.connection_lost))
-            self.state.conn = old
-            return False, f'재연결 실패: {e}'
+        conn.attach(sock, self.state.me or self.username, **self._credentials())
         disconnect_signals((old.event_received, self.state.handle), (old.disconnected, self.state.connection_lost))
         try:
             old.close()           # 수동 재연결이면 예전 연결이 아직 살아 있을 수 있다
         except Exception:
             pass
         self.conn = conn
-        self._retry = 0
         self._retry_timer.stop()  # 수동 재연결이 먼저 성공했으면 예약된 자동 재연결이 새 연결을 끊지 않게
+        self._welcome_timer.start(self.WELCOME_TIMEOUT_MS)
         return True, ''
 
     def _on_login_failed(self, reason):
         if self.window is None:      # 첫 로그인은 wait_for_login 이 처리
             return
+        error = self.state.login_error
+        if keeps_saved_login(error.get('code')):
+            # 잠깐 막힌 것(시도가 너무 많음 · 서버 문제): 저장된 로그인은 그대로 두고, 서버가 알려 준 시간 뒤에 다시 붙는다
+            self._welcome_timer.stop()
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            wait = max(self.retry_delay(), int(error.get('retry_after') or 0))
+            self.window.show_reconnecting(wait)
+            self._retry_timer.start(wait * 1000)
+            return
         self._closing = True         # 다시 붙어도 또 거절된다 → 재시도 멈춤
         self._retry_timer.stop()
+        self._welcome_timer.stop()
         try:
             self.conn.close()
         except Exception:
@@ -222,6 +298,7 @@ class Session:
     def close(self):
         self._closing = True
         self._retry_timer.stop()
+        self._welcome_timer.stop()
         try:
             self.conn.close()
         except Exception:
@@ -273,6 +350,8 @@ def relaunch_to_login():
         if a.startswith(('--user=', '--password=')):
             continue
         args.append(a)
+    if '--after-relaunch' not in args:
+        args.append('--after-relaunch')     # 새 실행이 이 실행이 끝나기를 기다렸다가 뜨게 (하나만 실행 규칙)
     program, program_args = osenv.relaunch_command([sys.argv[0]] + args)
     QProcess.startDetached(program, program_args)
     QApplication.quit()
@@ -282,7 +361,7 @@ def wait_for_login(state, timeout_ms=10000):
     """join 결과를 기다린다 → ('ok'|'failed'|'lost'|'timeout', 사유)
     중첩 QEventLoop 대신 이벤트를 직접 돌린다(앞서 quit()가 불렸으면 QEventLoop.exec_는 바로 끝난다)"""
     import time
-    from PyQt5.QtCore import QEventLoop
+    from client.kakao.widgets import pump_events
     result = []
     hooks = ((state.welcomed, lambda: result or result.append(('ok', ''))),
              (state.login_failed, lambda reason: result or result.append(('failed', reason))),
@@ -290,9 +369,8 @@ def wait_for_login(state, timeout_ms=10000):
     for signal, slot in hooks:
         signal.connect(slot)
     deadline = time.monotonic() + timeout_ms / 1000
-    app = QCoreApplication.instance()
     while not result and time.monotonic() < deadline:
-        app.processEvents(QEventLoop.AllEvents, 50)
+        pump_events(50)
         time.sleep(0.01)
     for signal, slot in hooks:
         signal.disconnect(slot)
@@ -360,9 +438,12 @@ def install_interrupt_quit(app):
 
 def main(argv=None):
     args = parse_args(argv)
+    osenv.secure_app_home()           # 데이터 폴더 · 기록 폴더는 본인만 (macOS · Linux 0700, 예전 폴더도 고친다)
     setup_high_dpi()                  # macOS 메뉴 막대 이름 · Windows 작업 표시줄 묶음 (QApplication 보다 먼저)
     app = QApplication.instance() or QApplication(sys.argv[:1])
     osenv.configure_app(app)          # 이름 · Fusion 스타일 · macOS Dock 이름 · Linux .desktop 연결
+    from client.kakao.widgets import install_safe_gc
+    install_safe_gc(app)              # 메모리 정리(GC)는 화면 스레드의 이벤트 사이에서만 (다른 스레드 · Qt 처리 도중에 돌지 않게)
     if args.self_check:
         try:
             return self_check()
@@ -370,6 +451,24 @@ def main(argv=None):
             import traceback
             traceback.print_exc()
             return 1
+    instance = None
+    if single_instance_wanted(args):
+        from client.kakao.single import SingleInstance
+        instance = SingleInstance(parent=app)
+        # 로그아웃 뒤 다시 실행된 경우에는 앞선 실행이 끝나기를 잠깐 기다린다
+        if not instance.acquire(wait_ms=8000 if args.after_relaunch else 0):
+            instance.notify()               # 이미 실행 중 → 그 창을 앞으로 꺼내고 끝낸다
+            return 0
+        instance.activated.connect(lambda: show_running_app(app))
+    try:
+        return _run(args, app)
+    finally:
+        if instance is not None:
+            instance.release()              # 끝나면 다음 실행이 뜰 수 있게
+
+
+def _run(args, app):
+    """로그인 창 → 연결 → 메인 창 (main 이 실행 수를 확인한 뒤 부른다)"""
     install_korean_qt_translation(app)
     install_crash_guard()
     install_interrupt_quit(app)
@@ -386,8 +485,10 @@ def main(argv=None):
     fixed = args.host is not None or args.port is not None or configured is not None
     host = args.host or (configured[0] if configured else DEFAULT_HOST)
     port = args.port or (configured[1] if configured else DEFAULT_PORT)
-    # TLS 여부도 같은 순서: --tls/--no-tls → server.json 의 tls → DEFAULT_TLS
-    tls = args.tls if args.tls is not None else load_server_tls()
+    def tls_for(target):
+        """TLS 여부: --tls/--no-tls → server.json · 번들의 tls → 정하지 않았으면 실제로 접속할 주소로
+        (이 PC 가 아니면 TLS). 저장된 로그인의 주소로 붙을 때도 같은 규칙"""
+        return args.tls if args.tls is not None else load_server_tls(host=target)
     username, password = args.user.strip(), args.password
     saved = login_mod.load_saved_login() if not username else None
 
@@ -407,7 +508,7 @@ def main(argv=None):
             if saved and not args.user and not args.no_auto_login:
                 host, port = saved_address(host, port)
             # 런처(--no-auto-login)로 연 창은 처음 로그인 상태: 아이디·비밀번호를 비우고 저장된 로그인을 쓰지 않는다
-            dlg = LoginDialog(host, port, username, registration=registration, tls=tls,   # 등록 실패면 등록 화면 그대로
+            dlg = LoginDialog(host, port, username, registration=registration, tls=tls_for(host),   # 등록 실패면 등록 화면 그대로
                               fresh=args.no_auto_login)
             dlg.show_error(error)
             if dlg.exec_() != QDialog.Accepted:
@@ -416,12 +517,13 @@ def main(argv=None):
             password, token = dlg.password(), dlg.saved_token()
             remember, auto_login = dlg.remember(), dlg.auto_login()
             registration = dlg.registration()
+        tls = tls_for(host)
         session = Session(host, port, username, password, token=token, remember=remember,
                           registration=registration, tls=tls)
         try:
             session.connect()
         except OSError as e:
-            choice = ask_connection_failure(host, port, e)
+            choice = ask_connection_failure(host, port, e, tls=tls)
             if choice == 'quit':
                 return 1
             error = ''
@@ -431,8 +533,8 @@ def main(argv=None):
             break
         session.close()
         if outcome == 'failed':          # 아이디/비밀번호 오류·저장 정보 만료 → 로그인 창에 사유 표시
-            if token:
-                login_mod.clear_saved_login()
+            if token and not keeps_saved_login(session.state.login_error.get('code')):
+                login_mod.clear_saved_login()      # 저장된 로그인이 틀렸거나 만료됨 (잠깐 막힌 것이면 지우지 않는다)
                 saved, token = None, ''
             need_login, error = True, detail
             continue
@@ -443,6 +545,9 @@ def main(argv=None):
         return 1
 
     remember_login(session, username, auto_login)
+    # 비밀번호를 바꾸면 서버가 새 자동 로그인 토큰을 준다 → 저장된 로그인도 그 값으로
+    session.state.password_changed.connect(
+        lambda p: bool(p.get('login_token')) and login_mod.replace_saved_token(p['login_token']))
 
     def logout():
         perform_logout(session)
@@ -461,5 +566,33 @@ def main(argv=None):
     return app.exec_()
 
 
+def finish_process(code=0):
+    """프로세스를 끝낸다 - 파이썬의 마무리 정리를 거치지 않고.
+    메모리 정리(GC)를 이벤트 사이에서만 하도록 자동 GC 를 꺼 두어서, 끝날 때 창 · 대화상자 · 연결 객체가 서로 물린 채로 남는다.
+    파이썬 마무리 정리는 이것들을 정해지지 않은 순서로 지우는데, Qt 가 먼저 정리된 뒤 남은 Qt 객체를 지우면 가끔
+    Bus error 로 죽었다 (macOS 실제 화면, 7~10번에 한 번 - 2026-11-18 ci_smoke native).
+    정확히는 PyQt 가 QApplication 을 만들 때 건 종료 처리기(atexit)가 남은 Qt 객체를 정리하다 죽는다 → atexit 는 돌리지 않고,
+    출력을 비우고 앱이 건 종료 처리(osenv.on_exit: 받은 파일 임시 폴더 정리 등)만 한 뒤 바로 끝낸다.
+    연결 닫기 · 설정 저장은 그 전에 끝나 있다 (aboutToQuit → session.close, 설정은 바꿀 때마다 저장)"""
+    try:
+        code = int(code or 0)
+    except (TypeError, ValueError):
+        code = 1
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.flush()
+        except Exception:
+            pass
+    osenv.run_exit_handlers()
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.flush()
+        except Exception:
+            pass
+    os._exit(code)
+
+
 if __name__ == '__main__':
-    sys.exit(main())
+    finish_process(main())

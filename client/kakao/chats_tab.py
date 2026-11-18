@@ -6,7 +6,6 @@
 공용 목록 위젯(ElidedLabel, StatusPill, RowList, TabHeader)도 이 모듈에 둔다.
 """
 
-import copy
 from datetime import datetime, date, timedelta
 
 from PyQt5.QtCore import Qt, QObject, QSize, QRectF, QPoint, pyqtSignal, pyqtSlot, QTimer
@@ -18,7 +17,7 @@ from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QLi
 
 from client.kakao import theme
 from client.kakao.state import parse_dt, BOT_NAME
-from client.kakao.widgets import (IconButton, Avatar, Badge, make_icon, avatar_pixmap, underline_tabs_qss,
+from client.kakao.widgets import (IconButton, Avatar, Badge, make_icon, avatar_pixmap, underline_tabs_qss, exec_and_release,
                                   check_box_qss, set_shown)
 
 
@@ -125,6 +124,38 @@ class StatusPill(QWidget):
         p.drawText(self.rect().adjusted(pad, 0, -pad, 0), Qt.AlignCenter, text)
 
 
+def row_accessible_text(widget):
+    """목록 행 위젯을 화면낭독기가 읽을 한 문장으로 ('이동현, 사원, 마케팅팀').
+    행 위젯은 setItemWidget 으로 얹혀 있어 목록 접근성 트리에는 항목만 보이고 그 안의 글자는 보이지 않는다
+    (ElidedLabel 처럼 직접 그리는 위젯은 원래 접근성 이름도 없다). 행이 accessibleName 을 정해 두었으면 그것을,
+    아니면 숨기지 않은 자식 위젯의 이름 · 글자를 화면 순서대로 모은다"""
+    name = widget.accessibleName()
+    if name:
+        return name
+    parts = []
+    for child in [widget] + widget.findChildren(QWidget):
+        if child is not widget and (child.isHidden() or any(p.isHidden() for p in _ancestors(child, widget))):
+            continue
+        text = child.accessibleName()
+        if not text:
+            getter = getattr(child, 'text', None)
+            try:
+                text = getter() if callable(getter) else ''
+            except TypeError:
+                text = ''
+        text = ' '.join(str(text or '').split())
+        if text and (not parts or parts[-1] != text):
+            parts.append(text)
+    return ', '.join(parts)
+
+
+def _ancestors(child, stop):
+    parent = child.parentWidget()
+    while parent is not None and parent is not stop:
+        yield parent
+        parent = parent.parentWidget()
+
+
 class RowList(QListWidget):
     """행 위젯을 담는 목록. 더블클릭/Enter → row_activated"""
 
@@ -139,6 +170,8 @@ class RowList(QListWidget):
         self.setFrameShape(QFrame.NoFrame)
         self.setMouseTracking(True)
         self.itemDoubleClicked.connect(self.row_activated)
+        self._height_guess = {}          # 행 종류 → 마지막으로 만든 그 종류 행의 높이 (아직 안 만든 행의 자리)
+        self.verticalScrollBar().valueChanged.connect(self._on_scrolled)
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Return, Qt.Key_Enter) and self.currentItem() is not None:
@@ -148,21 +181,92 @@ class RowList(QListWidget):
 
     def _fit_rows(self):
         """행 위젯 폭을 뷰포트에 맞춘다. 숨겨진 탭에서 만들어진 행은 기본 폭(640)으로 남아
-        보이기 시작한 뒤에도 오른쪽(시간·배지)이 잘리므로, 표시/크기 변경 때마다 다시 맞춘다."""
+        보이기 시작한 뒤에도 오른쪽(시간·배지)이 잘리므로, 표시/크기 변경 때마다 다시 맞춘다.
+        아직 만들지 않은 행은 만들 때 맞춘다."""
         width = self.viewport().width()
         for i in range(self.count()):
-            widget = self.itemWidget(self.item(i))
+            widget = self.built_widget(self.item(i))
             if widget is not None and widget.width() != width:
                 widget.resize(width, widget.height())
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self.build_visible()
         self._fit_rows()
 
     def showEvent(self, event):
         super().showEvent(event)
         self.doItemsLayout()
+        self.build_visible()
         self._fit_rows()
+
+    # ---- 보이는 행만 만들기 ----
+    # 직원 500명 · 채팅방 300개면 행 위젯을 한 번에 다 만드는 데 0.3초가 넘게 걸려 탭 · 메인 창이 늦게 뜬다.
+    # sync_rows 는 행 자리(항목)만 바로 만들고, 위젯은 화면에 보이는 범위(+ 위아래 여유)만 만든다.
+    # 나머지는 스크롤해서 보이게 될 때, 또는 itemWidget() 으로 그 행을 찾을 때 만든다.
+    LAZY_ROLE = Qt.UserRole + 2
+    HEIGHT_ROLE = Qt.UserRole + 3
+    EAGER_PX = 1600          # 아직 보이지 않는 목록도 위쪽 이만큼은 미리 만든다 (처음 보일 때 바로 그려지게)
+    OVERSCAN_PX = 400        # 보이는 목록은 화면 아래로 이만큼 더
+    DEFAULT_ROW_PX = 56
+
+    @staticmethod
+    def _kind(data):
+        return data[0] if isinstance(data, tuple) and data else type(data).__name__
+
+    def itemWidget(self, item):
+        """행 위젯. 아직 만들지 않은 행이면 지금 만든다"""
+        if item is not None and item.data(self.LAZY_ROLE) is not None:
+            self._build(item)
+        return super().itemWidget(item)
+
+    def built_widget(self, item):
+        """이미 만든 행 위젯만 (없으면 None, 새로 만들지 않는다)"""
+        return super().itemWidget(item) if item is not None else None
+
+    def pending_count(self):
+        return sum(1 for i in range(self.count()) if self.item(i).data(self.LAZY_ROLE) is not None)
+
+    def _build(self, item):
+        factory = item.data(self.LAZY_ROLE)
+        item.setData(self.LAZY_ROLE, None)
+        widget = factory()
+        height = item.data(self.HEIGHT_ROLE) or widget.sizeHint().height()
+        self._height_guess[self._kind(item.data(Qt.UserRole))] = height
+        item.setSizeHint(QSize(1, height))
+        self.setItemWidget(item, widget)
+        item.setData(Qt.AccessibleTextRole, row_accessible_text(widget))
+        width = self.viewport().width()
+        if width > 0 and widget.width() != width:
+            widget.resize(width, widget.height())
+        return widget
+
+    def build_visible(self):
+        """보이는 범위(보이지 않는 목록은 위쪽 EAGER_PX)의 아직 안 만든 행을 만든다 → 만든 수"""
+        count = self.count()
+        if not count:
+            return 0
+        start = self.indexAt(QPoint(1, 1)).row() if self.verticalScrollBar().value() > 0 else 0
+        start = max(0, start - 1)
+        if self.isVisible():
+            budget = self.viewport().height() + self.OVERSCAN_PX
+        else:
+            budget = max(self.viewport().height(), self.EAGER_PX)
+        built, used = 0, 0
+        for i in range(start, count):
+            item = self.item(i)
+            if item.isHidden():
+                continue
+            if item.data(self.LAZY_ROLE) is not None:
+                self._build(item)
+                built += 1
+            used += item.sizeHint().height()
+            if used > budget:
+                break
+        return built
+
+    def _on_scrolled(self, _value):
+        self.build_visible()
 
     def add_row(self, widget, data, selectable=True):
         item = QListWidgetItem()
@@ -172,7 +276,77 @@ class RowList(QListWidget):
         item.setSizeHint(QSize(1, widget.sizeHint().height()))
         self.addItem(item)
         self.setItemWidget(item, widget)
+        item.setData(Qt.AccessibleTextRole, row_accessible_text(widget))
         return item
+
+    def add_lazy_row(self, factory, data, selectable=True, height=None):
+        """add_row 와 같되 위젯은 보일 때 만든다 (factory() → 행 위젯). 다 넣었으면 build_visible() 을 부른다.
+        height: 행 높이를 고정할 때 (주지 않으면 만든 위젯의 sizeHint 높이)"""
+        item = QListWidgetItem()
+        item.setData(Qt.UserRole, data)
+        if not selectable:
+            item.setFlags(Qt.ItemIsEnabled)
+        if height:
+            item.setData(self.HEIGHT_ROLE, int(height))
+        self.addItem(item)
+        self._place(item, factory, None)
+        return item
+
+    SIGNATURE_ROLE = Qt.UserRole + 1
+
+    def sync_rows(self, rows):
+        """목록을 rows 와 같게 만들되 달라진 행만 손댄다 → 새로 만든 행 수.
+        rows: [(data, signature, factory, selectable)] - data 는 행의 이름표(목록 안에서 하나뿐), signature 는 그 행이 보여 주는
+        내용을 담은 값, factory() 는 행 위젯을 만든다. signature 가 그대로인 행은 위젯을 그대로 두고, 바뀐 행만 다시 만들고,
+        없어진 행은 지우고, 자리가 바뀐 행만 옮긴다. 선택과 스크롤 위치는 그대로다
+        (한 사람의 접속 상태 · 한 방의 새 메시지 때문에 수백 줄을 전부 다시 만들지 않는다)"""
+        wanted = {row[0] for row in rows}
+        for i in range(self.count() - 1, -1, -1):
+            if self.item(i).data(Qt.UserRole) not in wanted:
+                self.takeItem(i)
+        existing = {}
+        for i in range(self.count()):
+            item = self.item(i)
+            existing.setdefault(item.data(Qt.UserRole), item)
+        built = 0
+        for index, (data, signature, factory, selectable) in enumerate(rows):
+            item = self.item(index) if index < self.count() else None
+            if item is not None and item.data(Qt.UserRole) == data:
+                if item.data(self.SIGNATURE_ROLE) != signature:       # 같은 자리, 내용이 달라짐 → 위젯만 새로
+                    self._place(item, factory, signature)
+                    built += 1
+                continue
+            current = False
+            old = existing.pop(data, None)
+            if old is not None:                                        # 다른 자리에 있던 행 → 여기로 옮긴다
+                row = self.row(old)
+                if row >= 0:
+                    current = self.currentRow() == row
+                    self.takeItem(row)
+            item = QListWidgetItem()
+            item.setData(Qt.UserRole, data)
+            if not selectable:
+                item.setFlags(Qt.ItemIsEnabled)
+            self.insertItem(index, item)
+            self._place(item, factory, signature)
+            built += 1
+            if current:
+                self.setCurrentItem(item)
+        while self.count() > len(rows):                                # 같은 이름표가 겹쳐 남은 행
+            self.takeItem(self.count() - 1)
+        self.build_visible()
+        return built
+
+    def _place(self, item, factory, signature):
+        """행 자리에 만들 위젯을 정해 둔다 (실제로 만드는 것은 보일 때 - build_visible / itemWidget)"""
+        item.setData(self.SIGNATURE_ROLE, signature)
+        if self.built_widget(item) is not None:
+            self.removeItemWidget(item)
+        item.setData(Qt.AccessibleTextRole, None)      # 예전 내용을 읽지 않게 - 위젯을 다시 만들 때 채운다
+        item.setData(self.LAZY_ROLE, factory)
+        guess = item.data(self.HEIGHT_ROLE) or self._height_guess.get(self._kind(item.data(Qt.UserRole)),
+                                                                      self.DEFAULT_ROW_PX)
+        item.setSizeHint(QSize(1, guess))
 
     def items(self):
         return [self.item(i) for i in range(self.count())]
@@ -430,6 +604,75 @@ class _AvatarRelay(QObject):
             self._slot()
 
 
+class RefreshWhenVisible:
+    """목록 탭에 섞어 쓴다: 창은 떠 있는데 다른 탭 뒤에 가려진 목록은 바뀐 것을 표시만 해 두고, 다시 보일 때 한 번에 그린다.
+    (보지도 않는 목록을 변화가 올 때마다 다시 그리지 않는다. 어디에도 들어 있지 않거나 창째 숨은 목록은 바로 그린다)
+
+        state.rooms_changed.connect(self.refresh_when_visible)
+        def showEvent(self, event): super().showEvent(event); self.refresh_if_stale()
+    """
+    _stale = False
+
+    def hidden_behind_another(self):
+        """다른 탭 뒤에 가려졌거나, 한 번 띄웠던 창째 숨어 있으면(X 로 트레이에 내려간 메인 창) True.
+        한 번도 띄우지 않은 창 · 어디에도 들어 있지 않은 목록은 False (바로 그린다)"""
+        window = self.window()
+        if self.isVisible() or window is self:
+            return False
+        return window.isVisible() or window.testAttribute(Qt.WA_WState_ExplicitShowHide)
+
+    def refresh_when_visible(self, *_args):
+        if self.hidden_behind_another():
+            self._stale = True
+            return False
+        self.refresh()
+        return True
+
+    def refresh_if_stale(self):
+        if self._stale:
+            self._stale = False
+            self.refresh()
+
+
+class _BurstRelay(QObject):
+    """목록을 통째로 다시 만드는 slot 앞에 둔다: 첫 알림은 바로 부르고, 이어서 WINDOW_MS 안에 몰려오는 알림은
+    모아 두었다가 끝에 한 번만 더 부른다 (출근 시간처럼 접속 상태가 줄줄이 바뀔 때 목록을 매번 다시 만들지 않게).
+    주인(parent)이 사라지면 함께 사라진다"""
+
+    WINDOW_MS = 150
+
+    def __init__(self, slot, parent=None):
+        super().__init__(parent)
+        self._slot = slot
+        self._pending = False
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(self.WINDOW_MS)
+        self._timer.timeout.connect(self.flush)
+
+    @pyqtSlot()
+    def fire(self):
+        if self._timer.isActive():
+            self._pending = True
+            return
+        self._timer.start()
+        self._slot()
+
+    def flush(self):
+        """모아 둔 갱신이 있으면 지금 (타이머 · 테스트용)"""
+        if self._pending:
+            self._pending = False
+            self._timer.start()
+            self._slot()
+
+
+def connect_users_changed(state, slot):
+    """구성원 정보 · 접속 상태가 바뀌면 slot() - 몰려오는 변경은 _BurstRelay 로 묶는다. 묶는 객체를 돌려준다"""
+    relay = _BurstRelay(slot, getattr(slot, '__self__', None))
+    state.users_changed.connect(relay.fire)
+    return relay
+
+
 def connect_avatar_changed(state, slot):
     sig = getattr(state, 'avatar_changed', None)
     if sig is None:
@@ -632,8 +875,9 @@ FOLDER_ALL = '전체'
 
 
 def folder_chip_label(name, count):
-    """'전체'는 개수 없이, 나머지는 '이름 N' (안읽음은 안 읽은 채팅방 수, 통화는 부재중이 있을 때만 그 수)"""
-    if name == FOLDER_ALL or (name == '통화' and not count):
+    """'전체'는 개수 없이, 나머지는 '이름 N' (안읽음은 안 읽은 채팅방 수, 통화는 부재중이 있을 때만 그 수).
+    0 은 쓰지 않는다 - '즐겨찾기 0' 같은 빈 숫자는 정보가 아니라 잡음 (2026-11-13)"""
+    if name == FOLDER_ALL or not count:
         return name
     return f'{name} {count}'
 
@@ -764,9 +1008,8 @@ def sparkle_path(cx, cy, r):
 
 
 def ai_icon_color():
-    """어두운 강조색(브랜드 네이비 등)이면 강조색, 밝은 강조색(카카오 옐로)이면 보조 글자색"""
-    accent = QColor(theme.c('yellow'))
-    return theme.c('yellow') if accent.lightness() < 170 else theme.c('text_sub')
+    """헤더의 다른 아이콘(검색 · 새 채팅 · 더보기)과 같은 보조 글자색. 강조색은 주 동작과 선택에만 쓴다 (2026-11-13)"""
+    return theme.c('text_sub')
 
 
 def make_ai_icon(size=22, color=None):
@@ -897,6 +1140,7 @@ class OpenRoomCard(QFrame):
         top = QHBoxLayout()
         top.setSpacing(6)
         self.name_label = QLabel(info.get('name') or '(이름 없음)')
+        self.name_label.setTextFormat(Qt.PlainText)
         self.name_label.setObjectName('cardTitle')
         top.addWidget(self.name_label, 1)
         self.count_label = QLabel(f"{int(info.get('member_count') or 0)}명")
@@ -910,6 +1154,7 @@ class OpenRoomCard(QFrame):
         col.addWidget(self.desc_label)
         tags = info.get('tags') or []
         self.tags_label = QLabel('  '.join(f'#{t}' for t in tags))
+        self.tags_label.setTextFormat(Qt.PlainText)
         self.tags_label.setObjectName('cardTags')
         self.tags_label.setVisible(bool(tags))
         col.addWidget(self.tags_label)
@@ -1117,7 +1362,7 @@ def confirm_delete_folder(parent, name):
 
 
 # ================================================================ 채팅 탭
-class ChatsTab(QWidget):
+class ChatsTab(RefreshWhenVisible, QWidget):
     open_room_requested = pyqtSignal(str)
 
     def __init__(self, state, settings, parent=None):
@@ -1168,14 +1413,21 @@ class ChatsTab(QWidget):
         self.list.row_activated.connect(self._activate)
         self.list.customContextMenuRequested.connect(self._show_context_menu)
 
-        self._fresh_row = None   # (room_id, 방 스냅샷): room_changed 로 막 새로 만든 행
-        state.rooms_changed.connect(self._on_rooms_changed)
-        state.room_changed.connect(self._on_room_changed)
-        state.users_changed.connect(self.refresh)
-        state.call_history_changed.connect(self.refresh)
+        # 바뀐 것은 refresh() 가 행 단위로 맞춘다 (RowList.sync_rows). 다른 탭 뒤에 가려져 있으면 보일 때까지 미룬다
+        # 새 메시지 · 읽음 · 임시저장마다 rooms_changed 가 온다: 첫 알림은 바로, 이어서 몰려오는 것은 묶어서 한 번 더
+        # (방 300개 목록을 메시지마다 다시 맞추면 메시지가 쏟아지는 방에서 초당 수십 번 돌았다)
+        self._rooms_relay = _BurstRelay(self.refresh_when_visible, self)
+        state.rooms_changed.connect(self._rooms_relay.fire)
+        state.room_changed.connect(lambda *_: self._rooms_relay.fire())
+        self._users_relay = connect_users_changed(state, self.refresh_when_visible)
+        state.call_history_changed.connect(self.refresh_when_visible)
         settings.changed.connect(self._on_setting)
-        connect_avatar_changed(state, self.refresh)
+        connect_avatar_changed(state, self.refresh_when_visible)
         self.apply_theme()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh_if_stale()
 
     # ---- 목록 ----
     def _on_setting(self, key):
@@ -1307,13 +1559,8 @@ class ChatsTab(QWidget):
             return f"'{self.current_folder}' 폴더에 채팅방이 없습니다\n채팅방을 우클릭해 폴더에 추가해 보세요"
         return '채팅방이 없습니다'
 
-    def _on_rooms_changed(self):
-        self.refresh(reuse_fresh=True)
-
-    def refresh(self, reuse_fresh=False):
-        # room_changed 직후 이어지는 rooms_changed 에서는 방금 만든 행을 다시 만들지 않는다
-        fresh = self._fresh_row if reuse_fresh else None
-        self._fresh_row = None
+    def refresh(self):
+        self._stale = False
         folders = self.state.chat_folders()
         if self.current_folder not in [name for name, _count in folders]:
             # 이름이 바뀌었을 수도 있으니 기억해 두었다가 편집 결과에서 따라간다
@@ -1322,48 +1569,39 @@ class ChatsTab(QWidget):
         self.folder_bar.set_folders(folders, self.current_folder)
         self._update_subtitle()
         query = self.search_edit.text().strip()
-        if self.current_folder != '통화':
-            rooms = [room for room in self.state.rooms_in_folder(self.current_folder) if self._matches(room, query)]
-            if self._update_rows_in_place(rooms, fresh):
-                return
-        current = self.list.currentItem().data(Qt.UserRole) if self.list.currentItem() else None
         scroll = self.list.verticalScrollBar().value()
-        self.list.clear()
-        if self.current_folder == '통화':
+        if self.current_folder == '통화':                 # 통화 기록: 같은 방이 여러 줄이라 통째로 다시 만든다
+            self.list.clear()
             self._fill_call_log(query)
-            rooms = []
-        for room in rooms:
-            item = self.list.add_row(RoomRow(self.state, room['room_id']), room['room_id'])
-            if room['room_id'] == current:
-                self.list.setCurrentItem(item)
-        self.list._fit_rows()
+            self.list._fit_rows()
+        else:
+            rooms = [room for room in self.state.rooms_in_folder(self.current_folder) if self._matches(room, query)]
+            self.list.sync_rows([(room['room_id'], self._room_signature(room),
+                                  lambda rid=room['room_id']: RoomRow(self.state, rid), True) for room in rooms])
         self.list.verticalScrollBar().setValue(scroll)
         has_rows = self.list.count() > 0
         self.list.setVisible(has_rows)
         self.empty_label.setText(self._empty_text(query))
         self.empty_label.setVisible(not has_rows)
 
-    def _update_rows_in_place(self, rooms, fresh=None):
-        """보이는 방 목록·순서가 그대로면 항목은 두고 행 위젯만 바꾼다 (선택·스크롤 유지, 목록 재생성 없음).
-        순서·구성이 바뀌었으면 False → 전체를 다시 만든다"""
-        items = self.list.items()
-        if not rooms or len(items) != len(rooms):
-            return False
-        if [it.data(Qt.UserRole) for it in items] != [room['room_id'] for room in rooms]:
-            return False
-        if not all(isinstance(self.list.itemWidget(it), RoomRow) for it in items):
-            return False
-        for item, room in zip(items, rooms):
-            rid = room['room_id']
-            if fresh is not None and fresh[0] == rid and fresh[1] == room:
-                continue   # room_changed 에서 막 만든 행이고 그 뒤로 방 정보가 그대로
-            row = RoomRow(self.state, rid)
-            item.setSizeHint(QSize(1, row.sizeHint().height()))
-            self.list.setItemWidget(item, row)
-        self.list._fit_rows()
-        self.list.setVisible(True)
-        self.empty_label.setVisible(False)
-        return True
+    def _room_signature(self, room):
+        """채팅방 행(RoomRow)이 보여 주는 것 전부 - 이 값이 같으면 그 행은 다시 만들지 않는다"""
+        state = self.state
+        rid = room['room_id']
+        last = room.get('last_message') or {}
+        members = room.get('members') or []
+        shown = [m for m in members if m != state.me][:4] or members[:1]
+        avatars = getattr(state, 'avatars', {})
+        failed = getattr(state, 'room_has_failed', lambda _r: False)(rid)
+        draft = ''
+        if not failed and rid not in getattr(state, 'active_rooms', ()):
+            draft = getattr(state, 'room_draft', lambda _r: '')(rid)
+        return (room.get('type'), state.room_title(rid), len(members),
+                tuple((m, state.display_name(m), (avatars.get(m) or (None,))[0]) for m in shown),
+                state.is_pinned(rid), state.is_muted(rid), state.room_unread(rid), failed, draft,
+                state.message_preview(last) if last else '',
+                format_room_time(last.get('timestamp') or '') if last else '',
+                foreign_company(state, shown[0]) if room.get('type') == 'direct' and shown else '')
 
     def _fill_call_log(self, query):
         for call in self.state.call_history:
@@ -1371,25 +1609,6 @@ class ChatsTab(QWidget):
             if room is None or not self._matches(room, query):
                 continue
             self.list.add_row(CallLogRow(self.state, call), call['room_id'])
-
-    def _on_room_changed(self, room_id):
-        """방 하나만 바뀌면(이름·미리보기·전송 실패 표시) 그 행만 새로 만든다. 순서·폴더가 바뀌는 변화는
-        rooms_changed 로 전체를 다시 그린다"""
-        if self.current_folder == '통화' or self.search_edit.text().strip():
-            self.refresh()
-            return
-        for i in range(self.list.count()):
-            item = self.list.item(i)
-            if item.data(Qt.UserRole) == room_id and isinstance(self.list.itemWidget(item), RoomRow):
-                if self.state.room(room_id) is None:
-                    break
-                row = RoomRow(self.state, room_id)
-                self.list.setItemWidget(item, row)
-                self.list._fit_rows()
-                self._update_subtitle()
-                self._fresh_row = (room_id, copy.deepcopy(self.state.room(room_id)))
-                return
-        self.refresh()
 
     def _activate(self, item):
         rid = item.data(Qt.UserRole)
@@ -1455,7 +1674,7 @@ class ChatsTab(QWidget):
 
     def show_peek_dialog(self, room_id):
         dlg = PeekDialog(self.state, room_id, self.window())
-        dlg.exec_()
+        exec_and_release(dlg)
         return dlg
 
     def confirm_leave(self, room_id):
@@ -1470,12 +1689,12 @@ class ChatsTab(QWidget):
         return False
 
     def show_create_dialog(self):
-        CreateGroupDialog(self.state, self.window()).exec_()
+        exec_and_release(CreateGroupDialog(self.state, self.window()))
 
     def show_open_chat_dialog(self, modal=True):
         dlg = OpenChatDialog(self.state, self.window())
         if modal:
-            dlg.exec_()
+            exec_and_release(dlg)
         else:
             dlg.show()
         return dlg
@@ -1486,7 +1705,7 @@ class ChatsTab(QWidget):
         dlg = TalkDrawerDialog(self.state, self.window())
         dlg.setAttribute(Qt.WA_DeleteOnClose, True)
         if modal:
-            dlg.exec_()
+            exec_and_release(dlg)
         else:
             dlg.show()
         return dlg
@@ -1497,7 +1716,7 @@ class ChatsTab(QWidget):
         except ImportError:
             return None
         dlg = InviteDialog(self.state, room_id, self.window())
-        dlg.exec_()
+        exec_and_release(dlg)
         return dlg
 
     def apply_theme(self):
@@ -1508,6 +1727,7 @@ class ChatsTab(QWidget):
                                        f" padding: 0 24px;")
         self.setStyleSheet(f"ChatsTab {{ background: {theme.c('bg')}; }}")
         self.setAttribute(Qt.WA_StyledBackground, True)
+        self.list.clear()        # 색 · 글자 크기가 바뀌었다 → 행을 전부 다시 만든다
         self.refresh()
 
 
@@ -1640,6 +1860,7 @@ class InviteToRoomDialog(QDialog):
         layout.setContentsMargins(18, 18, 18, 16)
         layout.setSpacing(10)
         title = QLabel(f"{state.display_name(username)}님을 초대할 채팅방")
+        title.setTextFormat(Qt.PlainText)
         title.setWordWrap(True)
         title.setStyleSheet(f"font-size: {theme.fs('title')}px; font-weight: bold;")
         layout.addWidget(title)

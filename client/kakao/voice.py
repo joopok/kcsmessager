@@ -44,8 +44,11 @@ def wav_info(data):
             frames = w.readframes(w.getnframes())
     except (wave.Error, EOFError, struct.error):
         return b'', 0.0
-    if width != 2:
+    # 받은 파일의 머리 값을 그대로 믿지 않는다: 표본율이 아주 낮게 적혀 있으면 16kHz 로 늘리는 동안 수 GB 가 되고
+    # (10MB 파일에 200Hz → 80배), 0 이면 나눗셈 오류. 녹음 · 통화가 쓰는 범위 밖이면 재생하지 않는다
+    if width != 2 or not 8000 <= rate <= 48000 or not 1 <= ch <= 2:
         return b'', 0.0
+    frames = frames[:int(MAX_VOICE_SECONDS * 1.5 * rate) * 2 * ch]     # 음성 메시지 최대 길이(+여유)까지만
     if ch > 1:   # 첫 채널만
         frames = b''.join(frames[i:i + 2] for i in range(0, len(frames), 2 * ch))
     if rate != SAMPLE_RATE:

@@ -48,7 +48,13 @@
 - **줄 단위 JSON(NDJSON)**, UTF-8. 메시지 1개 = JSON 객체 1개 + `\n`.
 - 서버는 줄바꿈 없이 이어 붙은 JSON(구버전 클라이언트)도 `json.JSONDecoder.raw_decode`로 파싱한다.
 - 모든 요청은 `"type"`을 가진다. 선택 필드 `"req_id"`를 보내면 응답에 그대로 돌려준다.
-- 오류: `{"type":"error","req_type":"<요청 type>","message":"<한국어 설명>","req_id":...}`
+- 오류: `{"type":"error","req_type":"<요청 type>","message":"<한국어 설명>","req_id":...}` (일부 오류에는 `code` — §4.1 '오류 구분 코드')
+- **연결 한도 (2026-11-17):** 로그인하지 않은 연결은 30초 뒤 `error {code:"login_timeout"}` 을 보내고 닫는다. 로그인 전 요청 한 건은 64KB 까지(넘으면 `code:"too_large"` 후 닫음), 로그인 뒤에는 16M자까지. 동시 연결은 3,000개, 한 주소의 로그인 전 연결은 100개까지 — 넘는 새 연결은 바로 닫는다. **TCP_NODELAY (2026-11-18):** 서버는 받은 연결마다 TCP_NODELAY 를 켠다 — 작은 응답이 이어질 때 상대의 지연 ACK(Windows 약 200ms)를 기다리지 않게. 클라이언트도 같은 이유로 켜는 것이 좋다. 운영의 nginx stream 은 기본(`tcp_nodelay on`)을 유지한다. 진단: `python3 scripts/bench_server_requests.py --scale small --rtt`(서버 · 클라이언트 켬/끔 네 가지의 연속 왕복). **접속 알림 묶기 (2026-11-18):** `user_status_changed` 와 그에 따르는 `user_updated`(접속 · 접속 종료 · 처음 등록)는 상태가 바뀐 뒤 0.15초 동안 모았다가 보낸다 — 늦어도 약 0.2초(서버가 바쁘면 그만큼 더) 안에 간다. 그 사이 여러 번 바뀌면 보낼 때의 마지막 상태로 한 번만 보낸다(나갔다가 바로 들어오면 `online` 한 번). 한 사람에 대해서는 `user_status_changed` → `user_updated` 순서, 본인에게는 보내지 않는다. 받는 연결마다 그 묶음을 한 번에 쓴다(줄 여러 개). 모양은 그대로다. 로그인이 몰려도 사람마다 즉시 전원에게 보내지 않게 하려는 것(예전에는 로그인 한 번마다 접속자 수만큼 만들어 보냈다). **한 계정의 동시 연결은 20개까지 (2026-11-18):** 로그인으로 21번째가 되면 그 계정의 가장 오래된 연결을 닫는다(새 로그인은 그대로 된다) — 로그인한 계정이 연결을 계속 열어 받는 버퍼로 서버 메모리를 채우지 못하게.
+- **하트비트 (2026-11-17):** 서버는 45초 동안 아무것도 보내지 않은 로그인 연결에 `{"type":"ping"}` 을 보낸다(끊긴 연결을 찾아내고 중간 장비가 연결을 닫지 않게). `ping` 을 모르는 예전 클라이언트는 무시하면 되고, 그런 연결은 조용하다는 이유로 끊지 않는다(운영체제의 TCP keepalive 만 건다). 클라이언트가 `ping`(→ 서버가 `pong {req_id?}` 로 답함, 로그인 전에도) 이나 `pong` 을 한 번이라도 보내면 하트비트를 하는 연결로 보고, 그 뒤 150초 동안 아무것도 보내지 않으면 서버가 연결을 닫는다. 새 클라이언트는 서버 `ping` 에 `pong` 으로 답하면 된다.
+  - **클라이언트 쪽 규칙:** ① 서버 `ping` 을 받으면 `pong` 으로 답한다. ② 40초 동안 아무것도 보내지 않았으면 `ping` 을 보낸다. ③ `pong`(또는 서버 `ping`)을 한 번이라도 받은 서버가 100초 동안 아무것도 보내지 않으면 끊긴 것으로 보고 다시 연결한다 — 하트비트를 모르는 예전 서버에는 ③을 적용하지 않는다.
+- **요청 빈도 (2026-11-17):** 연결마다 초당 200개(한꺼번에 2,000개까지) — 넘으면 그 요청은 처리하지 않고 `error {code:"rate_limited", retry_after:초}` "요청이 너무 잦습니다. 잠시 후 다시 시도해 주세요." (`call_media` 는 초당 150개를 넘는 조각을 오류 없이 버린다). 사용자별로 1분에: 못 찾은 친구 조회(`friend_add` 의 query) 10번, AI 비서 질문 20번(넘으면 봇이 "질문이 너무 잦아요…" 를 한 번 답하고 그 질문은 건너뛴다), `room_export` 6번, `story_post` 20번, `rag_doc_add` 20번, `search` 120번, 첨부 올리기 120번 — 넘으면 같은 `rate_limited` 오류.
+- 큰 응답 전송: 서버는 30초 동안 한 바이트도 보내지 못하거나 평균 32KB/초보다 느리면 그 연결을 닫는다(느린 회선도 10MB 첨부를 받을 수 있다).
+- **연결별 보내기 대기열 (2026-11-17):** 서버는 연결마다 보낼 것을 줄 세워 두고 그 연결 전용 스레드가 차례로 보낸다 — 한 연결이 받지 않고 멈춰도 다른 연결로 가는 전달과 요청을 처리하는 쪽은 기다리지 않는다. 한 연결 안의 순서는 서버가 내보낸 순서 그대로이고, 로그인 응답(`welcome` · `all_users_list`)은 그 연결로 가는 다른 알림보다 항상 먼저 간다. 같은 알림을 여러 사람에게 보낼 때는 한 번만 만들어 함께 쓴다. 대기열이 32MB 또는 20,000건을 넘으면(받는 쪽이 계속 밀리면) 그 연결을 닫는다. 자기 요청의 큰 응답(첨부 받기 · 내보내기)은 대기열에 8MB 넘게 쌓여 있으면 줄어들 때까지 그 연결의 다음 요청 처리를 늦춘다. 통화 미디어 조각은 대기열에 2MB 넘게 쌓인 연결에는 보내지 않고 버린다. 연결을 닫을 때 이미 줄 서 있던 것(오류 안내 등)은 2초까지 마저 보낸다.
 
 ## 3. 데이터 모델 (JSON)
 
@@ -94,18 +100,18 @@ Todo    {todo_id:int, owner, title, due:"YYYY-MM-DD"|null, done:bool, created_at
 | 요청 (client→server) | 필드 | 서버 동작 / 응답 |
 |---|---|---|
 | `org_companies` | – | **로그인 전에도 가능**(§4.1). 응답 `org_companies {companies:[str]}` — 처음 사용 등록 때 고를 소속 회사 목록 |
-| `register` | company, name, employee_no, email, password, remember? | 처음 사용 등록(§4.1). 성공하면 `join` 과 똑같이 `welcome …` |
-| `password_reset` | username, email, new_password | **로그인 전에도 가능**(§4.1). 비밀번호 재설정 → `password_reset_ok {username}` |
+| `register` | company, name, email, password, remember?, employee_no?, code? | 처음 사용 등록(§4.1). 성공하면 `join` 과 똑같이 `welcome …`. `code` 는 관리자가 발급한 등록 코드(등록이 닫힌 서버에서 필요) |
+| `password_reset` | username, email, new_password, code | **로그인 전에도 가능**(§4.1). 비밀번호 재설정(비밀번호가 없는 계정은 등록 코드로 최초 등록) → `password_reset_ok {username}` |
 | `join` | username, password? | 아이디/비밀번호 로그인(§4.1). 비밀번호 없는 구버전·테스트 join 만 사용자 자동 생성. 응답 `welcome {me:User, users:[User], rooms:[Room]}`. 이어서 구버전 호환 `all_users_list {users:[username], online_users:[username]}`. 다른 사람에게 `user_status_changed {username,status:"online"}` |
-| `message` (구버전) | content | 모두에게 `message {sender, content, timestamp}` 브로드캐스트(구버전 호환, DB 미저장) |
+| `message` (구버전) | content | 모두에게 `message {sender, content, timestamp}` 브로드캐스트(구버전 호환, DB 미저장). **비밀번호 없는 join 을 받는 구버전 · 테스트 서버에서만**(2026-11-17) — 비밀번호가 필수인 서버는 "지원하지 않는 요청입니다." |
 | `room_open_direct` | target | 1:1 방 생성/조회 → 양쪽에 `room_updated {room}`. target==me면 `self` 방 |
 | `room_create` | name, members:[username] | 그룹 방 생성(요청자 자동 포함) → 멤버에게 `room_updated`, 시스템 메시지 "A님이 B, C님을 초대했습니다." |
-| `room_invite` | room_id, usernames | 멤버 추가(direct면 오류) → `room_updated` + 시스템 메시지 |
+| `room_invite` | room_id, usernames | 멤버 추가(direct면 오류, 한 번에 100명까지 — 방 만들기와 같다) → `room_updated` + 시스템 메시지 |
 | `room_leave` | room_id | 멤버 제거 → 나간 사람에게 `room_removed {room_id}`, 남은 사람에게 `room_updated` + "A님이 나갔습니다." |
 | `room_rename` | room_id, name | → `room_updated` |
 | `history` | room_id, before_msg_id?:int, limit?:int=50 | `history {room_id, messages:[Message](오래된→최신), has_more}` |
 | `send` | room_id, kind("text"/"emoticon"/"image"/"file"), content, reply_to_id?, mentions?, attachment?{name,mime,data_b64}, send_at?:ISO, client_tmp_id? | 즉시 전송이면 멤버 모두에게 `msg_new {message, client_tmp_id}` + `read_update`(발신자). `send_at`이 미래면 저장 후 요청자에게 `scheduled_ok {scheduled_id, room_id, send_at, content}`; 시각이 되면 `msg_new`. 그때 보낸 사람이 방을 나갔거나 서버 오류로 못 보내면 보낸 사람에게 `scheduled_failed {scheduled_id, room_id, kind, content, reason}`(첨부는 지움, 다시 보내지 않음) |
-| `read` | room_id, last_msg_id | read pointer 갱신(감소 불가) → 멤버에게 `read_update {room_id, username, last_read_msg_id}` |
+| `read` | room_id, last_msg_id | read pointer 갱신(감소 불가) → 멤버에게 `read_update {room_id, username, last_read_msg_id}`. 읽은 본인의 연결(다른 기기 포함)에는 그 방의 남은 안 읽은 수 `unread_count` 도 함께(2026-11-17) |
 | `react` | msg_id, emoji | 토글 → 멤버에게 `msg_updated {message}` |
 | `delete` | msg_id | 발신자 본인 + 24시간 이내만. deleted=true, content="삭제된 메시지입니다.", attachment/poll 유지하지 않음 → `msg_updated` |
 | `notice_set` | room_id, msg_id:int\|null | → `room_updated` + 시스템 메시지 "A님이 공지를 등록했습니다." (해제는 메시지 없음) |
@@ -122,8 +128,9 @@ Todo    {todo_id:int, owner, title, due:"YYYY-MM-DD"|null, done:bool, created_at
 | `todo_update` | todo_id, title?, due?, done? | 소유자만 → `todo_updated` |
 | `todo_delete` | todo_id | → `todo_deleted {todo_id}` |
 | `todo_list` | – | → `todo_list {todos}` |
-| `profile_update` | display_name?, status_message?, birthday?, deputies? | → 모두에게 `user_updated {user}` (`deputies` §8.13) |
+| `profile_update` | display_name?, status_message?, birthday?, mobile?, email?, deputies?, avatar_b64?, avatar_clear? | → 모두에게 `user_updated {user}` (`deputies` §8.13). `email` 은 §4.1 '로그인 아이디는 겹치지 않는다' 규칙을 따른다 |
 | `attachment_get` | attachment_id | → `attachment_data {attachment_id, name, mime, data_b64}` |
+| `password_change` | old_password, new_password, remember? | 본인 비밀번호 변경(§4.1, 2026-11-17) → `password_changed {login_token?}` |
 | `leave` | – | 연결 종료 처리 |
 
 ### 4.1 아이디/비밀번호 로그인
@@ -132,14 +139,53 @@ Todo    {todo_id:int, owner, title, due:"YYYY-MM-DD"|null, done:bool, created_at
   - 검증(오류 `error {req_type:"register"}`): 목록에 없는 회사 "소속 회사를 선택해 주세요." / 이름 1~20자(제어 문자·`@` 불가) / 사번은 없어도 되지만 보냈으면 영문·숫자로 시작하는 영문·숫자·`-`·`_` 1~20자가 아니면 "사번은 영문·숫자 20자 이내로 입력해 주세요." / 다른 사용자의 사번·사내 계정(account)·이름과 같은 사번(대소문자 무시) "이미 등록된 사번입니다. 사번과 비밀번호로 로그인해 주세요." / 이메일 형식 "이메일 주소 형식이 올바르지 않습니다." / 비밀번호 4~64자 / 다른 사용자가 쓰는 이메일(대소문자 무시) "이미 가입된 이메일입니다." / 이미 비밀번호가 있는 이름 "이미 등록된 이름입니다. 아이디와 비밀번호로 로그인해 주세요." / 봇 이름 불가.
   - 없는 이름이면 그 회사 소속으로 새로 만든다. 비밀번호가 없는 기존 계정(조직도 시드·예전 게스트)이면 그 계정에 이메일·비밀번호(사번을 보냈으면 사번도)를 등록한다. 이때 계정의 회사가 비어 있거나 "게스트"면 고른 회사로 바꾸고, 다른 회사면 "선택한 소속에 같은 이름의 구성원이 없습니다. 소속을 다시 확인해 주세요." 비밀번호 등록은 `password_hash IS NULL` 일 때만(동시 등록 중 한쪽만).
   - **계정 가로채기 방지 (2026-10-11 · 2026-10-14 이메일 확인):** 비밀번호가 없는 기존 계정은 조직도에 적힌 값과 맞아야 가져갈 수 있다. 조직도에 이메일이 있으면 입력한 이메일이 같아야 한다(대소문자 무시) — "조직도에 등록된 이메일과 다릅니다. 회사 이메일을 확인하거나 관리자에게 문의해 주세요." 사번을 보냈고 조직도에도 사번이 있으면 같아야 한다 — "조직도에 등록된 사번과 다릅니다. 사번을 확인하거나 관리자에게 문의해 주세요." 조직도에 사번만 있고 이메일이 없는 계정에 사번 없이(새 클라이언트) 등록하면 — "조직도에 이메일이 등록되지 않아 직접 등록할 수 없습니다. 관리자에게 이메일 등록을 요청해 주세요." 사번·이메일이 모두 없는 관리자 계정은 직접 등록할 수 없다 — "관리자 계정은 직접 등록할 수 없습니다. 서버 PC 에서 scripts/set_password.py 로 비밀번호를 정해 주세요." 등록 실패는 로그인 실패처럼 세어 5번이면 5분 잠근다.
+  - **등록 방식 — 열림/닫힘 (2026-11-17):** 서버 옵션 `open_registration`. 비밀번호가 필수인 서버(배포용 `chat_server.py`)는 기본이 **닫힘**이고 `--open-registration` 으로 연다. 비밀번호 없는 join 을 받는 서버(테스트 · 데모 · `--allow-passwordless`)는 기본이 열림이며 위 규칙 그대로다.
+    - 닫힘이면 조직도(구성원 목록)에 없는 이름으로는 계정을 만들지 않는다. 구성원은 관리자가 `admin_member_create` 로 먼저 등록한다.
+    - 닫힘이면 비밀번호가 없는 기존 계정은 관리자가 발급한 **등록 코드**(`admin_reset_code` §4.2, 30분 · 한 번)를 `register` 의 `code` 로 함께 보내야 등록된다. 코드가 맞은 뒤의 회사 · 조직도 이메일/사번 확인은 위와 같다. 등록되면 코드는 지운다.
+    - 닫힘이면 형식 검증(회사 목록 · 이름 · 이메일 · 비밀번호 길이)을 뺀 모든 거절 — 없는 이름, 다른 회사, 이미 등록된 이름, 코드가 없거나 틀리거나 만료됨, 관리자 계정, 사용 중지 — 은 한 가지 문구 "등록할 수 없습니다. 이미 등록했다면 이메일과 비밀번호로 로그인하고, 처음이라면 관리자에게 등록 코드나 초기 비밀번호를 요청해 주세요." 로만 답하고 로그인 실패로 센다(계정이 있는지 · 등록됐는지 알려 주지 않는다).
+    - 코드 칸이 없는 클라이언트는 로그인 창의 [비밀번호 재설정](아이디 = 이름, 이메일, 코드, 새 비밀번호)으로 같은 등록을 한다 — `password_reset` 이 "비밀번호가 없는 계정 + 맞는 코드"를 최초 등록으로 처리한다. 조직도에 이메일이 있으면 보낸 이메일이 같아야 하고, 없으면 보낸 이메일을 그 계정의 이메일(= 다음부터의 로그인 아이디)로 저장한다(형식이 틀리거나 다른 사람이 쓰는 이메일이면 거절).
+    - 클라이언트는 `register` 의 `code` 를 닫힌 서버(`org_companies` 응답의 `open_registration:false`)에만 싣는다(열린 서버 · 예전 서버에는 보내지 않는다).
+    - 닫힘이면 `join` 의 `auth_failed` 문구 끝에 등록 안내가 붙는다 — "아이디 또는 비밀번호가 올바르지 않습니다. 처음 쓰는 분은 관리자에게 등록 코드를 받아 아래 [처음 사용하시나요?]에서 등록해 주세요." 계정이 있든 없든 같은 문구다(2026-11-17).
+    - 코드 없이 시작하게 하려면 관리자가 [비밀번호 재설정…](`admin_reset_password`)으로 초기 비밀번호를 정해 알려 준다 — 그 계정은 바로 `join` 한다.
   - 성공하면 `join` 과 같은 `welcome`(+ `remember:true` 면 `login_token`) 과 이후 알림.
-- **비밀번호 재설정**: `password_reset {username, email, new_password}` (로그인 전 연결). 관리자 계정은 이메일만으로 바꿀 수 없다 — "관리자 계정은 직접 재설정할 수 없습니다. 다른 그룹 관리자나 서버 PC 의 scripts/set_password.py 로 바꿔 주세요." **이메일은 본인 · 관리자에게만 보낸다**: welcome `users` · `user_updated` · `friend_added` 의 다른 사람 User 는 `email:""` (재설정 확인 값이자 '정확히 아는 사람만' 찾는 친구 추가 값이라 모두에게 공개하지 않는다). `username` 은 join 과 같은 로그인 아이디(이름·사내 계정·이메일). 그 계정에 비밀번호가 등록돼 있고 가입 이메일이 `email` 과 같으면(대소문자 무시) 새 비밀번호(4~64자)로 바꾸고 그 계정의 자동 로그인 토큰을 모두 폐기한 뒤 `password_reset_ok {username}` (연결은 로그인되지 않은 상태 그대로). 아이디가 없거나 이메일이 다르면 `error {req_type:"password_reset"}` "아이디 또는 가입한 이메일이 일치하지 않습니다." (계정이 있는지 드러내지 않는다) 이고 로그인 실패와 같은 횟수 제한(아이디 5번·IP 20번 → 5분)에 센다. 비밀번호를 등록한 적 없는 계정은 처음 사용 등록 안내 오류. 메일 발송 없이 가입 이메일로만 확인하므로, 메일 인증이 필요해지면 확인 코드 단계를 추가한다.
+- **로그인 아이디는 겹치지 않는다 (2026-11-17):** 이름(username) · 사번 · 사내 계정(account) · 이메일은 모두 로그인 아이디라, 새로 정하는 값은 다른 사람의 이 네 값 어느 것과도 같을 수 없다(대소문자 무시). 처음 사용 등록의 새 이름 "다른 사람의 로그인 아이디와 같은 이름은 쓸 수 없습니다. 관리자에게 문의해 주세요." / 이메일 "이미 가입된 이메일입니다." / 구성원 등록 · 수정(§4.3)의 이름 "다른 구성원의 로그인 아이디(사번 · 사내 계정)와 같은 이름은 쓸 수 없습니다." 과 "이미 다른 구성원이 쓰는 사번(사내 계정 · 이메일)입니다." / `profile_update` 의 이메일 "이미 다른 사람이 쓰는 이메일입니다."
+- **이메일은 등록이 닫힌 서버에서 관리자 관리 항목 (2026-11-17):** 닫힌 서버의 `profile_update` 는 `email` 을 지금 값과 다르게 보내도 바꾸지 않는다 — 함께 보낸 다른 항목은 저장해 `user_updated` 를 보내고, 이어서 `error {req_type:"profile_update"}` "이메일은 로그인 아이디라 직접 바꿀 수 없습니다. 관리자에게 변경을 요청해 주세요." 를 보낸다(이메일만 보냈으면 오류만). 이메일은 관리자가 `admin_member_update` 로 고친다. 열린 서버는 본인이 바꿀 수 있다(위 중복 규칙 적용).
+- **서버 정책 알림 (2026-11-17, 추가 필드):** `welcome` 에 `policy {open_registration:bool, email_editable:bool, display_name_editable:bool}`, 로그인 전 `org_companies` 응답에 `open_registration:bool` 을 넣는다. 클라이언트는 등록 화면의 코드 칸 · 프로필의 이메일 칸을 이 값에 맞춘다(없으면 예전 서버).
+- **비밀번호 재설정**: `password_reset {username, email, new_password, code}` (로그인 전 연결). `code` 는 관리자가 `admin_reset_code` 로 발급한 일회용 코드(30분)이고 없거나 틀리면 바꾸지 않는다. 등록이 닫힌 서버(위 '등록 방식')에서는 비밀번호가 없는 계정 · 사용 중지 계정도 처음 사용 등록 안내나 사용 중지 안내 대신 아래의 불일치 오류로 답한다. 관리자 계정은 이메일만으로 바꿀 수 없다 — "관리자 계정은 직접 재설정할 수 없습니다. 다른 그룹 관리자나 서버 PC 의 scripts/set_password.py 로 바꿔 주세요." **이메일은 본인 · 관리자에게만 보낸다**: welcome `users` · `user_updated` · `friend_added` 의 다른 사람 User 는 `email:""` (재설정 확인 값이자 '정확히 아는 사람만' 찾는 친구 추가 값이라 모두에게 공개하지 않는다). `username` 은 join 과 같은 로그인 아이디(이름·사내 계정·이메일). 그 계정에 비밀번호가 등록돼 있고 가입 이메일이 `email` 과 같으면(대소문자 무시) 새 비밀번호(4~64자)로 바꾸고 그 계정의 자동 로그인 토큰을 모두 폐기한 뒤 `password_reset_ok {username}` (연결은 로그인되지 않은 상태 그대로). 아이디가 없거나 이메일이 다르면 `error {req_type:"password_reset"}` "아이디 또는 가입한 이메일이 일치하지 않습니다." (계정이 있는지 드러내지 않는다) 이고 로그인 실패와 같은 횟수 제한(아이디 5번·IP 20번 → 5분)에 센다. 비밀번호를 등록한 적 없는 계정은 처음 사용 등록 안내 오류. 메일 발송 없이 가입 이메일로만 확인하므로, 메일 인증이 필요해지면 확인 코드 단계를 추가한다.
 - **그다음부터는 `join {username, password}`**: `username` 은 로그인 아이디로, 클라이언트는 로그인 창에 넣은 값(운영은 이메일)을 보낸다. 사번(`employee_no`, 대소문자 무시)이 같은 사용자가 먼저이고, 없으면 사용자 이름(username), 그다음 대소문자 무시로 조직 `account`, `email` 과 같은 사용자로 로그인한다(1~120자. 사번 없이 등록한 예전 계정 호환). User 에 `employee_no`(없으면 "") 포함.
-- `password` 가 있으면: 비밀번호가 등록된 계정은 PBKDF2-SHA256(솔트) 해시와 비교해 틀리면 오류 "아이디 또는 비밀번호가 올바르지 않습니다." 비밀번호가 아직 없는 계정이나 없는 아이디는 오류 "처음 사용하는 아이디입니다. [처음 사용 등록]에서 소속 회사·이름·이메일·비밀번호를 등록해 주세요." (로그인 실패 횟수에는 세지 않는다). 비밀번호는 4~64자, 아니면 오류 "비밀번호는 4~64자로 입력해 주세요."
+- `password` 가 있으면: 비밀번호가 등록된 계정은 PBKDF2-SHA256(솔트) 해시와 비교해 틀리면 오류 "아이디 또는 비밀번호가 올바르지 않습니다." 비밀번호가 아직 없는 계정이나 없는 아이디는 오류 "처음 사용하는 아이디입니다. [처음 사용 등록]에서 소속 회사·이름·이메일·비밀번호를 등록해 주세요." (로그인 실패 횟수에는 세지 않는다) — 단, 등록이 닫힌 서버에서는 이 경우도 "아이디 또는 비밀번호가 올바르지 않습니다." 로 답하고 실패로 센다. 비밀번호는 4~64자, 아니면 오류 "비밀번호는 4~64자로 입력해 주세요."
 - `password` 가 없으면(구버전·테스트 클라이언트): 비밀번호가 없는 계정만 로그인된다(없는 아이디는 20자 이내로 게스트 생성). 비밀번호가 등록된 계정은 오류 "비밀번호를 입력해 주세요."
 - 비밀번호(해시)는 User 객체에 절대 포함하지 않는다. 오류 응답은 `error {req_type:"join"}` 이고 연결은 유지되어 같은 연결에서 다시 join 할 수 있다.
 - 로그인 정보 저장/자동 로그인: `join` 에 `remember:true` 를 주고 비밀번호로 성공하면 welcome 에 `login_token`(무작위 32바이트, urlsafe) 을 넣는다. 서버는 토큰의 SHA-256 만 `login_tokens(token_hash, username, created_at)` 에 저장하고 30일 뒤 만료. 사용자당 최근 5개만 유지. `join {username, token}` 은 비밀번호 대신 토큰으로 로그인(토큰 주인과 아이디가 같아야 함). 틀리거나 만료되면 오류 "저장된 로그인 정보가 만료되었습니다. 비밀번호를 입력해 주세요." `login_token_revoke {token}` → 그 토큰 삭제 후 `login_token_revoked {}` (로그아웃).
-- 보안: 같은 아이디로 5번(IP 기준 20번) 틀리면 5분간 그 아이디/IP 의 join 을 "로그인 실패가 너무 많습니다. N분 뒤에 다시 시도해 주세요." 로 거절. 서버 옵션 `require_password`(배포용 `chat_server.py` 기본 켬, `--allow-passwordless` 로 끔)면 비밀번호·토큰 없는 join 은 "비밀번호를 입력해 주세요." 관리자 도구 `scripts/set_password.py <아이디> [--password P | --clear]` (변경 시 토큰 모두 폐기. `--clear` 하면 그 사람은 다시 [처음 사용 등록]을 한다).
+- 보안 — 로그인 실패 제한 (2026-11-17 개정): 최근 5분 안의 실패 횟수로 본다. ① **한 주소(IP)에서 한 아이디 5번**, ② 한 아이디 전체 20번(여러 주소에서 나눠 시도), ③ 한 주소 전체 100번(사무실이 주소 하나를 같이 쓰므로 넉넉하게) 가운데 하나라도 넘으면 그 범위의 join · register · password_reset 을 "로그인 실패가 너무 많습니다. N분 뒤에 다시 시도해 주세요." 로 거절한다(맞는 비밀번호도 그동안은 확인하지 않는다). 다른 주소에서 로그인하는 본인은 ①에 걸리지 않는다. 성공하면 ①만 지운다(②·③은 시간이 지나야 풀린다). **자동 로그인 토큰**(`join {token}`)은 맞혀 볼 수 없는 값이라 ③만 본다 — 아이디가 잠겨 있어도 로그인을 저장해 둔 기기는 들어온다. 거절 응답에는 `code:"throttled"` 와 `retry_after`(초)가 함께 온다.
+- **비밀번호 길이 · 변경 (2026-11-17):** 새로 정하는 비밀번호(register · password_reset · admin_reset_password · password_change)는 비밀번호가 필수인 서버에서 **8~64자**, 구버전 · 테스트 서버에서 4~64자 — "비밀번호는 N~64자로 입력해 주세요." 로그인(join)은 예전에 정한 4자 이상 비밀번호도 그대로 받는다. `password_change {old_password, new_password, remember?}`: 지금 비밀번호가 틀리면 `error {code:"auth_failed"}` "지금 비밀번호가 올바르지 않습니다."(로그인 실패로 센다), 맞으면 바꾸고 자동 로그인 토큰을 모두 폐기한 뒤 `password_changed {}`(`remember:true` 면 새 `login_token` 포함). 비밀번호가 바뀌면(본인 변경 · 재설정 · 관리자 재설정) 그 계정의 다른 접속 중 연결에는 `error {code:"session_expired"}` "비밀번호가 바뀌어 다시 로그인해야 합니다." 를 보내고 끊는다(바꾼 그 연결은 유지).
+- **오류 구분 코드 (2026-11-17, 추가 필드):** 아래 오류는 `error` 에 `code` 가 함께 온다(그 밖의 검증 오류에는 `code` 가 없다 — 기존 필드 `req_type` · `message` 는 그대로). 클라이언트는 문구가 아니라 이 값으로 가른다.
+
+| code | 언제 | 함께 오는 값 |
+|---|---|---|
+| `auth_failed` | join: 아이디 또는 비밀번호가 틀림 (등록이 닫힌 서버에서는 없는 아이디 · 비밀번호 없는 계정도) | – |
+| `token_expired` | join {token}: 저장된 로그인이 틀리거나 만료 | – |
+| `throttled` | join · register · password_reset: 실패가 너무 많음 (잠시 뒤 같은 값으로 다시 하면 된다) | `retry_after`:초 |
+| `account_disabled` | 사용 중지 · 삭제된 계정 | – |
+| `needs_register` | 열린 서버의 join · password_reset: 비밀번호를 등록한 적 없는 아이디 | – |
+| `password_required` | join: 비밀번호가 필요한데 없음 | – |
+| `register_closed` | 닫힌 서버의 register 거절 (§4.1 '등록 방식') | – |
+| `register_rejected` | register 의 그 밖의 거절 (이미 등록된 이름 · 이메일 중복 · 조직도 값 불일치 등) | – |
+| `reset_mismatch` | password_reset: 아이디 · 이메일 · 코드가 맞지 않음 | – |
+| `admin_account` | 열린 서버의 password_reset: 관리자 계정은 직접 재설정 불가 | – |
+| `email_admin_only` | profile_update: 닫힌 서버에서 이메일 변경 | – |
+| `name_fixed` | profile_update: 닫힌 서버에서 표시 이름 변경 (§4.5) | – |
+| `already_logged_in` | 이미 로그인한 연결에서 join · register | – |
+| `login_required` | 로그인 전에 보낸 요청 | – |
+| `admin_only` | 관리자 요청을 관리자가 아닌 사람이 보냄 | – |
+| `server_error` | 서버 내부 오류 (요청은 처리되지 않았을 수 있다) | – |
+| `rate_limited` | 요청이 너무 잦음 (§2 '요청 빈도') | `retry_after`:초 |
+| `login_timeout` | 로그인하지 않은 연결을 닫기 직전 (§2) | – |
+| `too_large` | 요청 한 건이 너무 커서 연결을 닫기 직전 (§2) | – |
+| `session_expired` | 비밀번호가 바뀌어 이 연결을 끊기 직전 | – |
+| `quota_exceeded` | 하루에 올릴 수 있는 첨부 용량(1GB)을 넘음 (§4.5) | – |
+
+- (이어서) 로그인 실패 제한 밖의 보안 옵션: 서버 옵션 `require_password`(배포용 `chat_server.py` 기본 켬, `--allow-passwordless` 로 끔)면 비밀번호·토큰 없는 join 은 "비밀번호를 입력해 주세요." 관리자 도구 `scripts/set_password.py <아이디> [--password P | --clear]` (새 비밀번호는 8~64자 — 시험용 서버는 `--allow-short` 로 4자부터. 변경 시 토큰 모두 폐기. `--clear` 하면 그 사람은 다시 [처음 사용 등록]을 한다).
 - 설정 파일: 클라이언트 설정은 welcome 의 실제 username 기준 파일(계정 아이디로 로그인해도 같은 파일)이며 임시 파일 → 교체로 저장, 바뀐 키만 합쳐 쓴다.
 - **간편 로그아웃 (2026-10-10):** 메인 창 왼쪽 아래 내 사진(사이드바)을 우클릭하면 메뉴 [이름(표시만) · 로그아웃]. 로그아웃은 확인 창 없이 바로 더보기 → 로그아웃과 같은 처리(`login_token_revoke` 로 토큰 폐기 + 저장된 로그인 삭제 + 로그인 창부터 다시)를 한다(메뉴를 고른 것이 확인). 더보기 · 트레이의 로그아웃은 그대로 확인 창을 띄운다.
 - 클라이언트 저장: `~/.kcs_messenger/saved_login.json` (권한 0600) `{login_id, token, auto_login, host, port}`. 비밀번호 원문은 어디에도 저장하지 않는다. 로그인 창의 [사번·비밀번호 저장] 이 켜져 있으면 다음 실행 때 아이디가 채워지고 비밀번호 칸은 '저장됨' 표시 → 그대로 로그인하면 토큰을 쓴다. [자동 로그인] 이면 로그인 창 없이 바로 토큰으로 로그인(실패하면 로그인 창 + 사유). 단, `app.py --no-auto-login`(런처가 창을 열 때 사용)이면 자동 로그인을 건너뛰고 로그인 창을 띄운다(아이디만 미리 채움). 더보기 → 로그아웃: 토큰 폐기 + 저장 정보 삭제 후 로그인 창으로 다시 시작.
@@ -149,7 +195,7 @@ Todo    {todo_id:int, owner, title, due:"YYYY-MM-DD"|null, done:bool, created_at
 
 
 ### 4.2 관리자 권한
-- **관리자 지정**: `users.is_admin`. ① `org.json` v2 의 `admins:[username]`(서버 시작 때마다 is_admin=1 로 올린다 — 내리지는 않는다), ② 관리자 도구 `scripts/set_admin.py <아이디> [--off]`, ③ 다른 관리자가 앱에서 `admin_set_admin`. 회사 `org.json` 은 `admins:["KCS관리자"]`(사내 계정 `kcs_administrator`).
+- **관리자 지정**: `users.is_admin`. ① `org.json` v2 의 `admins:[username]`(**처음 한 번만** is_admin=1 로 올린다 — 2026-11-17: 앱에서 해제하거나 삭제한 사람을 재시작이 되돌리지 않는다. 그룹 관리자가 한 명도 남지 않았으면 삭제되지 않은 `admins` 를 다시 올린다), ② 관리자 도구 `scripts/set_admin.py <아이디> [--off]`, ③ 다른 관리자가 앱에서 `admin_set_admin`. 회사 `org.json` 은 `admins:["KCS관리자"]`(사내 계정 `kcs_administrator`).
 - User 객체에 `is_admin`(bool) 포함. 클라이언트는 `me.is_admin` 이면 더보기 탭에 '관리자' 메뉴를 보인다(서버가 모든 요청에서 다시 검사하므로 화면 숨김은 편의일 뿐).
 - **사용 중지**: `users.disabled`. 중지된 계정은 `join`(비밀번호·토큰 모두)·`register`·`password_reset` 이 오류 "사용이 중지된 계정입니다. 관리자에게 문의해 주세요." (로그인 실패 횟수에 세지 않는다). 중지하면 그 계정의 자동 로그인 토큰을 모두 폐기하고, 접속 중인 연결에는 `account_disabled {message}` 를 보낸 뒤 끊는다. 클라이언트는 재연결하지 않고 사유를 보여 준 뒤 로그인 창으로 돌아간다.
 - **관리자 요청** (관리자가 아니면 오류 "관리자만 사용할 수 있습니다." / 대상이 없으면 "사용자를 찾을 수 없습니다." / 봇이면 "봇 계정은 관리할 수 없습니다." — `username` 은 정확한 사용자 이름):
@@ -158,11 +204,13 @@ Todo    {todo_id:int, owner, title, due:"YYYY-MM-DD"|null, done:bool, created_at
 |---|---|---|
 | `admin_users` | – | `admin_users {users:[{username, display_name, company, department, title, account, employee_no, email, registered, disabled, is_admin, online}]}` 봇 제외, 이름순. `registered` = 비밀번호 등록됨 |
 | `admin_reset_password` | username, new_password(4~64) | 비밀번호 교체 + 그 계정 토큰 모두 폐기 → `admin_done {action:"reset_password", username}` |
-| `admin_clear_password` | username | 비밀번호 삭제(사번·이메일은 남김) + 토큰 폐기 → 그 사람은 [처음 사용 등록]을 다시 → `admin_done {action:"clear_password", username}` |
+| `admin_clear_password` | username | 비밀번호 삭제(사번·이메일은 남김) + 토큰 · 발급된 코드 폐기 → 그 사람은 [처음 사용 등록]을 다시 → `admin_done {action:"clear_password", username}` |
+| `admin_reset_code` | username | 일회용 코드(8자 `ABCD-EFGH`, 30분, 새로 발급하면 예전 코드 무효) 발급 → `admin_done {action:"reset_code", username, code, expires_at, registered}`. 비밀번호가 있는 계정(`registered:true`)에는 비밀번호 재설정 코드, 없는 계정에는 등록 코드(§4.1)다. 관리자 계정에는 발급하지 않는다 "관리자 계정은 [비밀번호 재설정…]으로 바꿔 주세요." |
 | `admin_set_disabled` | username, disabled(bool) | 자기 자신은 중지 불가 "자기 계정은 사용 중지할 수 없습니다." → `admin_done {action:"set_disabled", username, disabled}` |
 | `admin_set_admin` | username, is_admin(bool), company?(§4.3) | 그룹 관리자만. 마지막 그룹 관리자를 해제하거나 회사 관리자로 바꾸면 "관리자가 한 명은 있어야 합니다." → 모두에게 `user_updated` + `admin_done {action:"set_admin", username, is_admin}` |
 | `admin_notice` | content(1~1000자) | 접속 중인 모든 사람(나 포함)에게 `admin_notice {sender, content, timestamp}` → `admin_done {action:"notice", delivered:N}` (접속하지 않은 사람에게는 가지 않는다) |
 
+- **관리자 도구와 가동 중인 서버 (2026-11-17):** `scripts/set_password.py` · `scripts/set_admin.py` · `scripts/import_org_photos.py` 는 이미 만들어진 DB 를 열 때 표 만들기 · 구조 변경 · `org.json` 시드를 하지 않는다(`Store.open_for_tools`) — 그 일은 서버가 시작할 때만 한다. DB 가 없으면(처음) 도구가 만들어 초기화한다. DB 가 예전 버전이라 도구가 쓸 칸이 없으면 "서버를 새 버전으로 한 번 다시 시작한 뒤 실행해 주세요." 로 끝낸다.
 - 관리자 요청이 성공하면 서버 로그에 `관리자 <누가>: <무엇> <대상>` 을 남긴다.
 - 클라이언트(`client/kakao/admin.py` AdminDialog): 더보기 → 관리자 → 계정 관리 창(이름·소속·사번·이메일 검색, 표: 이름 / 소속·부서 / 사번 / 이메일 / 상태(미등록·사용 중·사용 중지·관리자·접속 중)), 선택한 사람에게 [비밀번호 재설정…] [등록 초기화] [사용 중지/해제] [관리자 지정/해제] (재설정 외에는 확인 창), [전체 공지…]. `admin_done` 을 받으면 목록을 다시 받는다. `admin_notice` 를 받으면 모든 클라이언트가 '관리자 공지' 창(닫을 수 있는 비모달)과 알림을 띄운다.
 
@@ -176,14 +224,14 @@ Todo    {todo_id:int, owner, title, due:"YYYY-MM-DD"|null, done:bool, created_at
 | `admin_users` | – | §4.2 + 각 항목에 `title, extension, mobile, removed, admin_company`. 삭제된 구성원도 포함(`removed:true`) |
 | `admin_member_create` | 구성원 필드 | 이미 있는 이름이면 "이미 있는 이름입니다." → 모두에게 `user_updated` + `admin_done {action:"member_create", username}`. 비밀번호 없이 만들어지므로 그 사람은 [처음 사용 등록]으로 시작 |
 | `admin_member_update` | username + 바꿀 필드 | 회사 관리자는 `company` 를 자기 회사 밖으로 바꿀 수 없다 → `user_updated` + `admin_done {action:"member_update", username}` |
-| `admin_member_delete` | username | 자기 자신 불가 "자기 계정은 삭제할 수 없습니다." 소프트 삭제(`removed=1`, `disabled=1`, 토큰 폐기, 접속 중이면 `account_disabled` 후 끊음). 대화 기록은 남는다. 모두에게 `user_removed {username}` + `admin_done {action:"member_delete", username}` |
-| `admin_member_restore` | username | `removed=0`, `disabled=0` → `user_updated` + `admin_done {action:"member_restore", username}` |
+| `admin_member_delete` | username | 자기 자신 불가 "자기 계정은 삭제할 수 없습니다." 소프트 삭제(`removed=1`, `disabled=1`, 관리자 권한 해제, 토큰 폐기, 접속 중이면 `account_disabled` 후 끊음). 대화 기록은 남는다. 모두에게 `user_removed {username}` + `admin_done {action:"member_delete", username}` |
+| `admin_member_restore` | username | `removed=0`, `disabled=0` (관리자였던 사람도 일반 구성원으로 돌아온다 — 다시 지정은 그룹 관리자가) → `user_updated` + `admin_done {action:"member_restore", username}` |
 
-- **관리자 계정은 그룹 관리자만 (2026-10-11):** 회사 관리자는 같은 회사 소속이라도 다른 관리자(그룹 · 회사 관리자)를 대상으로 한 비밀번호 재설정 · 등록 초기화 · 사용 중지 · 수정 · 삭제를 할 수 없다 — "관리자 계정은 그룹 관리자만 관리할 수 있습니다." (자기 자신은 예외). 삭제된 구성원에게 `admin_set_disabled {disabled:false}` 는 "삭제한 구성원입니다. [복원]으로 되살려 주세요." — 삭제된 구성원은 `disabled` 값과 상관없이 로그인할 수 없다.
+- **관리자 계정은 그룹 관리자만 (2026-10-11):** 회사 관리자는 같은 회사 소속이라도 다른 관리자(그룹 · 회사 관리자)를 대상으로 한 비밀번호 재설정 · 등록 초기화 · 사용 중지 · 수정 · 삭제를 할 수 없다 — "관리자 계정은 그룹 관리자만 관리할 수 있습니다." (자기 자신은 예외. 삭제된 관리자 계정도 같다). 삭제된 구성원에게 `admin_set_disabled {disabled:false}` 는 "삭제한 구성원입니다. [복원]으로 되살려 주세요." — 삭제된 구성원은 `disabled` 값과 상관없이 로그인할 수 없다.
 
 - 삭제된 구성원은 일반 사용자 목록(welcome `users`, `all_users_list`, 조직도, 친구 찾기)에 나오지 않고 로그인할 수 없다(사용 중지와 같은 오류). 클라이언트는 `user_removed` 를 받으면 그 사람을 사용자 목록·조직도·친구 목록에서 뺀다.
 - 관리자가 등록·수정한 구성원은 `users.org_locked=1` 이 되어, 서버를 다시 켤 때 `org.json` 시드가 그 사람의 조직 정보(회사·부서·직함·계정·내선·휴대폰·조직 경로)를 덮어쓰지 않는다. 삭제한 구성원은 시드가 되살리지 않는다.
-- **서버 주소는 그룹 관리자만 (2026-10-10):** 로그인 창에는 서버 설정(주소 · 포트)이 없다. 접속 주소는 ① 명령줄 `--host`/`--port`(관리자 비상용) → ② 이 PC 의 `server.json`(`app_home()` 아래, `{host, port, tls}`) → ③ 저장된 로그인의 주소 → ④ 기본 127.0.0.1:5555 순서로 정한다. **TLS(2026-10-14):** `tls:true`(또는 `--tls`/`--no-tls`)면 클라이언트가 소켓을 TLS 로 감싼다(SNI=host, OS·certifi 신뢰 저장소로 인증서 검증). 운영 서버 `talk.kcins.co.kr:9550` 은 nginx stream 이 TLS 를 종단해 `127.0.0.1:9551` 의 서버로 PROXY protocol v1 과 함께 넘기고, 서버는 `--proxy-protocol` 로 첫 줄에서 실제 클라이언트 IP 를 복원한다(IP 기준 로그인 스로틀 §4.1 보존). NDJSON 프로토콜 자체는 바뀌지 않는다 — TLS 는 전송 계층이고, `tls` 는 클라이언트 PC 설정이다. `save_server_address` 에 `tls` 를 넘기지 않으면 기존 값을 보존한다(더보기 → 정보에서 주소만 바꿔도 TLS 가 풀리지 않게). `server.json` 은 **그룹 관리자**(`is_admin` 이고 `admin_company=""`, 예: `KCS관리자` / `kcs_administrator`)만 더보기 → **정보** 에서 고친다(주소 · 포트 칸 + [저장], 다음 로그인부터 적용). 정보 구역(회사 로고 · 버전 · 서버 주소)은 그룹 관리자에게만 보이고, 회사 관리자 · 일반 사용자에게는 구역째 숨긴다. 연결 실패 창에는 [다시 시도] [종료]만 있고 '관리자에게 문의' 안내를 보인다. 서버 프로토콜 바뀜 없음(클라이언트 PC 설정).
+- **서버 주소는 그룹 관리자만 (2026-10-10):** 로그인 창에는 서버 설정(주소 · 포트)이 없다. 접속 주소는 ① 명령줄 `--host`/`--port`(관리자 비상용) → ② 이 PC 의 `server.json`(`app_home()` 아래, `{host, port, tls}`) → ③ 저장된 로그인의 주소 → ④ 기본 127.0.0.1:5555 순서로 정한다. **TLS(2026-10-14, 기본값 2026-11-17):** `tls` 가 참이면 클라이언트가 소켓을 TLS 로 감싼다(SNI=host, OS·certifi 신뢰 저장소로 인증서 검증). 값은 `--tls`/`--no-tls` → 이 PC 의 `server.json` `tls` → 설치본에 묶인 `deploy.json` `tls` 순서로 정하고, 어디에도 없으면 **접속할 주소로 정한다: 이 PC(127.0.0.1 · localhost · ::1)의 서버는 평문, 다른 컴퓨터의 서버는 TLS**(`settings.default_tls_for`). 다른 컴퓨터의 서버에 평문으로 붙으려면 `tls:false` · `--no-tls` · `kcs.py build --deploy-plain` 으로 명시해야 하고, 그때 로그인 창에 "연결이 암호화되지 않습니다" 안내가 보인다. 운영 서버 `talk.kcins.co.kr:9550` 은 nginx stream 이 TLS 를 종단해 `127.0.0.1:9551` 의 서버로 PROXY protocol v1 과 함께 넘기고, 서버는 `--proxy-protocol` 로 첫 줄에서 실제 클라이언트 IP 를 복원한다(IP 기준 로그인 스로틀 §4.1 보존). NDJSON 프로토콜 자체는 바뀌지 않는다 — TLS 는 전송 계층이고, `tls` 는 클라이언트 PC 설정이다. `save_server_address` 에 `tls` 를 넘기지 않으면 기존 값을 보존한다(더보기 → 정보에서 주소만 바꿔도 TLS 가 풀리지 않게). `server.json` 은 **그룹 관리자**(`is_admin` 이고 `admin_company=""`, 예: `KCS관리자` / `kcs_administrator`)만 더보기 → **정보** 에서 고친다(주소 · 포트 칸 + [저장], 다음 로그인부터 적용). 정보 구역(회사 로고 · 버전 · 서버 주소)은 그룹 관리자에게만 보이고, 회사 관리자 · 일반 사용자에게는 구역째 숨긴다. 연결 실패 창에는 [다시 시도] [종료]만 있고 '관리자에게 문의' 안내를 보인다. 서버 프로토콜 바뀜 없음(클라이언트 PC 설정).
 - **조직도 편집 모드 (2026-10-10):** 관리자(예: `KCS관리자` / 사내 계정 `kcs_administrator`)로 로그인하면 조직도 탭 헤더에 연필 [편집 모드] 버튼이 보인다(관리자가 아니면 없음). 켜면 헤더 아래 '편집 모드' 안내 줄([끝내기] 포함)이 나오고 `admin_users` 를 받아 사번 · 이메일까지 채운다. 편집 모드에서는 구성원 행을 누르거나 두 번 누르면 채팅 대신 구성원 창(MemberDialog, 부서 아래 '팀' 칸 포함)이 열리고, [저장]하면 바뀐 필드만 `admin_member_update` 로 보낸다(부서나 팀이 바뀌면 `department` · `team` 을 함께). 관리 범위 밖(회사 관리자의 다른 회사 사람) · 봇은 열지 않는다. 관리자는 편집 모드가 아니어도 구성원 우클릭 → '정보 수정…' 으로 같은 창을 연다. 서버 오류는 알림 창으로 보여 준다.
 - 클라이언트: 계정 관리 창에 [구성원 등록…] [조회 · 수정…](행 두 번 클릭도) [삭제] [복원] 버튼. 구성원 창(MemberDialog)은 회사 콤보(회사 관리자는 자기 회사로 고정) + 필드 입력. 창 제목에 범위 표시 '관리자 · 계정 관리 (그룹 전체)' / '(케이씨에스)'.
 ### 4.4 조직도 그룹 (그룹 관리자, 2026-10-10)
@@ -206,6 +254,25 @@ Todo    {todo_id:int, owner, title, due:"YYYY-MM-DD"|null, done:bool, created_at
 - `event_reminder {event, minutes_before}` — `start - remind_minutes` 시각에 응답이 "no"가 아닌 참석자(+생성자) 중 접속자에게 1회. 15초 주기 검사.
 - 신규 사용자가 처음 join하면 다른 접속자에게 `user_updated {user}`.
 
+### 4.5 요청 값 공통 규칙 (2026-11-17)
+- **`req_id` · `client_tmp_id`** 는 클라이언트가 붙이는 짧은 표식이다: 없음(null) · 정수 · 64자 이내 문자열만 받는다(그대로 돌려주거나 다른 사람에게 전달되는 값이라). 아니면 `error` "req_id 값이 올바르지 않습니다."(이 오류에는 `req_id` 를 돌려주지 않는다) / "client_tmp_id 값이 올바르지 않습니다."
+- **글자**: 문자열 값은 UTF-8 로 보낼 수 있어야 한다(짝 없는 서러게이트 불가) — "… 값에 쓸 수 없는 문자가 있습니다." / 메시지 본문은 "메시지에 쓸 수 없는 문자가 있습니다."
+- **이름 목록**(`members` · `usernames` · `mentions` · `attendees` · `viewers` · `tags`): 한 요청에 1,000개까지(`mentions` 는 200개) — "… 항목이 너무 많습니다 (최대 N개)."
+- **사진으로 보내는 첨부**(`send` · `file_send_request` 의 `kind:"image"`)는 내용이 실제 사진(PNG · JPEG · GIF · BMP · WEBP)이어야 한다. 클라이언트도 보내기 전에 확장자가 아니라 내용으로 사진인지 판단한다. 아니면 서버가 `kind:"file"` 로 바꿔 저장 · 전달한다(오류가 아니다). 첨부의 `mime` 이 `image/*` 인데 내용이 그 형식들이 아니면 `application/octet-stream` 으로, 맞으면 내용에 맞는 값으로 고쳐 저장한다.
+- **통화 음성 조각**(`call_media` 의 `kind:"audio"`): 풀었을 때 32,000바이트(16kHz mono s16le 1초) 이하여야 한다. `zpcm` 은 서버가 그만큼만 풀어 확인한다 — 넘으면 "음성 조각이 너무 큽니다." (보내는 쪽 정상 조각은 40ms = 1,280바이트)
+- **이름**: 표시 이름 · 채팅방 이름 · 오픈채팅 닉네임 · 멀티프로필 이름에는 제어 문자(줄바꿈 · 탭 포함)와 글자 방향을 바꾸는 문자를 쓸 수 없다 — "…에 사용할 수 없는 문자가 있습니다."
+- **첨부 파일 이름**(`attachment.name` · `rag_doc_add` 의 `name`)은 서버가 정리해 저장한다: 폴더 부분을 떼고(마지막 조각만) 제어 문자 · 방향 전환 문자를 지우며, 끝의 공백 · 점을 뗀다. 남는 것이 없으면 "파일".
+- **하루 첨부 용량**: 한 사람이 24시간 동안 올릴 수 있는 첨부는 1GB — 넘으면 `error {code:"quota_exceeded"}` "하루에 올릴 수 있는 파일 용량을 넘었습니다. 내일 다시 시도해 주세요."
+- **쓰지 않는 첨부 정리**: 어떤 메시지 · 프로필/조직도 사진 · 멀티프로필 · 펑 · 처리 전 전송 요청 · 보내기 전 예약 메시지에서도 쓰지 않는 첨부는 올린 지 24시간 뒤 서버가 데이터를 지운다(1시간마다 확인).
+- **압축 파일 검사**(§10.10 보강): zip 은 든 파일 이름을 전부 보고, 든 파일의 내용 앞부분으로도 형태를 판별하며(이름만 바꾼 실행 파일), 안에 든 zip 은 한 단계 더 연다. 오피스 · 한글 문서(zip 형식)는 안에 실행 파일이 들어 있으면 막는다. 실행 파일 형태에 바로가기 · 도움말 · 디스크 이미지 확장자(url · chm · iso · img · vhd 등)를 더했다.
+- **링크 미리보기 접속 주소**(§7.8): 서버는 가져가도 되는지 확인한 바로 그 IP 로만 접속한다(리다이렉트마다 다시 확인). **공인 인터넷 주소만 가져온다 (2026-11-17 결정)** — 서버 자신 · 링크 로컬에 더해 사내망(10.x · 172.16~31.x · 192.168.x · 100.64~127.x · IPv6 사설 대역)도 가져오지 않는다. 사내 그룹웨어 링크에는 미리보기가 붙지 않는다(§7.8 표의 예전 설명보다 이 규칙이 우선).
+- **나중에 들어온 사람이 보는 범위 (2026-11-17 결정):** 그룹 채팅방에 초대로 들어온 사람은 **들어온 뒤의 메시지만** 본다(`room_members.since_msg_id` = 들어올 때의 마지막 메시지 번호. 방을 만들 때부터 있던 사람 · 이 규칙 전에 들어온 사람은 0 = 전부). 적용 범위: `history` · `search` · `drawer_query` · `mention_list` · `room_export` · `room_summary` · 방 목록의 마지막 메시지, 예전 메시지를 가리키는 요청(`react` · `thread_get` · `notice_set` · `send` 의 `reply_to_id`/`thread_root_id` · `poll_vote`/`poll_close` · `attachment_get`)은 없는 메시지로 답하고, 예전 메시지의 `msg_updated` 도 보내지 않는다. AI 비서의 근거에서도 빠진다. 예외: 들어온 뒤에 답글이 달린 스레드의 원글은 보인다. 방의 공지(`notice`)와 톡게시판 글은 방 전체의 것이라 그대로 보인다. 나갔다가 다시 초대받으면 다시 들어온 때부터다. 1:1 · 오픈채팅은 예전과 같다.
+- **표시 이름은 실명으로 고정 (2026-11-17 결정):** 등록이 닫힌 서버에서는 `display_name` 이 항상 `username`(조직도 이름)이다. `profile_update` 의 `display_name` 이 이름과 다르면 바꾸지 않고(함께 보낸 다른 항목은 저장) `error {code:"name_fixed"}` "이름은 조직도에 등록된 이름으로 고정되어 바꿀 수 없습니다." 를 보낸다. 멀티프로필(§8.5)의 `display_name` 도 서버가 실명으로 바꿔 저장한다(상태메시지 · 사진은 프로필마다 다르게 둘 수 있다). 서버는 시작할 때 예전에 바꿔 둔 표시 이름 · 멀티프로필 이름을 실명으로 되돌린다. `welcome.policy` 에 `display_name_editable:bool`. 열린 서버(테스트 · 데모)는 예전처럼 바꿀 수 있다.
+- **AI 비서 작업 처리**(§7.6, 2026-11-17): 답변 · 문서 학습처럼 오래 걸리는 일은 작업 스레드 3개가 나눠 처리한다. 같은 방의 질문은 물은 순서대로 답하고, 다른 방의 질문은 서로 기다리지 않는다. 메시지 색인 · 오늘의 브리핑은 따로 돌아 느린 답변에 밀리지 않는다. `rag_doc_add` 는 문서 해석을 요청 처리 밖에서 하고 끝나면 `rag_doc_added`(또는 `error`)를 보낸다 — 같은 연결의 다음 요청 응답이 먼저 올 수 있으므로 `req_id` 로 짝짓는다. 밀린 작업이 모두 합쳐 100건을 넘으면 답변은 "질문이 너무 잦아요…" 안내로, 문서 추가는 `rate_limited` 오류로 답한다. 학습하는 문서는 PDF 1,000쪽 · 글자 200만 자까지만 읽는다(넘는 부분은 빼고 학습하며 응답의 `doc.truncated:true` 로 알린다).
+- **AI 비서의 근거 범위**(§7.6): 1:1(AI 비서와의 방)에서는 질문자가 속한 모든 방 · 본인 문서가 근거다. 여럿이 보는 방에서 부르면 **그 방의 대화만** 근거로 삼고, 앞 대화도 질문자와 AI 비서의 말만 넘긴다.
+- **매크로 문서 · 7z · rar · alz · egg 기본 차단**(§10.10, 2026-11-17 결정): 기본 차단 형태에 `macro_document`(확장자와 내용으로 판별) · `sealed_archive`(7z · rar · alz · egg, 서버가 안을 볼 수 없는 압축 파일)를 더했다. 이미 저장된 정책에는 서버가 시작할 때 한 번 합치고 로그에 남긴다(관리자가 뺀 것은 다시 넣지 않는다).
+- **파일 전송 승인**(§10.10): 승인했는데 서버가 파일을 보내지 못하면 요청을 다시 대기(`pending`)로 돌리고 "파일을 보내지 못했습니다. 잠시 후 다시 승인해 주세요." 로 답한다.
+
 ## 5. 서버 구조
 
 ```
@@ -218,6 +285,8 @@ server/kakao/file_policy.py     # 파일 전송 보안 검사 (형태 · 확장�
 server/chat/chat_server.py  # 기존 진입점 → KakaoServer 실행 (CLI: --host --port --db)
 ```
 - 기본 DB 경로: `<프로젝트>/server_data/kakao.db`
+- **무거운 조회는 읽기 전용 두 번째 연결에서 (2026-11-17):** `search` · `drawer_query` · `mention_list` 는 큰 방을 훑을 수 있어, 쓰기용 연결 · 전역 잠금과 따로 둔 읽기 전용 SQLite 연결(WAL)에서 실행한다 — 검색 한 번이 다른 요청(메시지 저장 · 읽음 처리 등)을 세우지 않는다. 결과와 검색 규칙(부분 일치 · 한글 2글자 · 영문 대소문자 무시)은 그대로다. 방금 저장한 메시지도 바로 검색된다. 메모리 DB 처럼 두 번째 연결을 열 수 없으면 예전처럼 돈다.
+- **화면을 여는 조회 (2026-11-18, 측정: `scripts/bench_server_requests.py` → `claudedocs/SERVER_REQUEST_TIMES.md`):** 읽기 전용 연결은 2개(`Store.READ_CONNECTIONS`)이고, 로그인(welcome)의 방 목록 · 사용자 목록, `admin_users`, `event_list`, `call_history` 도 여기서 돈다 — 출근 시간처럼 로그인이 몰려도 메시지 저장이 서지 않는다. 한 번의 조회는 읽기 트랜잭션 하나 안에서 돌아 같은 시점의 내용을 본다(방 목록의 안 읽은 수와 읽음 위치가 서로 맞는다). 서랍은 종류별(사진 · 파일 · 링크), 멘션 모아보기는 멘션이 있는 메시지만 담은 부분 색인을 최신순으로 훑는다. 안 읽은 수는 방 · 번호 · 보낸 사람 · 종류 색인(`idx_messages_room_sender`, 예전 `idx_messages_room` 을 바꿈)만으로 센다. 서버가 처음 다시 시작할 때 색인을 만든다(메시지 100만 건에 약 2초). 응답 모양 · 결과는 바뀌지 않는다. **welcome 의 사용자 목록 캐시:** `users` 는 사용자 정보가 바뀔 때만 다시 만든다 — `users` 표의 목록에 보이는 칸이 바뀌면 DB 트리거가 `cache_versions` 의 버전을 올리고(어느 코드가 바꿔도), 서버는 사람마다 (버전, 접속 여부, 이메일 가림) 별 JSON 조각을 한 번만 만들어 이어 붙인다. 보는 사람마다 다른 것(멀티프로필 · 본인 · 관리자에게만 보이는 이메일 · 접속 상태)은 덧씌우며, 결과는 예전 방식과 바이트까지 같다(`tests/test_kakao_user_cache.py`). welcome 만들기는 한 번에 하나씩(`WELCOME_BUILDS`) — 파이썬 작업이라 동시에 만들면 서로 늦어진다. 측정: 100명 동시 자동 로그인에서 로그인 한 건 p95 1.1~1.2초 → 0.34~0.40초.
 - 기본 사용자: 홍길동, 김철수, 이영희, 박민수, 최지우 (생일 샘플 포함)
 - 첨부 최대 2MB(base64 디코딩 기준), 초과 시 error
 
@@ -335,7 +404,7 @@ online `#3DD16B` · away `#F5B400`(자리비움) · busy `#FF4B3E`(다른 용무
 | 메시지 수정 | 요청 `edit {msg_id, content}` — 본인·kind=text·삭제 안 됨·**24시간 이내**만. Message에 `edited:bool`, `edited_at:ISO|null`. 성공 시 멤버에게 `msg_updated`. 수정된 내용으로 검색/RAG 색인 갱신 |
 | 삭제 문구 | 삭제된 메시지 content = **"메시지가 삭제되었습니다"** (누가 지웠는지 표시하지 않음) |
 | 조용히 보내기 | `send`에 `silent:true` → Message `silent:true`. 받는 클라이언트는 소리/트레이 알림을 띄우지 않지만 안 읽은 수에는 반영 |
-| URL 미리보기 | text 메시지에 http(s) URL이 있으면 서버가 비동기로 첫 URL의 og:title/og:description/og:site_name(없으면 <title>)을 가져와 Message `link_preview:{url,title,description,site}`를 채우고 `msg_updated`. 3초 타임아웃, 256KB까지만 읽음. 서버 자신(127.x · ::1) · 링크 로컬(169.254.x) · 0.0.0.0 · 멀티캐스트 주소는 가져오지 않는다(리다이렉트 주소도 다시 검사, 사내망 10.x · 192.168.x 는 허용). 서버 옵션 `link_preview=True`(환경변수 `KCS_LINK_PREVIEW=off`로 끔) |
+| URL 미리보기 | text 메시지에 http(s) URL이 있으면 서버가 비동기로 첫 URL의 og:title/og:description/og:site_name(없으면 <title>)을 가져와 Message `link_preview:{url,title,description,site}`를 채우고 `msg_updated`. 3초 타임아웃, 256KB까지만 읽음. 공인 인터넷 주소만 가져온다 — 서버 자신(127.x · ::1) · 링크 로컬(169.254.x) · 0.0.0.0 · 멀티캐스트 · 사내망(10.x · 172.16~31.x · 192.168.x 등) 주소는 가져오지 않는다(리다이렉트 주소도 다시 검사. 사내망은 2026-11-17 부터 차단 — §4.5). 서버 옵션 `link_preview=True`(환경변수 `KCS_LINK_PREVIEW=off`로 끔) |
 | 오늘의 브리핑(선톡) | 서버 옵션 `daily_briefing`(기본 False, 실행 파일은 True). 사용자가 그날 처음 접속하면 AI 비서 1:1 방에 오늘 일정·응답 필요한 일정·마감 할 일·안 읽은 메시지 수 요약을 봇이 먼저 보냄(하루 1회, users.last_briefing) |
 | 채팅방 폴더 | 클라이언트 로컬 설정 `chat_folders:[{name, room_ids}]`. 기본 폴더: 전체 / 안읽음 / 즐겨찾기(고정된 방 + 즐겨찾기 친구와의 1:1). 안읽음 폴더에서 **읽지 않고 미리보기** |
 | 일정 변경 알림 | 클라이언트: 이미 알고 있는 일정이 다른 사람에 의해 바뀌면(제목/시간/장소) 트레이 알림 "일정이 변경되었습니다" |
@@ -361,6 +430,7 @@ online `#3DD16B` · away `#F5B400`(자리비움) · busy `#FF4B3E`(다른 용무
 - `call_leave {call_id}` → 참여자가 0명이거나, voiceroom에서 host가 모두 나가면 종료.
 - `call_hand {call_id, raised:bool}` (voiceroom listener) · `call_role {call_id, username, role:'speaker'|'listener'|'host'}` (host만, speaker+host ≤ 10) · `call_state {call_id, muted?, video?, screen?}` → 각각 `call_updated`.
 - 종료: `call_ended {call_id, room_id, duration_seconds}` + 시스템 메시지 "통화 종료 · M:SS" (보이스룸은 "보이스룸이 종료되었습니다"). 보이스룸은 생성 48시간 후 자동 종료(스케줄러).
+- 알림 순서: 한 연결이 받는 `call_updated` · `call_ended` · `call_list` 는 서버의 통화 상태가 바뀐 순서와 같다 (상태 변경과 알림 세우기를 통화 알림 순서 잠금 안에서 함께 한다). `call_ended` 뒤에 그 통화의 `call_updated` 는 오지 않는다.
 - 미디어 중계: `call_media {call_id, kind:'audio'|'video'|'screen', seq:int, data_b64}` → 서버가 보낸 사람을 뺀 참여자에게 `call_media {call_id, from, kind, seq, data_b64}` 그대로 전달(저장 안 함). 보이스룸에서 audio는 host/speaker만, listener 것은 버림. 형식: audio = 16kHz mono s16le PCM 40ms 프레임(zlib 압축 가능, `kind:'audio'`에 `codec:'pcm'|'zpcm'` 필드), video/screen = JPEG.
 - `call_list {room_id?}` → `call_list {calls}` (내가 속한 방의 진행 중 통화). welcome에도 `calls` 포함.
 
@@ -527,8 +597,9 @@ online `#3DD16B` · away `#F5B400`(자리비움) · busy `#FF4B3E`(다른 용무
 ### 10.10 파일 전송 보안 (외부 유출 방지, 2026-10-11)
 메시지 첨부(`send` 의 image · file · voice, 예약 · 전달 포함)를 서버가 **그룹 관리자 정책**으로 검사한다. 판단은 언제나 서버(`server/kakao/file_policy.py`)가 하고, 클라이언트는 이름 · 확장자만 미리 봐서 올리기 전에 알려 준다.
 
-- **정책** (`org_settings.file_policy`, 저장한 적 없으면 기본값): `{enabled, blocked_types:[형태], blocked_extensions:[확장자(점 없이 소문자, 100개)], blocked_names:[파일 이름 규칙(60자, 100개)]}`. 기본값은 켜짐 + 형태 `executable` · `database` · `credential` + 이름 `*대외비*` `*기밀*` `*confidential*`.
-- **형태** (`categories`): `executable` 실행 파일 · 스크립트 / `archive` 압축 / `database` 데이터베이스 · 백업 · 메일함 / `credential` 인증서 · 암호 키 / `source` 소스 코드 / `document` 문서 / `image` / `video` / `audio`. 확장자와 **파일 내용의 첫 바이트**(MZ · ELF · Mach-O · `#!` · PK · 7z · RAR · gzip · SQLite · `-----BEGIN` · OLE · PDF · 이미지) 둘 다로 판별한다 — `보고서.txt` 로 이름만 바꾼 실행 파일도 '실행 파일'(상세: "확장자는 .txt 이지만 실제 내용은 실행 파일 · 스크립트 형태예요"). docx · xlsx · pptx · hwpx 등은 zip 틀이어도 문서(안에 `[Content_Types].xml` · `mimetype` · `META-INF/manifest.xml` 이 있어야 문서, 없으면 이름만 바꾼 압축 파일), jar · apk 는 실행 파일. zip 은 안에 든 파일 이름(최대 2000개)도 같은 규칙으로 본다.
+- **정책** (`org_settings.file_policy`, 저장한 적 없으면 기본값): `{enabled, blocked_types:[형태], blocked_extensions:[확장자(점 없이 소문자, 100개)], blocked_names:[파일 이름 규칙(60자, 100개)]}`. 기본값은 켜짐 + 형태 `executable` · `macro_document` · `sealed_archive` · `database` · `credential` + 이름 `*대외비*` `*기밀*` `*confidential*`. 저장할 때 서버가 `defaults_seen`(그때의 기본 차단 형태 목록)을 함께 저장한다 — 클라이언트에는 보내지 않는다.
+- **새 기본 차단 형태 합치기 (2026-11-17):** 기본 차단 형태가 늘면 서버가 **시작할 때 한 번** 저장된 정책에 더하고 로그에 "파일 전송 보안: 새 기본 차단 형태 N개를 저장된 정책에 더했습니다 (…)" 를 남긴다. `defaults_seen` 에 이미 있는 형태(관리자가 본 기본값)는 더하지 않으므로 관리자가 뺀 것은 다시 들어가지 않는다. `defaults_seen` 이 없는 예전 정책은 예전 기본값(`executable` · `database` · `credential`)만 본 것으로 친다. 저장한 적 없는 서버는 기본 정책을 그대로 쓰므로 바로 적용된다. 정책이 꺼져 있으면 형태만 더하고 켜지는 않는다.
+- **형태** (`categories`): `executable` 실행 파일 · 스크립트 / `macro_document` 매크로 문서(docm · dotm · xlsm · xltm · xlam · pptm · potm · ppsm · ppam · sldm) / `sealed_archive` 속을 볼 수 없는 압축 파일(7z · rar · alz · egg) / `archive` 압축 / `database` 데이터베이스 · 백업 · 메일함 / `credential` 인증서 · 암호 키 / `source` 소스 코드 / `document` 문서 / `image` / `video` / `audio`. `archive` 를 막으면 `sealed_archive` 도, `document` 를 막으면 `macro_document` 도 함께 막힌다(그래서 7z · rar · alz · egg 와 매크로 문서 확장자는 `archive` · `document` 의 확장자 목록에도 있다). **매크로 문서는 내용으로도 판별한다:** 오피스(OOXML) zip 안에 `vbaProject.bin` 이나 `xl/macrosheets/` 가 있으면 확장자(docx · xlsx · zip 등)와 상관없이 매크로 문서이고, 옛 오피스 OLE 문서(doc · xls)는 VBA 저장소(`_VBA_PROJECT`)가 있으면 매크로 문서다(옛 ppt 의 매크로는 판별하지 못한다). zip 안에 든 매크로 문서(이름 · 안의 오피스 문서 · OLE 문서)도 막는다. 7z · RAR · ALZ · EGG 는 내용의 첫 바이트로도 `sealed_archive` 로 판별한다. 확장자와 **파일 내용의 첫 바이트**(MZ · ELF · Mach-O · `#!` · PK · 7z · RAR · ALZ · EGG · gzip · SQLite · `-----BEGIN` · OLE · PDF · 이미지) 둘 다로 판별한다 — `보고서.txt` 로 이름만 바꾼 실행 파일도 '실행 파일'(상세: "확장자는 .txt 이지만 실제 내용은 실행 파일 · 스크립트 형태예요"). docx · xlsx · pptx · hwpx 등은 zip 틀이어도 문서(안에 `[Content_Types].xml` · `mimetype` · `META-INF/manifest.xml` 이 있어야 문서, 없으면 이름만 바꾼 압축 파일), jar · apk 는 실행 파일. zip 은 안에 든 파일 이름(최대 2000개)도 같은 규칙으로 본다.
 - **파일 이름 규칙**: `*` `?` 가 있으면 이름 전체와 맞춰 보고(fnmatch), 없으면 이름에 들어 있으면 막는다. 대소문자 무시.
 - 검사 순서: 파일 이름 → 확장자 → 형태(확장자) → 형태(내용) → zip 안 파일. 위반 = `{rule:"name"|"extension"|"type", value, detail, category}`.
 - **막히면** `send` 는 오류 대신 요청자에게 `file_blocked {room_id, kind, name, size, client_tmp_id, rule, value, detail, category, sha256, message}` 를 보내고 저장 · 전달하지 않는다.

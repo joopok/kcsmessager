@@ -5,7 +5,8 @@
 다른 모듈은 sys.platform 을 직접 보지 말고 여기 함수를 쓴다.
 - 어떤 OS 인가: current() / is_mac() / is_windows() / is_linux()
 - 폴더: app_home() (사용자 데이터) · user_dir('downloads'|'documents'|'pictures'|'home') · resource_path() (앱에 든 파일)
-- 열기: open_path() · open_url()
+- 열기: open_path() · open_url() (웹 · 메일 주소만) · reveal_path() (폴더에서 보여 주기)
+- 받은 파일: can_open_directly(name) · save_opened_file(name, data) (본인만 보는 폴더) · mark_from_network(path)
 - 글자: ui_font_families() · emoji_families() - OS 마다 기본 한글 · 이모지 글꼴 순서
 - 단축키 표기: shortcut_text('Ctrl+Shift+Enter') → macOS '⇧⌘Enter' (Apple 순서 ⌃⌥⇧⌘), 그 밖 'Ctrl+Shift+Enter'
   (Qt 는 QKeySequence 의 Ctrl 을 macOS 에서 ⌘ 로 자동으로 바꾸므로 키 연결은 어디서나 'Ctrl+…' 로 쓴다)
@@ -16,9 +17,13 @@
 함수는 부를 때마다 sys.platform 을 읽는다 (테스트에서 OS 를 바꿔 끼울 수 있게).
 """
 
+import atexit
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
 
 APP_NAME = 'KCS Talk'
 APP_ID = 'kr.co.kcs.talk'                 # macOS 번들 ID · Windows AppUserModelID · Linux 데스크톱 파일 이름
@@ -100,6 +105,78 @@ def resource_path(*parts):
     return os.path.join(base, *parts)
 
 
+_EXIT_HANDLERS = []
+
+
+def on_exit(fn, *args):
+    """앱이 끝날 때 할 일을 건다. 보통 종료(atexit)와 app.finish_process 둘 다에서 돈다.
+    finish_process 는 PyQt 가 건 종료 처리기(남은 Qt 객체 정리 - 가끔 Bus error)를 피하려고 atexit 를 돌리지 않으므로,
+    앱의 종료 처리는 atexit.register 대신 여기에 건다"""
+    _EXIT_HANDLERS.append((fn, args))
+    atexit.register(_run_one, fn, args)
+
+
+def _run_one(fn, args):
+    if (fn, args) in _EXIT_HANDLERS:
+        _EXIT_HANDLERS.remove((fn, args))
+        fn(*args)
+
+
+def run_exit_handlers():
+    """on_exit 로 건 일을 지금 (건 순서의 반대로) 한다 - 한 번만"""
+    while _EXIT_HANDLERS:
+        fn, args = _EXIT_HANDLERS.pop()
+        try:
+            fn(*args)
+        except Exception:
+            pass
+
+
+PRIVATE_SUBDIRS = ('logs', 'recordings', 'keys', 'opened', 'macos')   # 데이터 폴더 아래 기록 · 키 · 받은 파일
+
+
+def make_private_dir(path):
+    """본인만 들어갈 수 있는 폴더를 만들고(이미 있으면 권한만 고치고) 경로를 돌려준다.
+    macOS · Linux 0700. Windows 는 사용자 프로필 폴더 권한을 따르므로 만들기만 한다"""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    if not is_windows():
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+    return path
+
+
+def secure_app_home():
+    """앱을 시작할 때 한 번: 데이터 폴더(app_home)와 그 아래 기록 폴더(logs · recordings · keys …)를 본인만 접근하게.
+    예전 버전이 0755 로 만든 폴더도 고친다 - 같은 PC 의 다른 계정이 임시저장 글 · 녹음 · 로그를 읽을 수 있었다.
+    성공하면 True"""
+    home = app_home()
+    try:
+        make_private_dir(home)
+    except OSError:
+        return False
+    if not is_windows():
+        for name in PRIVATE_SUBDIRS:
+            sub = os.path.join(home, name)
+            if os.path.isdir(sub):
+                try:
+                    os.chmod(sub, 0o700)
+                except OSError:
+                    pass
+    return True
+
+
+def notification_text(text):
+    """트레이 알림 본문. Linux 의 알림 서비스(D-Bus)는 본문을 서식(굵게 · 링크)으로 해석한다 - 받은 메시지 · 이름의
+    꺾쇠가 서식이 되거나 file: 링크가 알림에 생기지 않게 escape 한다. Windows · macOS 는 글자 그대로라 바꾸지 않는다"""
+    text = '' if text is None else str(text)
+    if is_linux():
+        import html
+        return html.escape(text, quote=False)
+    return text
+
+
 def secure_file(path):
     """다른 사용자가 못 읽게 (POSIX 600). Windows 는 사용자 프로필 폴더 권한을 따르므로 하지 않는다"""
     if is_windows():
@@ -117,7 +194,8 @@ def safe_filename(name, fallback='file'):
     """어느 OS 에서도 저장되는 파일 이름 - 받은 첨부 이름은 다른 OS 에서 왔을 수 있다.
     Windows 금지 글자(\\ / : * ? " < > |, 제어 문자) → '_', 끝의 점 · 공백 제거, CON · NUL 같은 예약 이름 피하기, 길이 제한"""
     import re
-    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', os.path.basename(str(name or '').replace('\\', '/'))).strip(' .')
+    name = re.sub(r'[\u200e\u200f\u202a-\u202e\u2066-\u2069]', '', str(name or ''))    # 글자 방향을 뒤집어 확장자를 가리는 제어 문자
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', os.path.basename(name.replace('\\', '/'))).strip(' .')
     if not name:
         return fallback
     stem, dot, ext = name.partition('.')
@@ -162,8 +240,19 @@ def open_path(path):
     return _open_fallback(os.path.abspath(path))
 
 
+OPEN_URL_SCHEMES = ('http', 'https', 'mailto')
+
+
+def is_openable_url(url):
+    """기본 프로그램에 넘겨도 되는 주소인가 - 웹 · 메일 주소만 (파일 경로 · 다른 프로그램을 부르는 주소는 넘기지 않는다)"""
+    scheme, sep, rest = str(url or '').strip().partition(':')
+    return bool(sep and rest) and scheme.lower() in OPEN_URL_SCHEMES
+
+
 def open_url(url):
-    """웹 주소를 기본 브라우저로. 열었으면 True"""
+    """웹 주소를 기본 브라우저로 (메일 주소는 메일 프로그램으로). 열었으면 True. 그 밖의 주소는 열지 않고 False"""
+    if not is_openable_url(url):
+        return False
     try:
         from PyQt5.QtCore import QUrl
         from PyQt5.QtGui import QDesktopServices
@@ -172,6 +261,107 @@ def open_url(url):
     except ImportError:
         pass
     return _open_fallback(url)
+
+
+def reveal_command(path, os_name=None):
+    """파일을 폴더에서 골라 보여 주는 명령 (없는 OS 는 None → 폴더만 연다)"""
+    os_name = os_name or current()
+    if os_name == 'mac':
+        return ['open', '-R', path]
+    if os_name == 'windows':
+        return ['explorer', '/select,', path]
+    return None
+
+
+def reveal_path(path):
+    """파일이 든 폴더를 열어 그 파일을 보여 준다 - 파일 자체는 열지 않는다. 열었으면 True"""
+    path = os.path.abspath(path)
+    cmd = reveal_command(path)
+    if cmd:
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except OSError:
+            pass
+    return open_path(os.path.dirname(path))
+
+
+# ---------------------------------------------------------------- 받은 파일
+# [열기]로 바로 여는 형식: 보기만 하는 문서 · 사진 · 소리 · 영상. 그 밖의 형식(프로그램 · 스크립트 · 바로가기 · 압축 ·
+# 매크로 문서 · 웹 문서 · 모르는 형식)은 메신저가 직접 열지 않고, 물어본 뒤 폴더에서 보여 주기만 한다.
+OPEN_DIRECTLY = frozenset(
+    'pdf txt md log csv rtf hwp hwpx doc docx xls xlsx ppt pptx odt ods odp '
+    'png jpg jpeg gif bmp webp tif tiff heic '
+    'mp3 wav m4a aac ogg flac mp4 mov avi mkv webm wmv'.split())
+
+
+def can_open_directly(name):
+    """받은 파일을 기본 프로그램으로 바로 열어도 되는 형식인가 (저장될 이름의 마지막 확장자로 본다)"""
+    ext = os.path.splitext(safe_filename(name, ''))[1][1:].lower()
+    return ext in OPEN_DIRECTLY
+
+
+OPENED_KEEP_SECONDS = 24 * 3600
+_opened_dir = None
+
+
+def forget_opened_files_dir():
+    """다음 opened_files_dir() 가 새 폴더를 만들게 한다 (테스트 · 데이터 폴더가 바뀔 때)"""
+    global _opened_dir
+    _opened_dir = None
+
+
+def opened_files_dir():
+    """[열기]로 받은 파일을 두는 폴더: app_home()/opened/<이번 실행> - 본인만 볼 수 있고 실행마다 새로 만든다.
+    앱이 끝날 때 지우고, 하루가 지난 예전 실행의 폴더(비정상 종료로 남은 것)도 이때 지운다"""
+    global _opened_dir
+    if _opened_dir and os.path.isdir(_opened_dir):
+        return _opened_dir
+    parent = app_path('opened')
+    os.makedirs(parent, exist_ok=True)
+    now = time.time()
+    for entry in os.listdir(parent):
+        old = os.path.join(parent, entry)
+        try:
+            if not os.path.islink(old) and os.path.isdir(old) and now - os.path.getmtime(old) > OPENED_KEEP_SECONDS:
+                shutil.rmtree(old, ignore_errors=True)
+        except OSError:
+            pass
+    _opened_dir = tempfile.mkdtemp(prefix='run_', dir=parent)      # 만든 사람만 읽고 쓴다 (0700)
+    on_exit(shutil.rmtree, _opened_dir, True)
+    return _opened_dir
+
+
+def save_opened_file(name, data, fallback='file'):
+    """받은 파일을 opened_files_dir() 에 저장 → 경로. 이름은 safe_filename 을 거치고, 같은 이름이 있으면 덮어쓰지 않고
+    '이름 (2).확장자' 로 저장한다. 쓰지 못하면 OSError"""
+    folder = opened_files_dir()
+    name = safe_filename(name, fallback)
+    stem, ext = os.path.splitext(name)
+    count = 1
+    while True:
+        path = os.path.join(folder, name if count == 1 else f'{stem} ({count}){ext}')
+        try:
+            with open(path, 'xb') as f:
+                f.write(data)
+            break
+        except FileExistsError:
+            count += 1
+    mark_from_network(path)
+    return path
+
+
+def mark_from_network(path):
+    """Windows: 받은 파일에 '다른 컴퓨터에서 받은 파일' 표시를 붙인다 (탐색기 속성의 차단 해제 항목, Office 제한된 보기 ·
+    SmartScreen 이 이 표시를 본다). 다른 OS 는 하지 않는다. 붙였으면 True"""
+    if not is_windows():
+        return False
+    try:
+        with open(path + ':Zone.Identifier', 'w', encoding='ascii', newline='') as f:
+            f.write('[ZoneTransfer]\r\nZoneId=3\r\n')
+        return True
+    except OSError:
+        return False
 
 
 # ---------------------------------------------------------------- 글자

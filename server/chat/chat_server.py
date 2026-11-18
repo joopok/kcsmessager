@@ -7,7 +7,7 @@ KCS Messenger 서버 진입점.
 (join / message / all_users_list / user_status_changed)와도 호환된다.
 
 사용법:
-    python server/chat/chat_server.py [--host 127.0.0.1] [--port 5555] [--db server_data/kakao.db] [--retention-days 90] [--no-portal] [--proxy-protocol]
+    python server/chat/chat_server.py [--host 127.0.0.1] [--port 5555] [--db server_data/kakao.db] [--retention-days 90] [--no-portal] [--proxy-protocol] [--open-registration]
 """
 
 import argparse
@@ -32,6 +32,8 @@ def parse_args(argv=None):
     parser.add_argument('--no-link-preview', action='store_true', help='URL 미리보기 끄기')
     parser.add_argument('--allow-passwordless', action='store_true',
                         help='비밀번호 없는 구버전 클라이언트 로그인 허용 (기본: 비밀번호 필수)')
+    parser.add_argument('--open-registration', action='store_true',
+                        help='누구나 [처음 사용 등록]으로 계정을 만들 수 있게 한다 (기본: 닫힘 - 조직도 구성원 + 관리자 등록 코드만)')
     parser.add_argument('--no-portal', action='store_true',
                         help='사내 포털(portal.kcins.co.kr) RAG 연동 끄기 - AI 비서가 메신저 자료로만 답함')
     parser.add_argument('--portal-config', default=None,
@@ -56,6 +58,7 @@ def main(argv=None):
                          link_preview=False if args.no_link_preview else None,
                          retention_days=args.retention_days,
                          require_password=not args.allow_passwordless,
+                         open_registration=True if args.open_registration else None,
                          portal=portal, proxy_protocol=args.proxy_protocol)
     try:
         server.start()

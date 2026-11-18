@@ -327,6 +327,7 @@ class SessionReconnectTests(ServerTestBase):
         ok, _ = s.reconnect()
         self.assertTrue(ok)
         self.assertFalse(s._retry_timer.isActive())
+        self.assertEqual(wait_for_login(s.state, 5000)[0], 'ok')              # 재시도 간격은 서버가 welcome 으로 답해야 처음으로
         self.assertEqual(s._retry, 0)
         self.assertIs(s.state.conn, s.conn)
         with mock.patch.object(s, 'reconnect') as again:
@@ -463,6 +464,9 @@ class CrashGuardTests(unittest.TestCase):
             hook(*sys.exc_info())
         self.assertIn("KeyError: 'root'", sys.stderr.getvalue())
 
+    @unittest.skipIf(sys.platform.startswith('win'),
+                     'Windows 는 os.kill(SIGINT) 이 신호를 전달하지 않고 프로세스를 바로 끝낸다 (종료 코드 2) - '
+                     'Ctrl+C 처리 자체는 test_keyboard_interrupt_in_slot_quits 가 본다')
     def test_ctrl_c_quits_instead_of_traceback_loop(self):
         # 터미널 Ctrl+C: 예전에는 eventFilter 안 KeyboardInterrupt 트레이스백만 찍히고 앱이 계속 돌았다
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

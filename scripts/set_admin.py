@@ -8,12 +8,13 @@
     python3 scripts/set_admin.py --list              # 관리자 목록
     python3 scripts/set_admin.py 김명수 --db server_data/kakao.db
 
-아이디는 사번, 사용자 이름, 이메일 또는 사내 계정. 서버가 켜져 있어도 된다(SQLite).
+아이디는 사번, 사용자 이름, 이메일 또는 사내 계정. 서버가 켜져 있어도 된다(SQLite) - 이미 있는 DB 의 구조 · 조직도 시드는 건드리지 않는다.
 접속 중인 사람의 화면(더보기 → 관리자 메뉴)은 다시 로그인하면 바뀐다.
 """
 
 import argparse
 import os
+import sqlite3
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -35,7 +36,7 @@ def main(argv=None):
     if not args.list and not args.login_id:
         parser.error('아이디를 입력하거나 --list 를 쓰세요.')
 
-    store = Store(args.db)
+    store = Store.open_for_tools(args.db)
     try:
         if args.list:
             admins = [u['username'] + (f" ({u['admin_company']})" if u['admin_company'] else ' (그룹)')
@@ -57,6 +58,9 @@ def main(argv=None):
         scope = '' if args.off else f" ({args.company or '그룹 전체'})"
         print(f"{username}: 관리자 {'해제' if args.off else '지정'}했습니다{scope}.")
         return 0
+    except sqlite3.OperationalError as exc:         # 예전 버전 DB - 구조는 서버가 시작할 때 바꾼다
+        print(f'{Store.TOOL_NEEDS_RESTART} ({exc})', file=sys.stderr)
+        return 1
     finally:
         store.close()
 

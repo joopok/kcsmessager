@@ -794,7 +794,7 @@ class TestMessaging(ServerTestBase):
     def test_attachments(self):
         a, b, outsider = self.connect(), self.connect(), self.connect()
         rid = self.group(a, [b])['room_id']
-        raw = bytes(range(256)) * 40
+        raw = PNG_1PX + bytes(range(256)) * 40          # 사진으로 보내는 첨부는 내용이 사진이어야 한다 (§4.5)
         a.send({'type': 'send', 'room_id': rid, 'kind': 'image', 'content': '',
                 'attachment': {'name': 'pic.png', 'mime': 'image/png',
                                'data_b64': base64.b64encode(raw).decode()}, 'client_tmp_id': 'img1'})
@@ -1405,7 +1405,7 @@ class TestLinkPreviewAndBriefing(unittest.TestCase):
         self.assertIsNone(fetch_link_preview(self.url))                       # 기본: 서버 자신은 가져가지 않는다
         for url in ('http://169.254.169.254/latest/meta-data/', 'http://[::1]/', 'http://0.0.0.0/', 'ftp://x/'):
             self.assertFalse(preview_host_allowed(url), url)
-        self.assertTrue(preview_host_allowed('http://10.1.2.3/groupware'))    # 사내망 그룹웨어는 미리보기
+        self.assertFalse(preview_host_allowed('http://10.1.2.3/groupware'))   # 사내망도 가져오지 않는다 (§4.5, 2026-11-17)
 
     def test_link_preview_pushed_as_msg_updated(self):
         self.start(link_preview=True, preview_fetcher=lambda url: fetch_link_preview(url, block_internal=False))
@@ -1526,6 +1526,44 @@ class TestCalls(ServerTestBase):
         sender.send({'type': 'call_media', 'call_id': call_id, 'kind': kind, 'seq': seq,
                      'data_b64': base64.b64encode(b'frame%d' % seq).decode(), **extra})
 
+    def test_call_notices_follow_state_order(self):
+        """상태를 뜬 뒤 알림을 세우기 전에 다른 스레드가 끼어들어도, 한 연결이 받는 순서는 상태 순서와 같다 (명세 §8.2)"""
+        from unittest import mock
+        a, b, c = self.connect(), self.connect(), self.connect()
+        rid = self.group(a, [b, c])['room_id']
+        call = self._start(a, rid, 'voice')
+        for cl in (b, c):
+            cl.request({'type': 'call_join', 'call_id': call['call_id']}, 'call_updated',
+                       lambda m, u=cl.username: u in m['call']['participants'])
+        time.sleep(0.3)
+        with c.cond:
+            c.buffer.clear()
+        original = self.server._push_call
+
+        def slow_push(snapshot, ctx=None):
+            people = snapshot['participants']
+            if a.username in people and people.get(b.username, {}).get('muted'):
+                time.sleep(0.5)                 # b 의 상태 알림(a 가 아직 있음)을 세우기 직전에 a 가 나간다
+            original(snapshot, ctx)
+        with mock.patch.object(self.server, '_push_call', slow_push):
+            b.send({'type': 'call_state', 'call_id': call['call_id'], 'muted': True})
+            time.sleep(0.15)
+            a.send({'type': 'call_leave', 'call_id': call['call_id']})
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with c.cond:
+                    seen = [m['call']['participants'] for m in c.buffer if m.get('type') == 'call_updated']
+                if len(seen) >= 2:
+                    break
+                time.sleep(0.05)
+            time.sleep(0.3)                     # 늦게 오는 것이 더 있는지
+        with c.cond:
+            seen = [m['call']['participants'] for m in c.buffer if m.get('type') == 'call_updated']
+        self.assertEqual(len(seen), 2, seen)
+        self.assertEqual(sorted(seen[0]), sorted([a.username, b.username, c.username]))   # b 음소거 (a 가 나가기 전)
+        self.assertEqual(sorted(seen[1]), sorted([b.username, c.username]))               # a 가 나간 뒤 = 마지막
+        self.assertTrue(seen[0][b.username]['muted'] and seen[1][b.username]['muted'])
+
     def test_video_call_lifecycle_and_relay(self):
         a, b, c, outsider = self.connect(), self.connect(), self.connect(), self.connect()
         rid = self.group(a, [b, c])['room_id']
@@ -1552,11 +1590,14 @@ class TestCalls(ServerTestBase):
         self.assertEqual([x['call_id'] for x in c2.welcome['calls']], [call['call_id']])
 
         # 미디어 중계: 보낸 사람 제외, 참여자에게만
-        self._media(a, call['call_id'], 'audio', 1, codec='zpcm')
+        import zlib
+        packed = zlib.compress(b'frame1')               # zpcm 은 서버가 풀어 크기를 본다 (§4.5)
+        a.send({'type': 'call_media', 'call_id': call['call_id'], 'kind': 'audio', 'seq': 1, 'codec': 'zpcm',
+                'data_b64': base64.b64encode(packed).decode()})
         got = b.wait_for('call_media')
         self.assertEqual((got['from'], got['kind'], got['seq'], got['codec'], got['call_id']),
                          (a.username, 'audio', 1, 'zpcm', call['call_id']))
-        self.assertEqual(base64.b64decode(got['data_b64']), b'frame1')
+        self.assertEqual(base64.b64decode(got['data_b64']), packed)
         c.assert_no('call_media', wait=0.2)
         a.assert_no('call_media', wait=0.0)
         self._media(c, call['call_id'], 'video', 2)   # 비참여자 프레임은 버림

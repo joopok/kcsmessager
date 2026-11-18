@@ -37,7 +37,8 @@ class ProfileEditTests(unittest.TestCase):
         dlg = ProfileEditDialog(self.state)
         self.addCleanup(dlg.close)
         self.assertEqual(dlg.employee_no_label.text(), 'K2019001')
-        self.assertIs(dlg.layout().itemAt(0).widget(), dlg.employee_card)       # 맨 위
+        body = dlg.employee_card.parentWidget()                                 # 본문(스크롤 영역 안)의 맨 위
+        self.assertIs(body.layout().itemAt(0).widget(), dlg.employee_card)
         self.assertNotIn('employee_no', dlg.values())                           # 보기만 (보내지 않음)
 
     def test_employee_no_missing(self):

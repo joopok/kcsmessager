@@ -19,6 +19,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushBut
                              QStackedWidget, QButtonGroup, QSizePolicy, QToolButton, QDialog)
 
 from client.kakao import theme
+from client.kakao.widgets import exec_and_release
 from client.kakao.state import parse_dt
 from client.kakao.widgets import paint_icon, make_icon, IconButton, qss_icon_path
 
@@ -347,9 +348,7 @@ class MonthGrid(QWidget):
 
             # 생일 표시
             if d.strftime('%m-%d') in birthdays:
-                p.setFont(theme.font('micro'))
-                p.setPen(theme.qc('text'))
-                p.drawText(QRectF(rect.left() + 3, rect.top() + 4, 16, 16), Qt.AlignCenter, '🎂')
+                paint_icon(p, 'cake', QRectF(rect.left() + 4, rect.top() + 6, 12, 12), theme.qc('text_sub'), stroke=2.0)
 
         # 일정 막대
         for week in range(self.week_count()):
@@ -457,9 +456,8 @@ class AgendaItem(QWidget):
             p.drawRoundedRect(r.adjusted(6, 1, -6, -1), 8, 8)
         left = 16
         if self.birthday_user:
-            p.setFont(theme.font('title'))
+            paint_icon(p, 'cake', QRectF(left + 2, (r.height() - 18) / 2, 18, 18), theme.qc('text_sub'), stroke=1.6)
             p.setPen(theme.qc('text'))
-            p.drawText(QRectF(left, 0, 22, r.height()), Qt.AlignCenter, '🎂')
             p.setFont(theme.font('body'))
             p.drawText(QRectF(left + 30, 0, r.width() - left - 40, r.height()),
                        Qt.AlignVCenter | Qt.AlignLeft, self.title_text())
@@ -469,10 +467,11 @@ class AgendaItem(QWidget):
         ev = self.event_data
         color = QColor(ev.get('color') or theme.EVENT_COLORS[0])
         has_sub = self._has_sub()
-        bar = QRectF(left, 9, 4, r.height() - 18)
+        # 일정 색: 왼쪽 세로 줄무늬 대신 첫 줄 높이에 맞춘 8px 점 (KCS Ink - 카드에 색 옆줄을 두지 않는다)
+        dot_cy = (8 + 10) if has_sub else r.height() / 2
         p.setPen(Qt.NoPen)
         p.setBrush(color)
-        p.drawRoundedRect(bar, 2, 2)
+        p.drawEllipse(QRectF(left, dot_cy - 4, 8, 8))
 
         # 시간 열
         time_w = theme.px(84)
@@ -675,13 +674,9 @@ class CalendarTab(QWidget):
         top = QWidget()
         top.setObjectName('calTop')
         tl = QHBoxLayout(top)
-        tl.setContentsMargins(20, 16, 14, 4)
-        tl.setSpacing(4)
-        accent = QFrame()
-        accent.setObjectName('calAccent')
-        accent.setFixedSize(4, 18)
-        tl.addWidget(accent, 0, Qt.AlignVCenter)
-        tl.addSpacing(4)
+        # 다른 탭 머리글(TabHeader)과 같은 여백 · 같은 제목 크기. 제목 앞 강조 막대는 두지 않는다 (KCS Ink)
+        tl.setContentsMargins(theme.sp('l') + 4, theme.sp('l'), theme.sp('m'), theme.sp('xs'))
+        tl.setSpacing(theme.sp('xs'))
         self.title_label = QLabel('캘린더')
         self.title_label.setObjectName('calTitle')
         tl.addWidget(self.title_label)
@@ -816,8 +811,7 @@ class CalendarTab(QWidget):
             CalendarTab {{ background: {c('bg')}; }}
             QWidget#calList, QScrollArea, QScrollArea > QWidget > QWidget {{ background: {c('bg')}; }}
             QLabel {{ color: {c('text')}; background: transparent; }}
-            QLabel#calTitle {{ font-size: {theme.fs('headline')}px; font-weight: bold; }}
-            QFrame#calAccent {{ background: {c('yellow')}; border-radius: 2px; }}
+            QLabel#calTitle {{ font-size: {theme.fs('display')}px; font-weight: bold; letter-spacing: -0.4px; }}
             QLabel#calMonth {{ font-size: {theme.fs('lead')}px; font-weight: bold; padding: 0 2px; }}
             QLabel#calDay {{ color: {c('text_sub')}; font-size: {theme.fs('meta')}px; }}
             QLabel#calEmpty {{ color: {c('text_hint')}; font-size: {theme.fs('meta')}px; padding: 18px; }}
@@ -833,8 +827,8 @@ class CalendarTab(QWidget):
                                    border-top-right-radius: 0; border-bottom-right-radius: 0; border-right: none; }}
             QPushButton#segRight {{ border-top-right-radius: 14px; border-bottom-right-radius: 14px;
                                     border-top-left-radius: 0; border-bottom-left-radius: 0; }}
-            QPushButton#segLeft:checked, QPushButton#segRight:checked {{ background: {c('text')}; color: {c('bg')};
-                border-color: {c('text')}; font-weight: bold; }}
+            QPushButton#segLeft:checked, QPushButton#segRight:checked {{ background: {c('yellow')}; color: {c('on_accent')};
+                border-color: {c('yellow')}; font-weight: bold; }}
             QWidget#calSegWrap {{ border-top: 1px solid {c('border')}; }}
             QWidget#todoAddRow {{ border-top: 1px solid {c('border')}; background: {c('bg')}; }}
             QLineEdit, QDateEdit {{ background: {c('input_bg')}; color: {c('text')}; border: 1px solid {c('border')};
@@ -980,7 +974,7 @@ class CalendarTab(QWidget):
         out = []
         for kind, data in self.agenda_entries:
             if kind == 'birthday':
-                out.append(f"🎂 {self.state.display_name(data['username'])}님 생일")
+                out.append(f"{self.state.display_name(data['username'])}님 생일")
             else:
                 out.append(data.get('title', ''))
         return out
@@ -1041,4 +1035,4 @@ class CalendarTab(QWidget):
     def open_event_detail(self, ev):
         from client.kakao.event_dialog import EventDetailDialog
         dlg = EventDetailDialog(self.state, ev, parent=self)
-        dlg.exec_()
+        exec_and_release(dlg)

@@ -26,6 +26,9 @@ BOT_NAME = 'AI 비서'
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 100
 TOP_K = 6
+MAX_PDF_PAGES = 1000   # 학습하는 PDF 에서 읽는 쪽 수
+MAX_DOC_CHARS = 2_000_000   # 학습하는 문서 하나에서 읽는 글자 수 (넘는 부분은 뺀다)
+LLM_TIMEOUT = 60.0     # Claude 호출 한 번의 시간 제한(초) - 답변 작업 스레드가 오래 붙잡히지 않게
 TEXT_EXTS = {'.txt', '.md', '.csv', '.json', '.log', '.py', '.tsv', '.html', '.xml', '.yaml', '.yml'}
 
 # 흔한 조사/어미 (검색어 정규화용, 긴 것부터)
@@ -91,7 +94,13 @@ def decode_document(name, data, mime=''):
             raise ValueError('PDF를 읽으려면 서버에 pypdf 패키지가 필요합니다.')
         try:
             reader = PdfReader(io.BytesIO(data))
-            text = '\n\n'.join((page.extract_text() or '') for page in reader.pages)
+            parts, size = [], 0
+            for number, page in enumerate(reader.pages):
+                if number >= MAX_PDF_PAGES or size >= MAX_DOC_CHARS:    # 끝없이 읽지 않는다
+                    break
+                parts.append(page.extract_text() or '')
+                size += len(parts[-1])
+            text = '\n\n'.join(parts)
         except Exception as e:
             raise ValueError(f'PDF를 읽을 수 없습니다: {e}')
     elif ext in TEXT_EXTS or mime.startswith('text/'):
@@ -169,7 +178,8 @@ class RagService:
 
     def add_document(self, owner, name, data, mime=''):
         text = decode_document(name, data, mime)
-        pieces = chunk_text(text)
+        truncated = len(text) > MAX_DOC_CHARS
+        pieces = chunk_text(text[:MAX_DOC_CHARS])
         now = datetime.now().isoformat(timespec='seconds')
         with self._lock:
             cur = self._db.execute('INSERT INTO docs(name, owner, size, chunks, created_at) VALUES (?,?,?,?,?)',
@@ -179,7 +189,7 @@ class RagService:
                 self._insert_chunk('doc', doc_id, None, owner, name, piece, now)
             self._db.commit()
         return {'doc_id': doc_id, 'name': name, 'owner': owner, 'size': len(data),
-                'chunks': len(pieces), 'created_at': now}
+                'chunks': len(pieces), 'created_at': now, **({'truncated': True} if truncated else {})}
 
     def list_documents(self, owner):
         with self._lock:
@@ -207,12 +217,21 @@ class RagService:
         terms = extract_terms(question)
         if not terms:
             return []
+        # room_ids 가 {방: msg_id} 면 그 방은 그 번호 뒤의 메시지만 근거로 삼는다 (나중에 들어온 방 - 명세 §4.5)
+        since = {r: int(v) for r, v in room_ids.items() if v} if isinstance(room_ids, dict) else {}
         room_ids = list(room_ids)
         scope = '(c.source="doc" AND (c.owner=? OR c.owner="")'
         params = [asker]
         if room_ids:
-            scope += f' OR (c.source="message" AND c.room_id IN ({",".join("?" * len(room_ids))}))'
-            params += room_ids
+            whole = [r for r in room_ids if r not in since]
+            parts = []
+            if whole:
+                parts.append(f'c.room_id IN ({",".join("?" * len(whole))})')
+                params += whole
+            for room, start in since.items():
+                parts.append('(c.room_id=? AND c.source_id>?)')
+                params += [room, start]
+            scope += ' OR (c.source="message" AND (' + ' OR '.join(parts) + '))'
         scope += ')'
         candidates = {}
         with self._lock:
@@ -303,6 +322,7 @@ class RagService:
             betas=['server-side-fallback-2026-07-01'],
             fallbacks='default',
             messages=[{'role': 'user', 'content': user_content}],
+            timeout=LLM_TIMEOUT,
         )
         if response.stop_reason == 'refusal':
             return '죄송해요, 이 질문에는 답변할 수 없어요.'

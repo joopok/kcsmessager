@@ -22,6 +22,7 @@ from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdi
                              QSizePolicy)
 
 from client.kakao import theme, osenv
+from client.kakao.widgets import set_shown
 from client.kakao.state import BOT_NAME
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -309,8 +310,10 @@ class FeatureRow(QFrame):
         top.addWidget(self.since_label, 0, Qt.AlignVCenter)
         self.verdict_label = QLabel({'PASS': '검증 ✓', 'FAIL': '검증 ✗'}.get(verdict, ''))
         self.verdict_label.setObjectName('verdictPass' if verdict == 'PASS' else 'verdictFail')
-        self.verdict_label.setVisible(bool(verdict))
         top.addWidget(self.verdict_label, 0, Qt.AlignVCenter)
+        # 아직 부모가 없는 라벨에 setVisible(True) 를 부르면 Qt 가 최상위 창으로 만든다 (Windows 에서 번쩍임,
+        # macOS 에서는 행마다 창을 만들었다 지워 기능 둘러보기가 0.7초 늦게 떴다) → set_shown
+        set_shown(self.verdict_label, bool(verdict))
         top.addStretch(1)
         self._top = top
         self._title_fits = None
@@ -407,6 +410,9 @@ class FeatureTourDialog(QDialog):
 
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs, 1)
+        # 스타일시트를 행을 만들기 전에 입힌다: 행 600여 개를 만든 뒤 입히면 Qt 가 모든 위젯의 모양을 한 번 더 계산한다
+        self._verify_loaded = False
+        self.apply_theme()
 
         # ---- 기능 목록
         page = QWidget()
@@ -431,28 +437,27 @@ class FeatureTourDialog(QDialog):
         col = QVBoxLayout(inner)
         col.setContentsMargins(0, 0, 6, 0)
         col.setSpacing(6)
-        _md, verdicts = load_verification()
-        self.rows = {}
-        self.headers = {}
-        for group in GROUPS:
-            items = [f for f in FEATURES if f[1] == group]
-            if not items:
-                continue
-            header = GroupHeader(group)
-            self.headers[group] = header
-            col.addWidget(header)
-            for feature in items:
-                row = FeatureRow(feature, feature[0] in self._checked, verdicts.get(feature[2], ''))
-                row.try_clicked.connect(self.try_feature)
-                row.check_changed.connect(self._on_check)
-                self.rows[feature[0]] = row
-                col.addWidget(row)
         self.no_match = QLabel('찾는 기능이 없습니다.')
         self.no_match.setObjectName('emptyLabel')
         self.no_match.setAlignment(Qt.AlignCenter)
         self.no_match.hide()
         col.addWidget(self.no_match)
         col.addStretch(1)
+        # 기능 행(90여 개 · 위젯 600여 개)을 한 번에 만들면 창이 0.5초 넘게 늦게 뜬다 → 첫 화면에 보이는 만큼만 먼저
+        # 만들고 나머지는 이벤트 사이에 나눠 만든다. rows · headers 를 찾으면 남은 행을 바로 다 만든다
+        _md, self._verdicts = load_verification()
+        self._rows, self._headers = {}, {}
+        self._row_col = col
+        self._pending = []
+        for group in GROUPS:
+            items = [f for f in FEATURES if f[1] == group]
+            if items:
+                self._pending.append(('header', group))
+                self._pending += [('row', f) for f in items]
+        self._row_timer = QTimer(self)          # 창의 자식: 창이 사라지면 함께 멈춘다
+        self._row_timer.setSingleShot(True)
+        self._row_timer.timeout.connect(self._build_more)
+        self._build_rows(self.FIRST_ROWS)
         self.scroll.setWidget(inner)
         pcol.addWidget(self.scroll, 1)
         self.tabs.addTab(page, f'기능 목록 {len(FEATURES)}')
@@ -485,21 +490,63 @@ class FeatureTourDialog(QDialog):
         self._sync_bottom()
         self.tabs.tabBar().setFocusPolicy(Qt.TabFocus)
         self._no_focus_halo()
+        if self._pending:
+            self._row_timer.start(0)
 
         self.search_edit.textChanged.connect(self.filter)
         self.reload_button.clicked.connect(self.load_verification)
         self.close_button.clicked.connect(self.reject)
-        self.apply_theme()
         self.load_verification()
         self._update_progress()
 
+    FIRST_ROWS = 12      # 창을 열 때 바로 만드는 기능 행 수 (첫 화면을 채우는 만큼)
+    CHUNK_ROWS = 10      # 그 뒤 이벤트 한 번에 만드는 행 수
+
+    @property
+    def rows(self):
+        """기능 key → 행. 아직 만들지 않은 행이 있으면 지금 다 만든다"""
+        self._build_rows()
+        return self._rows
+
+    @property
+    def headers(self):
+        self._build_rows()
+        return self._headers
+
+    def _build_rows(self, limit=None):
+        built = 0
+        while self._pending and (limit is None or built < limit):
+            kind, value = self._pending.pop(0)
+            at = self._row_col.indexOf(self.no_match)
+            if kind == 'header':
+                widget = GroupHeader(value)
+                self._headers[value] = widget
+            else:
+                widget = FeatureRow(value, value[0] in self._checked, self._verdicts.get(value[2], ''))
+                widget.try_clicked.connect(self.try_feature)
+                widget.check_changed.connect(self._on_check)
+                self._rows[value[0]] = widget
+                built += 1
+            self._row_col.insertWidget(at, widget)
+            self._no_focus_halo(widget)
+        return built
+
+    def _build_more(self):
+        self._build_rows(self.CHUNK_ROWS)
+        text = self.search_edit.text().strip()
+        if text:                          # 검색 중에 만든 행도 검색 결과를 따른다
+            self.filter(text)
+        if self._pending:
+            self._row_timer.start(0)
+
     # ---- 표시
-    def _no_focus_halo(self):
+    def _no_focus_halo(self, root=None):
         """macOS 가 포커스 · 기본 단추 둘레에 그리는 파란 번짐(창 밖으로 번지는 테두리)을 끈다.
         키보드 포커스는 QSS 의 :focus 테두리로 따로 보인다"""
-        for widget in self.findChildren(QWidget):
+        root = self if root is None else root
+        for widget in [root] + root.findChildren(QWidget):
             widget.setAttribute(Qt.WA_MacShowFocusRect, False)
-        for button in self.findChildren(QPushButton):
+        for button in ([root] if isinstance(root, QPushButton) else []) + root.findChildren(QPushButton):
             button.setAutoDefault(False)
             button.setDefault(False)
 
@@ -571,7 +618,8 @@ class FeatureTourDialog(QDialog):
                 '## 아직 검증 결과가 없습니다\n\n터미널에서 다음을 실행하면 기능별 테스트 결과가 여기에 표시됩니다.\n\n'
                 '```\npython3 scripts/verify_features.py\n```\n')
             self.verify_hint.setText('검증 결과 파일이 없습니다.')
-        for key, row in self.rows.items():
+        self._verdicts = verdicts                     # 아직 만들지 않은 행은 만들 때 이 결과로
+        for key, row in self._rows.items():
             verdict = verdicts.get(FEATURE_NAMES[key], '')
             row.verdict_label.setText({'PASS': '검증 ✓', 'FAIL': '검증 ✗'}.get(verdict, ''))
             row.verdict_label.setObjectName('verdictPass' if verdict == 'PASS' else 'verdictFail')

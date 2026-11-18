@@ -237,10 +237,10 @@ class AdminClientTests(unittest.TestCase):
         self.assertEqual(self.conn.last('admin_set_disabled'), {'username': '김철수', 'disabled': True})
         self.assertEqual(self.conn.last('admin_set_admin'), {'username': '김철수', 'is_admin': True})
         self.assertEqual(self.conn.last('admin_clear_password'), {'username': '김철수'})
-        with mock.patch('client.kakao.admin.QInputDialog.getText', side_effect=[('abcd1', True), ('abcd1', True)]):
+        with mock.patch('client.kakao.admin.QInputDialog.getText', side_effect=[('abcd1234', True), ('abcd1234', True)]):
             dlg.reset_password()
-        self.assertEqual(self.conn.last('admin_reset_password'), {'username': '김철수', 'new_password': 'abcd1'})
-        with mock.patch('client.kakao.admin.QInputDialog.getText', side_effect=[('abcd1', True), ('other', True)]):
+        self.assertEqual(self.conn.last('admin_reset_password'), {'username': '김철수', 'new_password': 'abcd1234'})
+        with mock.patch('client.kakao.admin.QInputDialog.getText', side_effect=[('abcd1234', True), ('other', True)]):
             dlg.reset_password()
         self.assertIn('다릅니다', dlg.status.text())
         dlg.select('이영희')

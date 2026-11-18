@@ -39,6 +39,8 @@ DEFAULTS = {
     'bubble_style': 'basic',
     'lock_pin_hash': '',
     'lock_salt': '',
+    'lock_fail_count': 0,         # 잠금 PIN 을 연달아 틀린 횟수
+    'lock_blocked_until': 0,      # 이 시각(epoch 초)까지는 PIN 입력을 받지 않는다
     'lock_minutes': 5,
     'call_auto_record': False,   # 보이스톡 자동 녹음 (카카오톡 2025-11)
     'social_features': False,    # 펑·생일·선물하기 (회사 메신저는 기본 끔 - 업무 우선)
@@ -50,9 +52,19 @@ _UNSAFE_FILE_CHARS = set('\\/:*?"<>|')
 # ---------------------------------------------------------------- 이 PC 의 서버 주소 (그룹 관리자만 더보기 → 정보에서 바꾼다)
 SERVER_FILE = 'server.json'
 DEFAULT_HOST, DEFAULT_PORT = '127.0.0.1', 5555
-# 기본은 평문(개발용 로컬 서버). 운영 서버(talk.kcins.co.kr:9550)는 nginx 가 TLS 를 종단하므로
-# server.json 에 "tls": true 를 넣거나 --tls 로 켠다. 배포용 빌드는 이 값을 True 로 바꿔 만든다.
-DEFAULT_TLS = False
+# TLS 를 따로 정하지 않았을 때 (2026-11-17): 이 PC 의 서버(127.0.0.1 · localhost · ::1, 개발용)는 평문,
+# 다른 컴퓨터의 서버는 TLS 로 접속한다 → default_tls_for(host). 평문으로 다른 컴퓨터에 붙으려면 server.json 에
+# "tls": false 를 적거나 --no-tls · kcs.py build --deploy-plain 으로 명시해야 한다 (그때는 로그인 창에 안내가 뜬다).
+DEFAULT_TLS = False       # 이 PC 의 서버에 붙을 때의 값
+
+
+LOCAL_HOSTS = ('127.0.0.1', 'localhost', '::1')
+
+
+def is_plain_remote(host, tls):
+    """다른 컴퓨터의 서버에 암호화 없이(평문) 붙는가 - 이 PC 안의 개발용 서버는 해당하지 않는다"""
+    host = str(host or '').strip().lower()
+    return bool(host) and not tls and host not in LOCAL_HOSTS
 
 
 def parse_server_address(host, port):
@@ -83,7 +95,7 @@ def load_deploy_defaults():
             data = json.load(f)
         host, port = parse_server_address(data.get('host'), data.get('port'))
         tls = data.get('tls')
-        return {'host': host, 'port': port, 'tls': bool(tls) if isinstance(tls, bool) else DEFAULT_TLS}
+        return {'host': host, 'port': port, 'tls': tls if isinstance(tls, bool) else None}   # tls 가 없으면 None (주소로 정한다)
     except (OSError, ValueError, TypeError, AttributeError):
         return None
 
@@ -111,13 +123,25 @@ def _saved_tls(base_dir):
         return None
 
 
-def load_server_tls(base_dir=None):
-    """TLS 사용 여부: 이 PC 의 server.json → 번들된 deploy.json → DEFAULT_TLS"""
+def default_tls_for(host):
+    """tls 를 따로 정하지 않았을 때의 값: 이 PC 의 서버는 평문, 다른 컴퓨터의 서버는 TLS"""
+    host = str(host or '').strip().lower()
+    return bool(host) and host not in LOCAL_HOSTS
+
+
+def load_server_tls(base_dir=None, host=None):
+    """TLS 사용 여부: 명시한 값(이 PC 의 server.json → 번들된 deploy.json)이 먼저, 없으면 접속할 주소로 정한다
+    (default_tls_for). host: 실제로 접속할 주소 - 주지 않으면 저장된 주소(load_server_address), 그것도 없으면 이 PC"""
     saved = _saved_tls(base_dir or osenv.app_home())
     if saved is not None:
         return saved
     deploy = load_deploy_defaults()
-    return deploy['tls'] if deploy else DEFAULT_TLS
+    if deploy and isinstance(deploy.get('tls'), bool):
+        return deploy['tls']
+    if host is None:
+        address = load_server_address(base_dir)
+        host = address[0] if address else DEFAULT_HOST
+    return default_tls_for(host)
 
 
 def save_server_address(host, port, base_dir=None, tls=None):
@@ -234,7 +258,9 @@ class LocalSettings(QObject):
         tmp = self.path + '.tmp'
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            with open(tmp, 'w', encoding='utf-8') as f:
+            # 본인만 읽게 (0600): 입력 임시저장 · 보내지 못한 글 · 잠금 비밀번호 해시가 들어 있다 (Windows 는 무시)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self.path)
             return True
