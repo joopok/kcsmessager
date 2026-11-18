@@ -49,6 +49,8 @@ BIG_ROOM = '측정 큰 방'
 WAIT_S = 6.0          # 서버 응답을 기다리는 최대 시간
 BUSY_S = 0.4          # 표시 뒤 막힘을 재는 시간
 # 응답 없이 끝나는 요청 (읽음 표시 · 지금 보는 방 알림처럼 결과를 기다리지 않는 것)
+BURST_MESSAGES = 1000  # 큰 방 읽음 몰림: 열어 둔 방에 먼저 들어오는 새 메시지 수
+BURST_LIMIT_MS = 50    # 서버 이벤트 한 번이 화면을 막아도 되는 시간 (입력이 끊겨 보이지 않게)
 NO_REPLY = {'read', 'typing', 'active_room', 'presence', 'pong', 'ping', 'story_view', 'call_media', 'call_state',
             'mark_read', 'leave_call', 'call_leave'}
 
@@ -84,7 +86,7 @@ def seed(db_path, scale):
     st.set_admin(ME, True)
     png = tiny_png()
     crew = names[:30]
-    big = st.create_group(ME, BIG_ROOM, crew)
+    big = st.create_group(ME, BIG_ROOM, names[:299])      # 300명 방 (읽음 몰림 측정)
     root_id = None
     for i in range(scale['messages']):
         sender = ME if i % 3 == 0 else crew[i % len(crew)]
@@ -279,6 +281,61 @@ class Probe:
         self.results.append(entry)
         return obj
 
+    def measure_burst(self, key, label, setup, events, limit):
+        """서버 이벤트가 몰릴 때: setup() 뒤 events() 의 함수를 하나씩 부르며 한 번마다 걸린 시간(= 그동안 입력이 막힌 시간)을 잰다.
+        show_ms · block_ms = 이벤트 한 번 최대, total_ms = 전부 합친 화면 스레드 시간"""
+        entry = {'key': key, 'label': label, 'show_ms': None, 'block_ms': None, 'server': {}, 'error': '',
+                 'limit_ms': limit}
+        self.pump(0.05)
+        import cProfile
+        import io
+        import pstats
+
+        def stats(prof):
+            out = io.StringIO()
+            pstats.Stats(prof, stream=out).sort_stats('cumulative').print_stats(30)
+            return out.getvalue()
+        try:
+            t = time.perf_counter()
+            prof = cProfile.Profile() if self.profile == key + '_setup' else None
+            if prof:
+                prof.enable()
+            fns = events(setup())
+            if prof:
+                prof.disable()
+                self.profile_text = stats(prof)
+            self.pump(0.3)
+            entry['setup_ms'] = round((time.perf_counter() - t) * 1000)
+            worst, total = 0.0, 0.0
+            prof = cProfile.Profile() if self.profile == key else None
+            if prof:
+                prof.enable()
+            for fn in fns:
+                t = time.perf_counter()
+                fn()
+                self.app.processEvents()
+                dt = time.perf_counter() - t
+                worst, total = max(worst, dt), total + dt
+            if prof:
+                prof.disable()
+                self.profile_text = stats(prof)
+            busy, end = 0.0, time.perf_counter() + BUSY_S
+            while time.perf_counter() < end:
+                t = time.perf_counter()
+                self.app.processEvents()
+                busy = max(busy, time.perf_counter() - t)
+                time.sleep(0.002)
+            entry['show_ms'] = round(worst * 1000)
+            entry['block_ms'] = round(max(worst, busy) * 1000)
+            entry['total_ms'] = round(total * 1000)
+            entry['events'] = len(fns)
+        except Exception as e:
+            import traceback
+            entry['error'] = f'{type(e).__name__}: {e}'
+            entry['trace'] = traceback.format_exc()[-600:]
+        entry['ok'] = not entry['error'] and entry['block_ms'] is not None and entry['block_ms'] <= limit
+        self.results.append(entry)
+
 
 def _stray_window_filter_class():
     from PyQt5.QtCore import QObject, QEvent, Qt
@@ -373,6 +430,44 @@ def screens(p):
     add('room_reopen', '채팅방 다시 열기 (받아 둔 대화)', [], reopen, ready=lambda win: bool(win.rows),
         close=lambda _w: None)
     add('room_other', '다른 채팅방 열기', [], lambda: p.w.open_room(other_room), ready=lambda win: bool(win.rows))
+
+    # 큰 방 읽음 몰림: 300명 방을 열어 둔 채 새 메시지 1,000개를 받은 뒤, 공지를 300명이 차례로 읽는다
+    burst = {}
+
+    def new_message_events():
+        """열어 둔 300명 방에 새 메시지 BURST_MESSAGES 개가 연달아 온다 (서버가 보내는 것과 같은 msg_new)"""
+        win = p.w.open_room(big)
+        p.pump(0.2)
+        win.scroll_to_bottom()
+        conn = p.s.conn
+        last = max((m['msg_id'] for m in st.room_messages(big) if isinstance(m.get('msg_id'), int)), default=0)
+        stamp = datetime.now().replace(microsecond=0).isoformat(timespec='seconds')
+        burst['last'] = last + BURST_MESSAGES
+
+        def one(i):
+            conn.event_received.emit('msg_new', {'type': 'msg_new', 'message': {
+                'msg_id': last + i, 'room_id': big, 'sender': p.info['names'][i % 30], 'kind': 'text',
+                'content': f'공지 뒤 대화 {i} 확인했습니다', 'timestamp': stamp,
+                'deleted': False, 'reactions': {}, 'mentions': [], 'reply_to': None, 'attachment': None,
+                'edited': False, 'edited_at': None, 'silent': False, 'link_preview': None}})
+        return [lambda i=i: one(i) for i in range(1, BURST_MESSAGES + 1)]
+    out.append(('burst_messages', f'큰 방 새 메시지 {BURST_MESSAGES:,}개 연달아 (300명 방, 메시지 한 건)', (), None, None, None,
+                {'setup': lambda: None, 'events': lambda _x: new_message_events(), 'limit': BURST_LIMIT_MS}))
+
+    def burst_setup():
+        if 'last' not in burst:                   # 새 메시지 항목을 건너뛰었으면 여기서 받는다
+            for fn in new_message_events():
+                fn()
+            p.app.processEvents()
+        return burst['last']
+
+    def burst_events(last):
+        members = [n for n in (st.room(big) or {}).get('members', []) if n != ME]
+        conn = p.s.conn
+        return [lambda n=n: conn.event_received.emit('read_update', {
+            'type': 'read_update', 'room_id': big, 'username': n, 'last_read_msg_id': last}) for n in members]
+    out.append(('burst_read', f'큰 방 읽음 {300}건 몰림 (300명 방 · 새 메시지 {BURST_MESSAGES:,}개 뒤, 이벤트 한 번)',
+                (), None, None, None, {'setup': burst_setup, 'events': burst_events, 'limit': BURST_LIMIT_MS}))
 
     def call():
         room().start_call('voice')
@@ -525,11 +620,20 @@ def run(native=False, small=False, profile=None, only=None, log=print):
         apply_app_theme(s.settings)
         p = Probe(app, s, info, profile=profile)
         p.pump(0.3)
-        for key, label, _classes, open_fn, ready, close in screens(p):
+        for entry in screens(p):
+            key, label, _classes, open_fn, ready, close = entry[:6]
             if only and key not in only and key != 'main' and not key.startswith('room_open'):
                 continue
-            p.measure(key, label, open_fn, ready, close)
+            if len(entry) > 6:
+                spec = entry[6]
+                p.measure_burst(key, label, spec['setup'], spec['events'], spec['limit'])
+            else:
+                p.measure(key, label, open_fn, ready, close)
             e = p.results[-1]
+            if 'total_ms' in e:
+                log(f"   {'✓' if e['ok'] else '✗'} {label} — 최대 {e['show_ms']}ms (기준 {e['limit_ms']}ms) · "
+                    f"{e['events']}건 합계 {e['total_ms']}ms · 준비 {e.get('setup_ms')}ms" + (f" · {e['error']}" if e['error'] else ''))
+                continue
             mark = '✓' if e['ok'] else '✗'
             log(f"   {mark} {label} — 표시 {e['show_ms']}ms · 막힘 {e['block_ms']}ms"
                 + (f" · 서버 {e['server']}" if e['server'] else '') + (f" · {e['error']}" if e['error'] else ''))
@@ -551,6 +655,10 @@ def run(native=False, small=False, profile=None, only=None, log=print):
 def summary_lines(data, top=12):
     res = data['results']
     lines = [f"화면 {len(res)}개 · 플랫폼 {data['platform']} · 기준 {LIMIT_MS}ms (목표 {TARGET_MS}ms)"]
+    for e in res:
+        if 'total_ms' in e:
+            lines.append(f"{e['label']}: 최대 {e['show_ms']}ms (기준 {e['limit_ms']}ms) · {e['events']}건 합계 {e['total_ms']}ms"
+                         + ('' if e['ok'] else '  ✗'))
     slow = sorted(res, key=lambda e: -max(e['show_ms'] or 0, e['block_ms'] or 0))[:top]
     lines.append('느린 화면 상위:')
     for e in slow:

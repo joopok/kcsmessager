@@ -1055,7 +1055,7 @@ def area_screens(sc):
             detail += f' (목표 {TARGET_MS}ms 넘음)'
         if e['error']:
             detail += f" · {e['error']}"
-        sc.check(ar, f"{e['label']} < {LIMIT_MS}ms", lambda ok=e['ok'], d=detail: (ok, d))
+        sc.check(ar, f"{e['label']} < {e.get('limit_ms', LIMIT_MS)}ms", lambda ok=e['ok'], d=detail: (ok, d))
     for line in summary_lines(data):
         print('   ' + line)
 

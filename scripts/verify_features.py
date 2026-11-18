@@ -86,6 +86,8 @@ MAPPING = [
     (r'test_kakao_review_1118\.PresenceOnlyUpdate', 'org_chart'),
     (r'test_kakao_review_1118\.HiddenWindowRefresh', 'friends'),
     (r'test_kakao_review_1118\.SplitRooms', 'room_list'),
+    (r'test_kakao_review_1118\.ProgressiveRender', 'room_list'),
+    (r'test_kakao_review_1118\.BigRoomRead', 'read_count'),
     (r'test_kakao_review_1118\.', 'platforms'),
     # 전체 점검(2026-11-17) 뒤 강화한 클라이언트 규칙 (test_kakao_hardening)
     (r'test_kakao_hardening\.ImageDecode', 'attach'),
@@ -210,6 +212,11 @@ MAPPING = [
     (r'event', 'event_crud'),
     (r'todo', 'todo'),
     (r'poll', 'poll'),
+    # 접근성: 목록 행 이름 · 사이드바 탭 (화면낭독기 · 접근성 자동화)
+    (r'RowAccessibilityTests\.test_friend', 'friends'),
+    (r'RowAccessibilityTests\.test_room', 'room_list'),
+    (r'RowAccessibilityTests\.test_org', 'org_chart'),
+    (r'RowAccessibilityTests|SidebarAccessibilityTests', 'friends'),
     # 조직도 · 프로필 · 상태
     (r'wide_window_docks', 'org_dock'),
     (r'org|holding|affiliate|multilevel|search_by_org_path|cross_company', 'org_chart'),

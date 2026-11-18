@@ -30,7 +30,8 @@ def _attach_log_when_no_console():
         return None
     from client.kakao import osenv as _osenv           # (PyQt 를 부르지 않는 가벼운 모듈)
     try:
-        os.makedirs(_osenv.app_path('logs'), exist_ok=True)
+        _osenv.make_private_dir(_osenv.app_home())
+        _osenv.make_private_dir(_osenv.app_path('logs'))
         log = open(_osenv.app_path('logs', 'kcs_talk.log'), 'a', encoding='utf-8', buffering=1)
     except OSError:
         return None
@@ -437,6 +438,7 @@ def install_interrupt_quit(app):
 
 def main(argv=None):
     args = parse_args(argv)
+    osenv.secure_app_home()           # 데이터 폴더 · 기록 폴더는 본인만 (macOS · Linux 0700, 예전 폴더도 고친다)
     setup_high_dpi()                  # macOS 메뉴 막대 이름 · Windows 작업 표시줄 묶음 (QApplication 보다 먼저)
     app = QApplication.instance() or QApplication(sys.argv[:1])
     osenv.configure_app(app)          # 이름 · Fusion 스타일 · macOS Dock 이름 · Linux .desktop 연결

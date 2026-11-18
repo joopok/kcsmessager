@@ -546,7 +546,7 @@ class CiSmokeNativeTests(unittest.TestCase):
 
     def test_parts_cover_the_six_areas_and_unknown_part_is_refused(self):
         self.assertEqual([name for name, _title, _fn in self.smoke.NATIVE_PARTS],
-                         ['windows', 'files', 'single', 'paths', 'tls', 'screens'])
+                         ['windows', 'files', 'single', 'paths', 'tls', 'screens', 'rtt'])
         self.assertEqual(self.smoke.native_part(['없는묶음']), 2)
         self.assertEqual(self.smoke.main(['모르는모드']), 2)
 
@@ -558,10 +558,10 @@ class CiSmokeNativeTests(unittest.TestCase):
     def test_one_failing_part_fails_the_whole_run(self):
         done = mock.Mock(returncode=0, stdout='✓ 항목\n', stderr='')
         failed = mock.Mock(returncode=1, stdout='✗ 항목\n', stderr='Traceback …')
-        with mock.patch.object(self.smoke.subprocess, 'run', side_effect=[done, failed, done, done, done, done]) as run, \
+        with mock.patch.object(self.smoke.subprocess, 'run', side_effect=[done, failed, done, done, done, done, done]) as run, \
                 mock.patch('sys.stdout', io.StringIO()) as out:
             self.assertFalse(self.smoke.native())
-        self.assertEqual(run.call_count, 6)                                   # 하나가 실패해도 나머지 묶음은 돈다
+        self.assertEqual(run.call_count, 7)                                   # 하나가 실패해도 나머지 묶음은 돈다
         self.assertIn('Traceback', out.getvalue())                            # 실패한 묶음의 오류 출력을 보여 준다
         env = run.call_args.kwargs['env']
         self.assertEqual(env['QT_QPA_PLATFORM'], self.smoke.native_platform())  # 화면 없는 플랫폼으로 돌지 않는다

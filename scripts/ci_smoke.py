@@ -228,6 +228,25 @@ def part_windows():
             win.set_tab(key)
             _wait(150)
     results.append(check('메인 창 표시 · 탭 전환', shown, f'{win.width()}x{win.height()}'))
+
+    # 트레이 알림 본문: Linux 알림 서비스는 본문을 서식으로 해석한다 → 받은 글자가 그대로 보이게 escape 해서 넘기는지
+    sent = []
+
+    class _Tray:
+        def supportsMessages(self):
+            return True
+
+        def showMessage(self, title, body, *_args):
+            sent.append((title, body))
+    old_tray, win.tray = win.tray, _Tray()
+    win.should_notify = lambda _rid: True
+    body = '<a href="file:///etc">회사 공지</a> & 5 < 6'
+    win.show_notification('김철수', body, '')
+    win.tray = old_tray
+    got = sent[-1][1] if sent else None
+    escaped = got == osenv.notification_text(body) and (got != body) == osenv.is_linux()
+    results.append(check('트레이 알림 본문 ' + ('escape (Linux 알림 서비스는 서식으로 읽는다)' if osenv.is_linux()
+                                                else '글자 그대로 (이 OS 는 서식으로 읽지 않는다)'), escaped, repr(got)[:90]))
     win._quitting = True        # 창 닫기(X)가 트레이로 숨기는 대신 실제로 닫히게
     win.close()
     _wait(200)
@@ -364,6 +383,28 @@ def part_paths():
         if saved_home is not None:
             os.environ['KCS_MESSENGER_HOME'] = saved_home
 
+    # 데이터 폴더 · 기록 폴더는 본인만 (macOS · Linux 0700, 예전 버전이 0755 로 만든 폴더도 시작할 때 고친다)
+    private = os.path.join(tempfile.mkdtemp(prefix='kcs_ci_private_'), '.kcs_messenger')
+    for sub in ('', 'logs', 'recordings'):
+        os.makedirs(os.path.join(private, sub), exist_ok=True)
+        if not osenv.is_windows():
+            os.chmod(os.path.join(private, sub), 0o755)
+    saved_home = os.environ.get('KCS_MESSENGER_HOME')
+    os.environ['KCS_MESSENGER_HOME'] = private
+    try:
+        secured = osenv.secure_app_home()
+    finally:
+        if saved_home is None:
+            os.environ.pop('KCS_MESSENGER_HOME', None)
+        else:
+            os.environ['KCS_MESSENGER_HOME'] = saved_home
+    if osenv.is_windows():
+        results.append(check('데이터 폴더 준비 (Windows: 사용자 프로필 권한을 따른다)', secured))
+    else:
+        modes = {sub or '.': oct(os.stat(os.path.join(private, sub)).st_mode & 0o777) for sub in ('', 'logs', 'recordings')}
+        results.append(check('데이터 · 로그 · 녹음 폴더는 본인만 (0700)', secured and set(modes.values()) == {'0o700'},
+                             str(modes)))
+
     work = tempfile.mkdtemp(prefix='kcs_ci_paths_')
     path = os.path.join(work, 'saved_login.json')
     login.save_saved_login('hong@kcs.test', 'token-1', True, '127.0.0.1', 5555, path=path)
@@ -430,19 +471,48 @@ def part_screens():
         print(line, flush=True)
     broken = [e for e in data['results'] if e['error']]
     slow = [e for e in data['results'] if not e['ok'] and not e['error']]
+    worst = lambda e: max(e['show_ms'] or 0, e['block_ms'] or 0)       # noqa: E731
+    failing = [e for e in slow if worst(e) > SCREEN_FAIL_MS]
     for e in slow:
-        print(f"::warning::[{osenv.os_label()} · {data['platform']}] {e['label']} 표시 {e['show_ms']}ms · "
-              f"막힘 {e['block_ms']}ms (기준 {screen_probe.LIMIT_MS}ms)", flush=True)
+        level = 'error' if e in failing else 'warning'
+        print(f"::{level}::[{osenv.os_label()} · {data['platform']}] {e['label']} 표시 {e['show_ms']}ms · "
+              f"막힘 {e['block_ms']}ms (기준 {e.get('limit_ms', screen_probe.LIMIT_MS)}ms)", flush=True)
     results.append(check(f"화면 {len(data['results'])}개 모두 열림", not broken,
                          '; '.join(f"{e['label']}: {e['error']}" for e in broken[:3])))
-    results.append(check(f'0.5초 안에 뜬 화면 (넘으면 경고만)', True,
-                         f"{len(data['results']) - len(slow)}/{len(data['results'])}"))
+    results.append(check(f'기준 안에 뜬 화면 (넘으면 경고, {SCREEN_FAIL_MS / 1000:g}초 넘으면 실패)', not failing,
+                         f"{len(data['results']) - len(slow)}/{len(data['results'])}"
+                         + (' · 실패: ' + ', '.join(f"{e['label']} {worst(e)}ms" for e in failing[:3]) if failing else '')))
     return all(results)
+
+
+# CI 러너(2코어 VM, GPU 없음)는 회사 PC 보다 몇 배 느리고 실행마다 들쭉날쭉하다 (같은 화면이 0.3~0.9초).
+# 그래서 0.5초는 경고로 알리고, 러너에서도 1초를 넘으면 회사 PC 에서 0.5초를 지키기 어렵다고 보고 실패로 한다.
+# 기준(0.5초)의 판정은 개발 PC 의 품질 하네스(13 화면 반응)가 한다
+SCREEN_FAIL_MS = 1000
+
+
+def part_rtt():
+    """요청 왕복: 작은 요청이 이어질 때(채팅방 열기 = history → read → attachment_get) Nagle + 지연 ACK 로
+    왕복마다 약 200ms 가 붙는지 본다. 서버 · 클라이언트 TCP_NODELAY 켬/끔 네 가지를 표로 남긴다 (scripts/bench_server_requests.py).
+    둘 다 켠 경우 묶음 p95 가 RTT_WARN_MS 를 넘으면 경고"""
+    sys.path.insert(0, os.path.join(ROOT, 'scripts'))
+    import bench_server_requests as bench
+    rows = bench.measure_rtt('small')
+    print(bench.render_rtt(rows), flush=True)
+    both = next((r for r in rows if r['server'] == '켬' and r['client'] == '켬'), None)
+    if both is not None and both['bundle_p95'] > RTT_WARN_MS:
+        print(f"::warning::[{osenv.os_label()}] TCP_NODELAY 켬/켬에서 채팅방 열기 요청 묶음 p95 {both['bundle_p95']:.0f}ms "
+              f"(기준 {RTT_WARN_MS}ms)", flush=True)
+    return check('요청 왕복 표 (서버 · 클라이언트 TCP_NODELAY 켬/끔)', both is not None,
+                 f"켬/켬 묶음 p95 {both['bundle_p95']:.0f}ms · ping p95 {both['ping_p95']:.0f}ms" if both else '측정 안 됨')
+
+
+RTT_WARN_MS = 100
 
 
 NATIVE_PARTS = [('windows', '창 · 알림 상자', part_windows), ('files', '받은 파일', part_files),
                 ('single', '중복 실행 방지', part_single), ('paths', '데이터 폴더 · 파일 권한', part_paths),
-                ('tls', 'TLS', part_tls), ('screens', '화면 반응', part_screens)]
+                ('tls', 'TLS', part_tls), ('screens', '화면 반응', part_screens), ('rtt', '요청 왕복', part_rtt)]
 
 
 def native_part(argv):

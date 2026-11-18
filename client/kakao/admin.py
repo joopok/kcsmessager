@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdi
                              QInputDialog, QCheckBox, QComboBox, QFormLayout)
 
 from client.kakao import theme
+from client.kakao.widgets import exec_and_release
 from client.kakao.widgets import disconnect_signals
 
 NOTICE_MAX = 1000
@@ -359,7 +360,7 @@ class AdminDialog(QDialog):
         dlg = FileSecurityDialog(self.state, self)
         self.file_security_dialog = dlg
         if exec_:
-            dlg.exec_()
+            exec_and_release(dlg)
         return dlg
 
     def send_notice(self, exec_=True):

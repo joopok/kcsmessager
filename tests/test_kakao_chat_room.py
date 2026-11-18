@@ -266,6 +266,7 @@ class LiveUpdateTests(ChatRoomTestBase):
         self.conn.push('read_update', room_id='r1', username='홍길동', last_read_msg_id=11)
         self.assertEqual(row11.unread_label.text(), '1')
         self.conn.push('read_update', room_id='r1', username='이영희', last_read_msg_id=30)
+        self.win.flush_read_refresh()          # 몰려오는 읽음은 50ms 안에 묶어 한 번에 그린다
         self.assertTrue(row11.unread_label.isHidden())
 
     def test_new_message_marks_read_when_active(self):

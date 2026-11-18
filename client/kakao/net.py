@@ -38,6 +38,12 @@ def open_socket(host, port, timeout=5.0, tls=False):
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)    # 죽은 연결을 OS 도 알아채게
     except OSError:
         pass
+    try:
+        # 요청은 한 줄씩 작게 오간다: Nagle 이 다음 줄을 모으려고 기다리면(Windows 는 지연 ACK 와 겹쳐 약 200ms)
+        # 채팅방 열기처럼 요청이 이어지는 화면이 그만큼 늦어진다 → 바로 보낸다
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
     if not tls:
         return sock
     try:

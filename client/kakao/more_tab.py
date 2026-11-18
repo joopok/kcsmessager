@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushBut
                              QListWidgetItem, QFileDialog, QSizePolicy, QMessageBox, QLineEdit)
 
 from client.kakao import theme
+from client.kakao.widgets import exec_and_release
 from client.kakao.widgets import Avatar, make_icon, FlowWidget, disconnect_signals
 from client.kakao.chats_tab import ElidedLabel, TabHeader, user_pixmap, connect_avatar_changed
 from client.kakao.friends_tab import ProfileEditDialog, PresenceButton
@@ -533,14 +534,14 @@ class MoreTab(QWidget):
         dlg = AdminDialog(self.state, self.window())
         self.admin_dialog = dlg
         if exec_:
-            dlg.exec_()
+            exec_and_release(dlg)
         return dlg
 
     def open_password_change(self, exec_=True):
         dlg = PasswordChangeDialog(self.state, self.window())
         self.password_dialog = dlg
         if exec_:
-            dlg.exec_()
+            exec_and_release(dlg)
         return dlg
 
     def _section(self, title):
@@ -612,38 +613,29 @@ class MoreTab(QWidget):
         self.presence_button.refresh()
 
     def edit_profile(self):
-        ProfileEditDialog(self.state, self.window()).exec_()
-
+        exec_and_release(ProfileEditDialog(self.state, self.window()))
     def open_wallpaper(self):
         try:
             from client.kakao.wallpaper import WallpaperDialog
         except ImportError:
             QMessageBox.information(self, '배경화면', '배경화면 모듈을 불러올 수 없습니다.')
             return
-        WallpaperDialog(self.settings, parent=self.window()).exec_()
-
+        exec_and_release(WallpaperDialog(self.settings, parent=self.window()))
     def open_rag_docs(self):
-        RagDocsDialog(self.state, self.window()).exec_()
-
+        exec_and_release(RagDocsDialog(self.state, self.window()))
     def open_multi_profile(self):
-        MultiProfileDialog(self.state, self.window()).exec_()
-
+        exec_and_release(MultiProfileDialog(self.state, self.window()))
     def open_friend_manage(self):
-        FriendManageDialog(self.state, self.window()).exec_()
-
+        exec_and_release(FriendManageDialog(self.state, self.window()))
     def open_keywords(self):
-        KeywordAlertDialog(self.settings, self.window()).exec_()
-
+        exec_and_release(KeywordAlertDialog(self.settings, self.window()))
     def open_dnd(self):
         from client.kakao.dnd import DndDialog
-        DndDialog(self.state, self.settings, self.window()).exec_()
-
+        exec_and_release(DndDialog(self.state, self.settings, self.window()))
     def open_bubble_style(self):
-        BubbleStyleDialog(self.settings, self.window()).exec_()
-
+        exec_and_release(BubbleStyleDialog(self.settings, self.window()))
     def open_lock_settings(self):
-        LockSettingsDialog(self.state, self.settings, self.window()).exec_()
-
+        exec_and_release(LockSettingsDialog(self.state, self.settings, self.window()))
     def open_feature_tour(self):
         win = self.window()
         if win is not self and hasattr(win, 'open_feature_tour'):

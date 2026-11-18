@@ -12,9 +12,10 @@ from PyQt5.QtGui import QPainter, QColor, QPalette, QKeySequence, QIcon, QPixmap
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
                              QPushButton, QStackedWidget, QAbstractButton, QSystemTrayIcon, QMenu,
                              QSizePolicy, QFrame, QShortcut, QDialog, QLineEdit, QListWidget,
-                             QListWidgetItem)
+                             QListWidgetItem, QButtonGroup)
 
 from client.kakao import theme
+from client.kakao.widgets import exec_and_release
 from client.kakao import osenv
 from client.kakao.widgets import (paint_icon, Badge, install_focus_visible, input_controls_qss, install_input_controls,
                                   install_dialog_title_bars, install_text_guard, pump_events)
@@ -136,9 +137,16 @@ class Sidebar(QWidget):
         col.addSpacing(10)
         self._refresh_logo()
         self.buttons = {}
+        # 탭 버튼은 늘 하나만 눌린 상태다 (선택된 탭을 다시 눌러도 풀리지 않는다).
+        # 탭 전환은 clicked 가 아니라 toggled(True) 로 받는다: 화면낭독기 · 접근성 자동화의 '누르기'는
+        # 체크 버튼에서 click() 이 아니라 toggle() 로 들어와 clicked 가 오지 않는다 - 체크 표시만 바뀌고 탭은 그대로였다
+        self.group = QButtonGroup(self)
+        self.group.setExclusive(True)
+        self._syncing = False
         for key in TAB_KEYS:
             btn = SidebarButton(key)
-            btn.clicked.connect(lambda _c=False, k=key: self.tab_selected.emit(k))
+            self.group.addButton(btn)
+            btn.toggled.connect(lambda on, k=key: self._on_toggled(k, on))
             col.addWidget(btn)
             self.buttons[key] = btn
         col.addStretch(1)
@@ -187,9 +195,20 @@ class Sidebar(QWidget):
         # 스크린리더: 숫자만이 아니라 맥락 있는 문장으로 (ui-ux-pro-max: Contextual Live Badge Updates)
         self.buttons['chats'].setAccessibleName(f'채팅, 안 읽은 메시지 {count}개' if count else '채팅')
 
+    def _on_toggled(self, key, on):
+        if on and not self._syncing:
+            self.tab_selected.emit(key)
+
     def set_current(self, key):
-        for k, btn in self.buttons.items():
-            btn.setChecked(k == key)
+        """프로그램이 탭을 바꿀 때 버튼 표시만 맞춘다 (tab_selected 는 다시 보내지 않는다)"""
+        btn = self.buttons.get(key)
+        if btn is None or btn.isChecked():
+            return
+        self._syncing = True
+        try:
+            btn.setChecked(True)          # 배타 그룹이라 이전 탭 버튼은 저절로 풀린다
+        finally:
+            self._syncing = False
 
     def _refresh_logo(self):
         # 브랜드(네이비) 사이드바: 흰 타일 + 네이비 마크 / 밝은 사이드바: 네이비 타일 + 흰 마크
@@ -964,7 +983,7 @@ class MainWindow(QMainWindow):
         dlg = QuickSwitcher(self.state, self)
         dlg.chosen.connect(self._quick_open)
         if exec_:
-            dlg.exec_()
+            exec_and_release(dlg)
         return dlg
 
     def _quick_open(self, kind, value):
@@ -1214,7 +1233,7 @@ class MainWindow(QMainWindow):
         if self.is_locked():           # 잠금 중: 일정 · 예약 메시지 · 파일 요청 알림도 내용을 숨긴다 (새 메시지와 같게)
             title, body = APP_TITLE, '새 알림이 있습니다'
         if self.tray is not None and self.tray.supportsMessages():
-            self.tray.showMessage(title, body, talk_icon(), 4000)
+            self.tray.showMessage(title, osenv.notification_text(body), talk_icon(), 4000)
         else:
             self.show_toast(f"{title}: {body}")
         return True
@@ -1232,7 +1251,7 @@ class MainWindow(QMainWindow):
         """관리자 전체 공지 (명세 §4.2): 비모달 '관리자 공지' 창 + 트레이 알림"""
         from client.kakao.admin import show_admin_notice
         if self.tray is not None and self.tray.supportsMessages():
-            self.tray.showMessage('관리자 공지', notice.get('content', ''), talk_icon(), 6000)
+            self.tray.showMessage('관리자 공지', osenv.notification_text(notice.get('content', '')), talk_icon(), 6000)
         self.admin_notice_box = show_admin_notice(self, notice)
         return self.admin_notice_box
 

@@ -298,13 +298,13 @@ class StoryBar(QWidget):
     def open_story(self, username):
         from client.kakao.story import StoryViewer
         viewer = StoryViewer(self.state, username, self.window())
-        viewer.exec_()
+        exec_and_release(viewer)
         return viewer
 
     def compose(self):
         from client.kakao.story import StoryComposeDialog
         dlg = StoryComposeDialog(self.state, self.window())
-        dlg.exec_()
+        exec_and_release(dlg)
         return dlg
 
     def apply_theme(self):
@@ -1036,6 +1036,8 @@ class SectionHeader(QWidget):
         self.chevron = QLabel()
         self.chevron.setPixmap(self._chevron_pixmap())
         row.addWidget(self.chevron)
+        # 화면낭독기: 목록 행 이름 (RowList 가 읽는다) - 접힘 · 펼침 상태까지
+        self.setAccessibleName(f"{title} {count}명, {'접힘' if collapsed else '펼침'}")
 
     def _chevron_pixmap(self):
         from PyQt5.QtGui import QPixmap, QPen
@@ -1443,7 +1445,7 @@ class FriendsTab(RefreshWhenVisible, QWidget):
     def show_add_friend(self, exec_=True):
         dlg = AddFriendDialog(self.state, self.window())
         if exec_:
-            dlg.exec_()
+            exec_and_release(dlg)
         return dlg
 
     def _add_pick_actions(self, menu, name=None):

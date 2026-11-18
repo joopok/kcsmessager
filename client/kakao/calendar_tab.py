@@ -19,6 +19,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushBut
                              QStackedWidget, QButtonGroup, QSizePolicy, QToolButton, QDialog)
 
 from client.kakao import theme
+from client.kakao.widgets import exec_and_release
 from client.kakao.state import parse_dt
 from client.kakao.widgets import paint_icon, make_icon, IconButton, qss_icon_path
 
@@ -1034,4 +1035,4 @@ class CalendarTab(QWidget):
     def open_event_detail(self, ev):
         from client.kakao.event_dialog import EventDetailDialog
         dlg = EventDetailDialog(self.state, ev, parent=self)
-        dlg.exec_()
+        exec_and_release(dlg)

@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel, QMenu, Q
                              QPushButton)
 
 from client.kakao import theme
+from client.kakao.widgets import exec_and_release
 from client.kakao.widgets import Avatar, set_shown
 from client.kakao.chats_tab import (ElidedLabel, RowList, TabHeader, make_search_edit, search_box_qss, InviteToRoomDialog,
                                     user_pixmap, presence_of, connect_avatar_changed, connect_users_changed, RefreshWhenVisible, PRESENCE_LABELS,
@@ -359,6 +360,7 @@ class GroupSectionHeader(QWidget):
         row.addWidget(self.count)
         row.addStretch(1)
         row.addWidget(_Chevron(collapsed))
+        self.setAccessibleName(f"{title} {count}곳, {'접힘' if collapsed else '펼침'}")   # 화면낭독기 (RowList 행 이름)
 
 
 class UnitHeader(QWidget):
@@ -379,6 +381,7 @@ class UnitHeader(QWidget):
         self.count.setFixedWidth(self.count.sizeHint().width())
         row.addWidget(self.count)
         row.addStretch(1)
+        self.setAccessibleName(f"{name or '소속 없음'} {count}명, {'접힘' if collapsed else '펼침'}")   # 화면낭독기
 
 
 DepartmentHeader = UnitHeader  # 이전 이름 호환
@@ -1531,7 +1534,7 @@ class OrgTab(RefreshWhenVisible, QWidget):
     def show_members(self, title, usernames, exec_=True):
         dlg = MembersDialog(self.state, title, usernames, self.window())
         if exec_:
-            dlg.exec_()
+            exec_and_release(dlg)
         return dlg
 
     def _collapsed_units(self, company):
@@ -1667,8 +1670,7 @@ class OrgTab(RefreshWhenVisible, QWidget):
 
     def show_profile(self, username):
         from client.kakao.friends_tab import ProfileDialog
-        ProfileDialog(self.state, username, self.window()).exec_()
-
+        exec_and_release(ProfileDialog(self.state, username, self.window()))
     def _show_context_menu(self, pos):
         item = self.list.itemAt(pos)
         if item is None:

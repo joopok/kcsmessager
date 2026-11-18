@@ -15,6 +15,7 @@ from PyQt5.QtWidgets import (QWidget, QFrame, QLabel, QVBoxLayout, QHBoxLayout, 
                              QListView, QAbstractItemView, QStackedWidget)
 
 from client.kakao import theme, osenv
+from client.kakao.widgets import exec_and_release
 
 from client.kakao.state import (parse_dt)
 from client.kakao.widgets import (paint_icon, user_avatar_pixmap, make_icon, decode_pixmap,
@@ -445,8 +446,7 @@ class DrawerDialog(_Dialog):
         except ImportError:
             self.win.toast('일정 기능을 불러올 수 없습니다.')
             return
-        EventDetailDialog(self.state, ev, self).exec_()
-
+        exec_and_release(EventDetailDialog(self.state, ev, self))
     def _wrap(self, lst, items, empty):
         if items:
             return lst

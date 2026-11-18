@@ -115,6 +115,7 @@ MORE_REACTIONS = [
     '📌', '📎', '📅', '⏰', '☕', '🍀', '🎂', '🎁', '🚀', '💡', '📢', '🆗']
 SUMMARY_CHIP_MIN = 20     # 이만큼 안 읽고 들어오면 '안 읽은 대화 요약' 칩 표시
 REACTION_BAR_MAX = 6      # 말풍선 아래에 바로 보이는 공감 종류 (나머지는 +N)
+_NOTHING = object()     # '아무것도 없음' 표시 (None 은 '전부'라는 뜻으로 쓴다)
 RENDER_PAGE = 150         # 한 번에 화면에 만드는 메시지 수 (위로 올리면 150개씩 더, 오래 쓴 큰 방도 바로 열림)
 EMOTICONS = ['😀', '😂', '🤣', '😊', '😍', '🥰', '😘', '😎', '🤔', '😮',
              '😢', '😭', '😡', '🥳', '😴', '🤗', '🙄', '😅', '🙏', '👏',
@@ -164,14 +165,28 @@ def _escape(text):
     return out.replace('  ', '&nbsp; ')
 
 
+_MENTION_RE_CACHE = {}
+
+
+def _mention_re(mention_names):
+    """멘션 이름들 → 정규식 (방마다 같은 이름 목록이면 다시 만들지 않는다 - 300명 방에서 메시지마다 300개 이름으로
+    정규식을 새로 만들어 대화 50개를 그리는 데 20ms 가 더 들었다)"""
+    key = tuple(mention_names)
+    found = _MENTION_RE_CACHE.get(key)
+    if found is None:
+        names = sorted({n for n in key if n}, key=len, reverse=True)
+        found = re.compile('@(' + '|'.join(re.escape(html.escape(n)) for n in names) + ')') if names else False
+        if len(_MENTION_RE_CACHE) > 64:
+            _MENTION_RE_CACHE.clear()
+        _MENTION_RE_CACHE[key] = found
+    return found or None
+
+
 def message_html(text, mention_names, link_color, mention_color):
     """본문 → 리치텍스트: URL 링크 + @멘션 강조 + 줄바꿈 유지"""
     parts = []
     pos = 0
-    mention_re = None
-    if mention_names:
-        names = sorted({n for n in mention_names if n}, key=len, reverse=True)
-        mention_re = re.compile('@(' + '|'.join(re.escape(html.escape(n)) for n in names) + ')')
+    mention_re = _mention_re(mention_names) if mention_names else None
 
     def plain(chunk):
         esc = _escape(chunk)
@@ -1833,6 +1848,9 @@ class MessageRow(QWidget):
 
     def refresh_unread(self):
         n = self.state.message_unread(self.win.room_id, self.msg)
+        if n == getattr(self, '_unread_shown', None):
+            return                                # 같은 숫자면 라벨을 건드리지 않는다 (읽음이 몰려올 때 다시 배치하지 않게)
+        self._unread_shown = n
         self.unread_label.setText(str(n) if n > 0 else '')
         self.unread_label.setVisible(n > 0)
         self.unread_label.setAccessibleName(f'안 읽은 사람 {n}명 보기' if n > 0 else '')
@@ -2127,8 +2145,16 @@ class MembersStrip(QFrame):
         wrap.setContentsMargins(theme.sp('s'), 0, theme.sp('s'), theme.sp('xs'))
         wrap.addWidget(self.area)
         v.addLayout(wrap)
-        self.chips = {}
+        self._chips = {}
+        self._chips_stale = True
         self.refresh()
+
+    @property
+    def chips(self):
+        """사용자 → 사진 칩. 접힌 동안은 만들지 않고 펼치거나 찾을 때 만든다 (300명 방을 열 때 사진 300장을 그렸다)"""
+        if self._chips_stale:
+            self._build_chips()
+        return self._chips
 
     def members(self):
         room = self.state.room(self.win.room_id) or {}
@@ -2142,6 +2168,8 @@ class MembersStrip(QFrame):
 
     def set_expanded(self, expanded):
         self.expanded = bool(expanded)
+        if self.expanded and self._chips_stale:
+            self._build_chips()
         self.area.setVisible(self.expanded)
         # 펼치면 사진 칩이 이름을 보여 주므로 미리보기는 비운다 (숨기면 늘림 칸이 사라져 버튼이 가운데로 온다)
         self.preview.setText('' if self.expanded else self._preview_text)
@@ -2172,18 +2200,26 @@ class MembersStrip(QFrame):
             {theme.button_qss('stripAll', 'ghost', size='meta', pad='3px 8px')}
             {theme.scrollbar_qss()}
         """)
-        room = self.state.room(self.win.room_id) or {}
         members = self.members()
         self.title.setText(f'대화상대 {len(members)}명')
-        names = [('나' if u == self.state.me else self.state.member_name(self.win.room_id, u)) for u in members]
-        self._preview_text = ', '.join(names)
+        names = [('나' if u == self.state.me else self.state.member_name(self.win.room_id, u)) for u in members[:60]]
+        self._preview_text = ', '.join(names) + (f' 외 {len(members) - 60}명' if len(members) > 60 else '')
         self.preview.setToolTip(self._preview_text)
+        self._chips_stale = True
+        if self.expanded:
+            self._build_chips()
+        self.set_expanded(self.expanded)
+
+    def _build_chips(self):
+        self._chips_stale = False
+        room = self.state.room(self.win.room_id) or {}
+        members = self.members()
         host = QWidget()
         host.setObjectName('stripHost')
         h = QHBoxLayout(host)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(theme.sp('xxs'))
-        self.chips = {}
+        self._chips = {}
         size = theme.px(self.CHIP_AVATAR)
         fm = QFontMetrics(theme.font('caption'))
         name_w = theme.px(60)
@@ -2202,12 +2238,11 @@ class MembersStrip(QFrame):
             chip.setAccessibleName(f'{name} 프로필 보기')
             chip.clicked.connect(lambda _c=False, name=u: self.win.open_profile(name))
             h.addWidget(chip)
-            self.chips[u] = chip
+            self._chips[u] = chip
         h.addStretch(1)
         self.area.setWidget(host)
         bar = self.area.horizontalScrollBar().sizeHint().height()
         self.area.setFixedHeight(host.sizeHint().height() + bar)
-        self.set_expanded(self.expanded)
 
 
 class MembersPopup(QFrame):
@@ -2384,23 +2419,27 @@ class ReactionPicker(_Dialog):
         grid = QGridLayout()
         grid.setSpacing(4)
         self.buttons = {}
+        # 모양은 창에 한 번만 입힌다 (단추 72개에 하나씩 스타일시트를 주면 Qt 가 72번 해석해 창이 0.6초 늦게 떴다)
+        self.setStyleSheet(self.styleSheet() + f"""
+            QPushButton#reactionPick, QPushButton#reactionPickMine {{ {emoji_css()} font-size: {theme.fs('heading')}px;
+                padding: 2px 6px; }}
+            QPushButton#reactionPickMine {{ border: 2px solid {theme.c('yellow_dark')}; }}
+            QLabel#pickerCount {{ background: {theme.c('yellow')}; color: {theme.c('on_accent')};
+                border-radius: {theme.px(7)}px; font-size: {theme.fs('micro')}px; font-weight: bold; padding: 0 3px; }}""")
         for i, emo in enumerate(MORE_REACTIONS):
             b = QPushButton(emo, self)
+            b.setObjectName('reactionPickMine' if emo in mine else 'reactionPick')
             if counts.get(emo):
                 b.setToolTip(f'{counts[emo]}명이 공감')
             b.setCursor(Qt.PointingHandCursor)
             b.setFixedSize(theme.px(46), theme.px(38))
             b.setAccessibleName(f'공감 {emo}' + (f' {counts[emo]}명' if counts.get(emo) else ''))
-            on = emo in mine
-            b.setStyleSheet(f"{emoji_css()} font-size: {theme.fs('heading')}px; padding: 2px 6px;"
-                            + (f" border: 2px solid {theme.c('yellow_dark')};" if on else ''))
             b.clicked.connect(lambda _=False, e=emo: self._pick(e))
             if counts.get(emo):
                 badge = QLabel(str(counts[emo]), b)
                 badge.setObjectName('pickerCount')
                 badge.setAlignment(Qt.AlignCenter)
-                badge.setStyleSheet(f"background: {theme.c('yellow')}; color: {theme.c('on_accent')};"
-                                    f" border-radius: {theme.px(7)}px; font-size: {theme.fs('micro')}px; font-weight: bold; padding: 0 3px;")
+                badge.ensurePolished()
                 badge.adjustSize()
                 bh = max(theme.px(14), badge.sizeHint().height())   # 글자 배율을 따라 높이도 커진다
                 badge.setFixedHeight(bh)
@@ -2512,6 +2551,14 @@ class ChatRoomWindow(QWidget):
         if created is not None and room_id in created:
             created.discard(room_id)
             self.set_members_strip(True)    # 방금 만든 방: 누가 들어왔는지 펼쳐서 바로 보이게
+        self._render_timer = QTimer(self)    # 나눠 그리는 말풍선 (_rebuild)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self._continue_render)
+        self._read_pending = _NOTHING       # 묶어 둔 읽음 갱신 범위 (_NOTHING: 없음, None: 전부, (lo, hi))
+        self._read_timer = QTimer(self)
+        self._read_timer.setSingleShot(True)
+        self._read_timer.setInterval(self.READ_COALESCE_MS)
+        self._read_timer.timeout.connect(self.flush_read_refresh)
         self._relayout_timer = QTimer(self)
         self._relayout_timer.setSingleShot(True)
         self._relayout_timer.setInterval(30)
@@ -3368,10 +3415,30 @@ class ChatRoomWindow(QWidget):
         dt = parse_dt(m.get('timestamp'))
         return dt.date() if dt else None
 
-    def _rebuild(self):
-        """받아 둔 메시지 중 최근 _render_count 개로 목록을 다시 배치(기존 행 위젯은 재사용)"""
+    RENDER_STEP = 15     # 이벤트 한 번에 새로 만드는 말풍선 수. 나머지는 다음 이벤트에 위로 붙인다 (0 이면 한 번에)
+    RENDER_GAP_MS = 1    # 덩어리 사이: 0 이면 같은 이벤트 처리 안에서 바로 이어져 화면이 먼저 그려지지 않는 경우가 있다
+
+    def _rebuild(self, sync=False):
+        """받아 둔 메시지 중 최근 _render_count 개로 목록을 다시 배치(기존 행 위젯은 재사용).
+        말풍선을 한 번에 수십 개 만들면 느린 PC(CI 의 Windows)에서 채팅방 열기 · 이전 대화가 0.8~1초 걸렸다 →
+        새로 만들 행이 RENDER_STEP 보다 많으면 맨 아래(최신)부터 그 수만큼만 지금 만들고, 나머지는 이벤트 사이에
+        위로 붙인다 (_render_timer). sync=True 면 한 번에 (찾아갈 메시지가 바로 있어야 할 때)"""
         all_msgs = self.state.timeline_messages(self.room_id)
         msgs = all_msgs[-self._render_count:] if self._render_count < len(all_msgs) else all_msgs
+        step = 0 if sync else self.RENDER_STEP
+        if step and self._order and len(msgs) > len(self._order):
+            n = len(self._order)
+            if all(a is b for a, b in zip(msgs[-n:], self._order)):     # 위에 더 붙이기만 하면 된다
+                missing = msgs[:len(msgs) - n]
+                chunk = missing[-step:]
+                self._prepend(chunk)
+                self._hidden_older = len(all_msgs) - len(self._order)
+                if len(chunk) < len(missing):
+                    self._render_timer.start(self.RENDER_GAP_MS)
+                return
+        more_later = bool(step) and not self._order and len(msgs) > step
+        if more_later:
+            msgs = msgs[-step:]                   # 처음 열 때: 맨 아래 한 화면부터
         self._hidden_older = len(all_msgs) - len(msgs)
         lay = self.list_layout
         while lay.count():
@@ -3404,6 +3471,39 @@ class ChatRoomWindow(QWidget):
                 sep.deleteLater()
         self.rows, self._seps, self._order = new_rows, new_seps, msgs
         self._apply_runs()
+        if more_later:
+            self._render_timer.start(self.RENDER_GAP_MS)
+
+    def _continue_render(self):
+        if len(self._order) < min(self._render_count, len(self.state.timeline_messages(self.room_id))):
+            self._rebuild()
+
+    def finish_rendering(self):
+        """나눠 그리는 중인 말풍선을 지금 다 그린다 (테스트 · 메시지 찾아가기)"""
+        self._render_timer.stop()
+        self._rebuild(sync=True)
+
+    def _prepend(self, chunk):
+        """이미 그린 말풍선 위에 더 오래된 메시지(chunk, 오래된→최신)를 붙인다. 이미 있는 행은 다시 배치하지 않는다"""
+        lay = self.list_layout
+        widgets, last_date = [], None
+        for m in chunk:
+            d = self._msg_date(m)
+            if d != last_date and d is not None:
+                sep = self._date_row(d)            # 같은 날짜 구분선이 이미 위에 있으면 그것을 옮긴다
+                if lay.indexOf(sep) >= 0:
+                    lay.removeWidget(sep)
+                self._seps[d] = sep
+                widgets.append(sep)
+                last_date = d
+            row = self._make_row(m)
+            self.rows[m['msg_id']] = row
+            widgets.append(row)
+        for i, widget in enumerate(widgets):
+            lay.insertWidget(1 + i, widget)        # 0 은 위쪽 빈칸(stretch)
+            widget.show()
+        self._order = list(chunk) + self._order
+        self._apply_runs(0, len(chunk) + 1)
 
     @staticmethod
     def _run_key(m):
@@ -3413,11 +3513,11 @@ class ChatRoomWindow(QWidget):
             return ('failed', m['msg_id'])
         return (m.get('sender'), (m.get('timestamp') or '')[:16])
 
-    def _apply_runs(self, start=0):
+    def _apply_runs(self, start=0, end=None):
         """연속 메시지 규칙: 같은 사람·같은 분이면 첫 메시지만 프로필/이름, 마지막만 시간"""
         order = self._order
         n = len(order)
-        for i in range(max(0, start), n):
+        for i in range(max(0, start), n if end is None else min(n, end)):
             m = order[i]
             key = self._run_key(m)
             if key is None:
@@ -3442,6 +3542,19 @@ class ChatRoomWindow(QWidget):
         self._order = self._order + [m]
         self._render_count += 1
         self._apply_runs(len(self._order) - 2)
+        self._trim_rendered()
+
+    RENDER_MAX = RENDER_PAGE * 2     # 맨 아래를 보는 동안 화면에 두는 최대 메시지 수 (넘으면 위쪽을 정리)
+
+    def _trim_rendered(self):
+        """맨 아래를 보는 중에 새 메시지로 행이 RENDER_MAX 를 넘으면 오래된 행을 정리해 RENDER_PAGE 개로 줄인다.
+        정리한 메시지는 받아 둔 채로 남아 위로 올리면(_load_older) 다시 그린다. 예전에는 열어 둔 큰 방에 메시지가
+        쌓일수록 행이 늘기만 해서, 읽음 · 테마 · 폭 변경마다 수천 행을 다시 셌다"""
+        if len(self._order) <= self.RENDER_MAX or not self._stick_bottom or self._anchor is not None \
+                or self._loading_older or self._pending_focus is not None:
+            return
+        self._render_count = RENDER_PAGE
+        self._rebuild()
 
     def _on_message_removed(self, rid, msg_id):
         """로컬 메시지(전송 실패) 하나 제거: 그 행만 지우고 앞뒤 묶음만 다시 계산 (방 전체를 다시 만들지 않음)"""
@@ -3618,7 +3731,7 @@ class ChatRoomWindow(QWidget):
             all_ids = [m['msg_id'] for m in self.state.timeline_messages(self.room_id)]
             if msg_id in all_ids:
                 self._render_count = max(self._render_count, len(all_ids) - all_ids.index(msg_id))
-                self._rebuild()
+                self._rebuild(sync=True)
                 row = self.rows.get(msg_id)
         if row is not None:
             self._pending_focus = None
@@ -3643,7 +3756,7 @@ class ChatRoomWindow(QWidget):
         if self._loading_older:
             self._render_count += len(batch)   # 서버에서 더 받은 오래된 메시지도 보이게
         self._loading_older = False
-        self._rebuild()
+        self._rebuild(sync=self._pending_focus is not None)
         if self._anchor is not None:
             self.container.layout().activate()
             QTimer.singleShot(150, self._clear_anchor)
@@ -3661,6 +3774,9 @@ class ChatRoomWindow(QWidget):
         self._maybe_mark_read()
 
     def _clear_anchor(self):
+        if self._render_timer.isActive():      # 아직 위로 붙이는 중: 다 붙인 뒤에 스크롤 고정을 푼다
+            QTimer.singleShot(150, self._clear_anchor)
+            return
         self._anchor = None
 
     def _on_message_added(self, rid, m):
@@ -3697,11 +3813,45 @@ class ChatRoomWindow(QWidget):
         if self._editing and self._editing.get('msg_id') == m['msg_id'] and (hidden or m.get('deleted')):
             self.cancel_edit()
 
+    READ_COALESCE_MS = 50       # 읽음이 몰려올 때: 첫 건은 바로, 이 시간 안에 이어 온 것은 끝에 한 번에
+
     def _on_read_changed(self, rid):
+        """읽음 숫자 갱신. 공지 하나를 300명이 읽으면 read_update 가 300건 몰려온다 - 건마다 행 수백 개의 숫자를 바꾸고
+        다시 배치하면 화면이 수 초 멈췄다. 한 사람의 읽은 위치가 옮겨진 구간의 행만 다시 세고, 몰려오는 건은 묶는다"""
         if rid != self.room_id:
             return
-        for row in self.rows.values():
+        span = self.state.read_span(rid) if hasattr(self.state, 'read_span') else None
+        if span is not None and span[1] <= span[0]:
+            return                                # 읽은 위치가 그대로 (예전 값이 다시 옴)
+        if self._read_timer.isActive():
+            pending = self._read_pending
+            if pending is _NOTHING:
+                self._read_pending = span
+            elif pending is None or span is None:
+                self._read_pending = None         # 어느 하나라도 '전부'면 전부
+            else:
+                self._read_pending = (min(pending[0], span[0]), max(pending[1], span[1]))
+            return
+        self._refresh_unread_rows(span)
+        self._read_timer.start()
+
+    def _refresh_unread_rows(self, span):
+        if span is None:
+            rows = list(self.rows.values())
+        else:                                     # 한 사람의 읽은 위치가 옮겨진 구간의 메시지만 숫자가 바뀐다
+            lo, hi = span
+            rows = [row for mid, row in self.rows.items() if isinstance(mid, int) and lo < mid <= hi]
+        for row in rows:
             row.refresh_unread()
+
+    def flush_read_refresh(self):
+        """묶어 둔 읽음 숫자 갱신을 지금 (타이머 · 테스트)"""
+        pending, self._read_pending = self._read_pending, _NOTHING
+        if pending is not _NOTHING:
+            self._refresh_unread_rows(pending)
+            self._read_timer.start()              # 계속 몰려오면 다음 묶음도 이 간격으로
+        else:
+            self._read_timer.stop()
 
     def _on_room_changed(self, rid):
         if rid != self.room_id:
@@ -4602,7 +4752,7 @@ class ChatRoomWindow(QWidget):
             self.toast('배경화면 설정을 불러올 수 없습니다.')
             return
         dlg = api.WallpaperDialog(self.state.settings, room_id=self.room_id, parent=self)
-        dlg.exec_()
+        exec_and_release(dlg)
         self._apply_styles()
         self.update()
 
@@ -4711,7 +4861,7 @@ class ChatRoomWindow(QWidget):
     def open_board(self, post_id=None):
         dlg = BoardDialog(self.state, self.room_id, self, post_id=post_id)
         self._board_dialog = dlg
-        dlg.exec_()
+        exec_and_release(dlg)
         return dlg
 
     def leave_room(self):
@@ -4750,8 +4900,7 @@ class ChatRoomWindow(QWidget):
 
     def open_drawer(self):
         dlg = DrawerDialog(self, self)
-        dlg.exec_()
-
+        exec_and_release(dlg)
     # ================= 검색 =================
     def toggle_search(self):
         if self.search_bar.isVisible():
@@ -4972,7 +5121,7 @@ class ChatRoomWindow(QWidget):
         dlg = ReactionPicker(mine, {e: len(u) for e, u in reactions.items()}, self)
         dlg.picked.connect(lambda e: self.react(m['msg_id'], e))
         if exec_:
-            dlg.exec_()
+            exec_and_release(dlg)
         return dlg
 
     def focus_compose(self):

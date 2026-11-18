@@ -124,6 +124,38 @@ class StatusPill(QWidget):
         p.drawText(self.rect().adjusted(pad, 0, -pad, 0), Qt.AlignCenter, text)
 
 
+def row_accessible_text(widget):
+    """목록 행 위젯을 화면낭독기가 읽을 한 문장으로 ('이동현, 사원, 마케팅팀').
+    행 위젯은 setItemWidget 으로 얹혀 있어 목록 접근성 트리에는 항목만 보이고 그 안의 글자는 보이지 않는다
+    (ElidedLabel 처럼 직접 그리는 위젯은 원래 접근성 이름도 없다). 행이 accessibleName 을 정해 두었으면 그것을,
+    아니면 숨기지 않은 자식 위젯의 이름 · 글자를 화면 순서대로 모은다"""
+    name = widget.accessibleName()
+    if name:
+        return name
+    parts = []
+    for child in [widget] + widget.findChildren(QWidget):
+        if child is not widget and (child.isHidden() or any(p.isHidden() for p in _ancestors(child, widget))):
+            continue
+        text = child.accessibleName()
+        if not text:
+            getter = getattr(child, 'text', None)
+            try:
+                text = getter() if callable(getter) else ''
+            except TypeError:
+                text = ''
+        text = ' '.join(str(text or '').split())
+        if text and (not parts or parts[-1] != text):
+            parts.append(text)
+    return ', '.join(parts)
+
+
+def _ancestors(child, stop):
+    parent = child.parentWidget()
+    while parent is not None and parent is not stop:
+        yield parent
+        parent = parent.parentWidget()
+
+
 class RowList(QListWidget):
     """행 위젯을 담는 목록. 더블클릭/Enter → row_activated"""
 
@@ -203,6 +235,7 @@ class RowList(QListWidget):
         self._height_guess[self._kind(item.data(Qt.UserRole))] = height
         item.setSizeHint(QSize(1, height))
         self.setItemWidget(item, widget)
+        item.setData(Qt.AccessibleTextRole, row_accessible_text(widget))
         width = self.viewport().width()
         if width > 0 and widget.width() != width:
             widget.resize(width, widget.height())
@@ -243,6 +276,7 @@ class RowList(QListWidget):
         item.setSizeHint(QSize(1, widget.sizeHint().height()))
         self.addItem(item)
         self.setItemWidget(item, widget)
+        item.setData(Qt.AccessibleTextRole, row_accessible_text(widget))
         return item
 
     def add_lazy_row(self, factory, data, selectable=True, height=None):
@@ -308,6 +342,7 @@ class RowList(QListWidget):
         item.setData(self.SIGNATURE_ROLE, signature)
         if self.built_widget(item) is not None:
             self.removeItemWidget(item)
+        item.setData(Qt.AccessibleTextRole, None)      # 예전 내용을 읽지 않게 - 위젯을 다시 만들 때 채운다
         item.setData(self.LAZY_ROLE, factory)
         guess = item.data(self.HEIGHT_ROLE) or self._height_guess.get(self._kind(item.data(Qt.UserRole)),
                                                                       self.DEFAULT_ROW_PX)
@@ -1379,8 +1414,11 @@ class ChatsTab(RefreshWhenVisible, QWidget):
         self.list.customContextMenuRequested.connect(self._show_context_menu)
 
         # 바뀐 것은 refresh() 가 행 단위로 맞춘다 (RowList.sync_rows). 다른 탭 뒤에 가려져 있으면 보일 때까지 미룬다
-        state.rooms_changed.connect(self.refresh_when_visible)
-        state.room_changed.connect(self.refresh_when_visible)
+        # 새 메시지 · 읽음 · 임시저장마다 rooms_changed 가 온다: 첫 알림은 바로, 이어서 몰려오는 것은 묶어서 한 번 더
+        # (방 300개 목록을 메시지마다 다시 맞추면 메시지가 쏟아지는 방에서 초당 수십 번 돌았다)
+        self._rooms_relay = _BurstRelay(self.refresh_when_visible, self)
+        state.rooms_changed.connect(self._rooms_relay.fire)
+        state.room_changed.connect(lambda *_: self._rooms_relay.fire())
         self._users_relay = connect_users_changed(state, self.refresh_when_visible)
         state.call_history_changed.connect(self.refresh_when_visible)
         settings.changed.connect(self._on_setting)
@@ -1636,7 +1674,7 @@ class ChatsTab(RefreshWhenVisible, QWidget):
 
     def show_peek_dialog(self, room_id):
         dlg = PeekDialog(self.state, room_id, self.window())
-        dlg.exec_()
+        exec_and_release(dlg)
         return dlg
 
     def confirm_leave(self, room_id):
@@ -1656,7 +1694,7 @@ class ChatsTab(RefreshWhenVisible, QWidget):
     def show_open_chat_dialog(self, modal=True):
         dlg = OpenChatDialog(self.state, self.window())
         if modal:
-            dlg.exec_()
+            exec_and_release(dlg)
         else:
             dlg.show()
         return dlg
@@ -1667,7 +1705,7 @@ class ChatsTab(RefreshWhenVisible, QWidget):
         dlg = TalkDrawerDialog(self.state, self.window())
         dlg.setAttribute(Qt.WA_DeleteOnClose, True)
         if modal:
-            dlg.exec_()
+            exec_and_release(dlg)
         else:
             dlg.show()
         return dlg
@@ -1678,7 +1716,7 @@ class ChatsTab(RefreshWhenVisible, QWidget):
         except ImportError:
             return None
         dlg = InviteDialog(self.state, room_id, self.window())
-        dlg.exec_()
+        exec_and_release(dlg)
         return dlg
 
     def apply_theme(self):

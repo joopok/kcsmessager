@@ -301,7 +301,7 @@ def blur_image(image, factor=10):
 
 def recordings_dir():
     from client.kakao import osenv
-    return osenv.app_path('recordings')
+    return osenv.make_private_dir(osenv.app_path('recordings'))     # 통화 녹음은 본인만 (0700)
 
 
 class WavRecorder:
@@ -1384,7 +1384,12 @@ class CallWindow(QWidget):
 
         self._refresh()
         self._tick_second()
-        self._start_devices()
+        # 마이크 · 스피커 · 카메라는 창을 먼저 그린 뒤에 연다: 장치를 여는 데 OS 가 수백 ms 를 쓰기도 해서
+        # (장치가 없는 PC · CI 의 macOS 에서 통화 창이 0.8초 늦게 떴다) 그동안 빈 화면을 보이지 않게
+        self._device_timer = QTimer(self)
+        self._device_timer.setSingleShot(True)
+        self._device_timer.timeout.connect(self._start_devices_once)
+        self._device_timer.start(self.DEVICE_START_DELAY_MS)
 
     # ------------------------------------------------------------ UI 구성
     def _build(self):
@@ -1933,6 +1938,13 @@ class CallWindow(QWidget):
             self.rec_badge.setText(f'녹음 중 {format_duration(self.recorder.duration)}')
 
     # ------------------------------------------------------------ 장치
+    DEVICE_START_DELAY_MS = 50
+
+    def _start_devices_once(self):
+        if self.closed or self._devices_started:
+            return
+        self._start_devices()
+
     def _start_devices(self):
         self._devices_started = True
         self.audio.start_output()

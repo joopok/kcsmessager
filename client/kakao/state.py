@@ -7,6 +7,7 @@ UI는 소켓을 직접 다루지 않고 이 클래스의 액션 메서드만 호
 """
 
 import base64
+import bisect
 import mimetypes
 import os
 import re
@@ -481,7 +482,8 @@ class AppState(QObject):
         if room is None:
             return
         pointers = room.setdefault('read_pointers', {})
-        pointers[p['username']] = max(pointers.get(p['username'], 0), p['last_read_msg_id'])
+        old = pointers.get(p['username'], 0)
+        pointers[p['username']] = max(old, p['last_read_msg_id'])
         if p['username'] == self.me:
             count = p.get('unread_count')
             if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
@@ -493,7 +495,17 @@ class AppState(QObject):
                     1 for m in loaded.values()
                     if m['msg_id'] > mine and m['sender'] != self.me and m['kind'] != 'system')
             self.rooms_changed.emit()
-        self.read_changed.emit(rid)
+        # 이 사람의 읽은 위치가 old → new 로 옮겨졌다: 채팅방은 그 사이 메시지의 읽음 숫자만 다시 센다 (read_span)
+        self._read_span = (rid, old, pointers[p['username']])
+        try:
+            self.read_changed.emit(rid)
+        finally:
+            self._read_span = None
+
+    def read_span(self, room_id):
+        """read_changed 를 처리하는 동안: 읽음 숫자가 바뀐 메시지 범위 (lo, hi] - lo < msg_id <= hi. 모르면 None (전부)"""
+        span = getattr(self, '_read_span', None)
+        return span[1:] if span is not None and span[0] == room_id else None
 
     def _on_search_result(self, p):
         self.search_results.emit(p.get('query', ''), p.get('messages', []))
@@ -973,8 +985,21 @@ class AppState(QObject):
         room = self.rooms.get(room_id)
         if room is None:
             return 0
+        # 읽은 위치를 정렬해 두고 이진 탐색: 300명 방에서 행마다 300명을 훑으면 읽음 한 건에 수십 ms 가 걸렸다
+        return bisect.bisect_left(self._sorted_read_pointers(room_id, room), message['msg_id'])
+
+    def _sorted_read_pointers(self, room_id, room):
+        """구성원들의 읽은 위치(오름차순). 구성원 · 읽은 위치가 그대로면 지난번 목록을 그대로 쓴다"""
+        members = tuple(room.get('members', []))
         pointers = room.get('read_pointers', {})
-        return sum(1 for u in room.get('members', []) if pointers.get(u, 0) < message['msg_id'])
+        key = (members, len(pointers), sum(pointers.values()))
+        cache = self.__dict__.setdefault('_unread_cache', {})
+        hit = cache.get(room_id)
+        if hit is not None and hit[0] is room and hit[1] == key:
+            return hit[2]
+        values = sorted(pointers.get(u, 0) for u in members)
+        cache[room_id] = (room, key, values)
+        return values
 
     def unread_members(self, room_id, message):
         """이 메시지를 아직 읽지 않은 사람 (이름순) - 읽음 숫자를 누르면 보인다 (§10.6)"""

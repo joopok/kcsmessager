@@ -292,6 +292,177 @@ class SplitRoomsTests(unittest.TestCase):
         self.assertIs(win.room_pane.currentWidget(), win.room_windows['g7'])
 
 
+def _text_message(msg_id, sender, content, room_id='r1', minutes_ago=0):
+    from datetime import datetime, timedelta
+    return dict(msg_id=msg_id, room_id=room_id, sender=sender, kind='text', content=content,
+                timestamp=(datetime.now() - timedelta(minutes=minutes_ago)).isoformat(timespec='seconds'),
+                reply_to=None, mentions=[], reactions={}, deleted=False, attachment=None, event_id=None, poll=None)
+
+
+class ProgressiveRenderTests(unittest.TestCase):
+    """채팅방은 말풍선을 RENDER_STEP 개씩 나눠 그린다 (느린 PC 에서 채팅방 열기 · 이전 대화가 1초 가까이 걸렸다)"""
+
+    def setUp(self):
+        from client.kakao.chat_room import ChatRoomWindow
+        app()
+        self.state, self.conn = make_demo_state()
+        for i in range(60):                       # 이틀에 걸친 메시지 60개 (날짜 구분선이 생기게)
+            self.conn.push('msg_new', message=_text_message(100 + i, '김철수' if i % 3 else '이영희', f'메시지 {i}',
+                                                             minutes_ago=(60 - i) * 60))
+        self.Win = ChatRoomWindow
+        self.addCleanup(setattr, ChatRoomWindow, 'RENDER_STEP', ChatRoomWindow.RENDER_STEP)
+        ChatRoomWindow.RENDER_STEP = 10
+
+    def open(self):
+        win = self.Win(self.state, 'r1')
+        self.addCleanup(win.close)
+        win.resize(420, 720)
+        win.show()
+        return win
+
+    def ids(self, win):
+        return [m['msg_id'] for m in win._order]
+
+    def test_first_screen_then_the_rest_in_steps(self):
+        win = self.open()
+        timeline = [m['msg_id'] for m in self.state.timeline_messages('r1')]
+        first = self.ids(win)                                       # 처음에는 맨 아래부터 몇 덩어리만 (덩어리 = 10개)
+        self.assertLess(len(first), len(timeline))
+        self.assertLessEqual(len(first), 20)
+        self.assertEqual(first, timeline[-len(first):])
+        pump(200)
+        self.assertEqual(self.ids(win), timeline[-win._render_count:])   # 이벤트 사이에 나머지를 위로 붙였다
+        self.assertEqual(sorted(win.rows), sorted(self.ids(win)))
+        # 같은 날짜 구분선은 하나씩, 날짜가 바뀌는 메시지 바로 위에
+        lay = win.list_layout
+        seps = [lay.itemAt(i).widget() for i in range(lay.count()) if lay.itemAt(i).widget() in win._seps.values()]
+        self.assertEqual(len(seps), len(set(win._msg_date(m) for m in win._order)))
+        for d, sep in win._seps.items():
+            first = next(m for m in win._order if win._msg_date(m) == d)
+            self.assertEqual(lay.indexOf(sep) + 1, lay.indexOf(win.rows[first['msg_id']]))
+
+    def test_same_result_as_drawing_at_once(self):
+        win = self.open()
+        pump(200)
+        stepped = (self.ids(win), [(r.first, r.last) for r in (win.rows[i] for i in self.ids(win)) if hasattr(r, 'first')])
+        self.Win.RENDER_STEP = 0
+        whole = self.open()
+        self.assertEqual(stepped, (self.ids(whole), [(r.first, r.last) for r in (whole.rows[i] for i in self.ids(whole))
+                                                      if hasattr(r, 'first')]))
+
+    def test_finding_an_old_message_draws_it_at_once(self):
+        win = self.open()
+        target = self.ids(win)[0] - 30
+        self.assertNotIn(target, win.rows)
+        self.assertTrue(win.focus_message(target))
+        self.assertIn(target, win.rows)
+
+
+class BigRoomReadTests(unittest.TestCase):
+    """큰 방 읽음 처리: 안 읽은 수는 정렬해 둔 읽은 위치에서 이진 탐색, 읽은 위치가 옮겨진 구간의 행만, 몰려오면 묶어서"""
+
+    def setUp(self):
+        app()
+        self.state, self.conn = make_demo_state()
+
+    def brute(self, rid, m):
+        room = self.state.room(rid)
+        return sum(1 for u in room['members'] if room.get('read_pointers', {}).get(u, 0) < m['msg_id'])
+
+    def test_unread_count_matches_counting_everyone(self):
+        rid = 'r1'
+        msgs = [m for m in self.state.room_messages(rid) if m.get('kind') != 'system']
+        for reader, last in (('김철수', 3), ('이영희', 9), (self.state.me, 11), ('김철수', 11)):
+            self.conn.push('read_update', room_id=rid, username=reader, last_read_msg_id=last)
+            for m in msgs:
+                self.assertEqual(self.state.message_unread(rid, m), self.brute(rid, m), (reader, last, m['msg_id']))
+        room = self.state.room(rid)                       # 읽은 위치를 직접 바꿔도 (테스트 · 예전 코드) 맞게 다시 센다
+        room['read_pointers']['이영희'] = 1
+        self.assertEqual(self.state.message_unread(rid, msgs[-1]), self.brute(rid, msgs[-1]))
+
+    def test_room_refreshes_only_rows_in_the_moved_span_and_batches_bursts(self):
+        from client.kakao.chat_room import ChatRoomWindow
+        self.state.room('r1').setdefault('read_pointers', {})['이영희'] = 0      # 아직 하나도 안 읽은 사람
+        win = ChatRoomWindow(self.state, 'r1')
+        self.addCleanup(win.close)
+        win.show()
+        pump()
+        win.flush_read_refresh()
+        touched = []
+        for mid, row in win.rows.items():
+            original = row.refresh_unread
+            row.refresh_unread = lambda mid=mid, original=original: (touched.append(mid), original())
+        room = self.state.room('r1')
+        pointers = room.get('read_pointers', {})
+        reader, start = '이영희', pointers.get('이영희', 0)
+        top = max(m for m in win.rows if isinstance(m, int))
+        self.assertGreaterEqual(top - start, 4)
+        self.conn.push('read_update', room_id='r1', username=reader, last_read_msg_id=start + 1)
+        self.assertTrue(touched)
+        self.assertTrue(all(start < mid <= start + 1 for mid in touched))   # 새로 읽은 메시지만
+        touched.clear()
+        for last in (start + 2, start + 3, start + 4):               # 이어서 몰려오는 것은 묶어서 끝에 한 번
+            self.conn.push('read_update', room_id='r1', username=reader, last_read_msg_id=last)
+        self.assertEqual(touched, [])
+        win.flush_read_refresh()
+        self.assertEqual(sorted(set(touched)),
+                         [m for m in sorted(win.rows) if isinstance(m, int) and start + 1 < m <= start + 4])
+
+    def test_rows_are_trimmed_while_following_the_bottom(self):
+        from client.kakao.chat_room import ChatRoomWindow, RENDER_PAGE
+        win = ChatRoomWindow(self.state, 'r1')
+        self.addCleanup(win.close)
+        win.show()
+        pump()
+        for i in range(RENDER_PAGE * 2 + 5):
+            self.conn.push('msg_new', message=_text_message(1000 + i, '김철수', f'공지 뒤 {i}'))
+        self.assertLessEqual(len(win._order), win.RENDER_MAX)
+        self.assertEqual(win._order[-1]['msg_id'], 1000 + RENDER_PAGE * 2 + 4)
+        self.assertGreater(win._hidden_older, 0)                   # 정리한 메시지는 받아 둔 채로 - 위로 올리면 다시 그린다
+
+
+class ScreenDetailTests(unittest.TestCase):
+    def test_reaction_picker_styles_once(self):
+        from client.kakao.chat_room import ReactionPicker
+        app()
+        dlg = ReactionPicker(mine={'👍'}, counts={'👍': 2})
+        self.addCleanup(dlg.close)
+        self.assertEqual(dlg.buttons['👍'].objectName(), 'reactionPickMine')
+        self.assertTrue(all(b.styleSheet() == '' for b in dlg.buttons.values()))
+        self.assertIn('reactionPickMine', dlg.styleSheet())
+
+    def test_members_strip_builds_photos_only_when_opened(self):
+        from client.kakao.chat_room import ChatRoomWindow
+        app()
+        state, _conn = make_demo_state()
+        win = ChatRoomWindow(state, 'r1')
+        self.addCleanup(win.close)
+        strip = win.members_strip
+        self.assertFalse(strip.expanded)
+        self.assertTrue(strip._chips_stale)                        # 접힌 채로는 사진 칩을 만들지 않는다
+        win.set_members_strip(True)
+        self.assertFalse(strip._chips_stale)
+        self.assertIn(state.me, strip.chips)
+
+    def test_notification_text_and_private_home(self):
+        from client.kakao import osenv
+        body = '<a href="file:///etc">공지</a> & 1 < 2'
+        with mock.patch.object(osenv, 'is_linux', return_value=True):
+            self.assertEqual(osenv.notification_text(body), '&lt;a href="file:///etc"&gt;공지&lt;/a&gt; &amp; 1 &lt; 2')
+        with mock.patch.object(osenv, 'is_linux', return_value=False):
+            self.assertEqual(osenv.notification_text(body), body)
+        if os.name == 'nt':
+            return
+        home = os.path.join(tempfile.mkdtemp(prefix='kcs_home_'), '.kcs_messenger')
+        for sub in ('', 'logs', 'recordings'):
+            os.makedirs(os.path.join(home, sub), exist_ok=True)
+            os.chmod(os.path.join(home, sub), 0o755)
+        with mock.patch.dict(os.environ, {'KCS_MESSENGER_HOME': home}):
+            self.assertTrue(osenv.secure_app_home())
+        for sub in ('', 'logs', 'recordings'):
+            self.assertEqual(os.stat(os.path.join(home, sub)).st_mode & 0o777, 0o700, sub)
+
+
 class DialogReleaseTests(unittest.TestCase):
     def test_closed_modal_dialogs_are_deleted(self):
         from PyQt5.QtWidgets import QDialog, QWidget

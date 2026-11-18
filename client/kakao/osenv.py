@@ -105,6 +105,51 @@ def resource_path(*parts):
     return os.path.join(base, *parts)
 
 
+PRIVATE_SUBDIRS = ('logs', 'recordings', 'keys', 'opened', 'macos')   # 데이터 폴더 아래 기록 · 키 · 받은 파일
+
+
+def make_private_dir(path):
+    """본인만 들어갈 수 있는 폴더를 만들고(이미 있으면 권한만 고치고) 경로를 돌려준다.
+    macOS · Linux 0700. Windows 는 사용자 프로필 폴더 권한을 따르므로 만들기만 한다"""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    if not is_windows():
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+    return path
+
+
+def secure_app_home():
+    """앱을 시작할 때 한 번: 데이터 폴더(app_home)와 그 아래 기록 폴더(logs · recordings · keys …)를 본인만 접근하게.
+    예전 버전이 0755 로 만든 폴더도 고친다 - 같은 PC 의 다른 계정이 임시저장 글 · 녹음 · 로그를 읽을 수 있었다.
+    성공하면 True"""
+    home = app_home()
+    try:
+        make_private_dir(home)
+    except OSError:
+        return False
+    if not is_windows():
+        for name in PRIVATE_SUBDIRS:
+            sub = os.path.join(home, name)
+            if os.path.isdir(sub):
+                try:
+                    os.chmod(sub, 0o700)
+                except OSError:
+                    pass
+    return True
+
+
+def notification_text(text):
+    """트레이 알림 본문. Linux 의 알림 서비스(D-Bus)는 본문을 서식(굵게 · 링크)으로 해석한다 - 받은 메시지 · 이름의
+    꺾쇠가 서식이 되거나 file: 링크가 알림에 생기지 않게 escape 한다. Windows · macOS 는 글자 그대로라 바꾸지 않는다"""
+    text = '' if text is None else str(text)
+    if is_linux():
+        import html
+        return html.escape(text, quote=False)
+    return text
+
+
 def secure_file(path):
     """다른 사용자가 못 읽게 (POSIX 600). Windows 는 사용자 프로필 폴더 권한을 따르므로 하지 않는다"""
     if is_windows():

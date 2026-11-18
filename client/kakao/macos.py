@@ -212,10 +212,15 @@ def unify_title_bar(widget):
         window = call(int(widget.winId()), 'window')
         if not window:
             return False
+        pos = widget.pos()
         mask = call(window, 'styleMask', restype=ctypes.c_ulong)
         call(window, 'setStyleMask:', mask | NS_FULL_SIZE_CONTENT_VIEW, argtypes=(ctypes.c_ulong,))
         call(window, 'setTitlebarAppearsTransparent:', True, argtypes=(ctypes.c_bool,))
         call(window, 'setTitleVisibility:', NS_TITLE_HIDDEN, argtypes=(ctypes.c_long,))
+        # showEvent 안(창이 아직 화면에 놓이기 전)에서 styleMask 를 바꾸면 macOS 가 창을 그 모니터 왼쪽 끝으로 옮긴다
+        # (메인 창 오른쪽에 열어야 할 채팅방 창이 700px 넘게 떨어져 떴다) → 정해 둔 자리로 다시 놓는다
+        if not widget.isMaximized() and not widget.isFullScreen():
+            widget.move(pos)
         # setMovableByWindowBackground 는 켜지 않는다: 누른 채로 있으면 창 끌기로 잡혀 콤보 목록 등 팝업이 바로 닫힌다.
         # 창은 투명해진 제목 표시줄 줄(위 28px)을 끌어 옮길 수 있다
         return True
