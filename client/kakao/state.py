@@ -356,13 +356,25 @@ class AppState(QObject):
             self.user_changed.emit(p['username'])
             self.users_changed.emit()
 
+    PRESENCE_KEYS = ('online', 'presence')
+
     def _on_user_updated(self, p):
         user = p['user']
-        self.users[user['username']] = user
-        self._sync_avatar(user['username'])
-        self.user_changed.emit(user['username'])
+        name = user['username']
+        old = self.users.get(name)
+        self.users[name] = user
+        self._sync_avatar(name)
+        # 접속 · 자리비움만 바뀌었으면(서버는 접속할 때마다 user_status_changed 뒤에 user_updated 도 보낸다)
+        # 목록이 그 사람 행만 다시 그리게 presence_changed 를 먼저 알리고, 채팅방 목록 전체 갱신(rooms_changed)은 건너뛴다.
+        # 예전에는 이 경로로 조직도를 통째로 다시 만들어, 펼친 조직도에서는 접속 한 건에 0.27초씩 화면이 멈췄다
+        presence_only = old is not None and all(
+            old.get(k) == user.get(k) for k in set(old) | set(user) if k not in self.PRESENCE_KEYS)
+        if presence_only:
+            self.presence_changed.emit(name)
+        self.user_changed.emit(name)
         self.users_changed.emit()
-        self.rooms_changed.emit()
+        if not presence_only:
+            self.rooms_changed.emit()
 
     def _on_room_updated(self, p):
         room = p['room']

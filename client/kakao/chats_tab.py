@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QLi
 
 from client.kakao import theme
 from client.kakao.state import parse_dt, BOT_NAME
-from client.kakao.widgets import (IconButton, Avatar, Badge, make_icon, avatar_pixmap, underline_tabs_qss,
+from client.kakao.widgets import (IconButton, Avatar, Badge, make_icon, avatar_pixmap, underline_tabs_qss, exec_and_release,
                                   check_box_qss, set_shown)
 
 
@@ -138,6 +138,8 @@ class RowList(QListWidget):
         self.setFrameShape(QFrame.NoFrame)
         self.setMouseTracking(True)
         self.itemDoubleClicked.connect(self.row_activated)
+        self._height_guess = {}          # 행 종류 → 마지막으로 만든 그 종류 행의 높이 (아직 안 만든 행의 자리)
+        self.verticalScrollBar().valueChanged.connect(self._on_scrolled)
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Return, Qt.Key_Enter) and self.currentItem() is not None:
@@ -147,21 +149,91 @@ class RowList(QListWidget):
 
     def _fit_rows(self):
         """행 위젯 폭을 뷰포트에 맞춘다. 숨겨진 탭에서 만들어진 행은 기본 폭(640)으로 남아
-        보이기 시작한 뒤에도 오른쪽(시간·배지)이 잘리므로, 표시/크기 변경 때마다 다시 맞춘다."""
+        보이기 시작한 뒤에도 오른쪽(시간·배지)이 잘리므로, 표시/크기 변경 때마다 다시 맞춘다.
+        아직 만들지 않은 행은 만들 때 맞춘다."""
         width = self.viewport().width()
         for i in range(self.count()):
-            widget = self.itemWidget(self.item(i))
+            widget = self.built_widget(self.item(i))
             if widget is not None and widget.width() != width:
                 widget.resize(width, widget.height())
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self.build_visible()
         self._fit_rows()
 
     def showEvent(self, event):
         super().showEvent(event)
         self.doItemsLayout()
+        self.build_visible()
         self._fit_rows()
+
+    # ---- 보이는 행만 만들기 ----
+    # 직원 500명 · 채팅방 300개면 행 위젯을 한 번에 다 만드는 데 0.3초가 넘게 걸려 탭 · 메인 창이 늦게 뜬다.
+    # sync_rows 는 행 자리(항목)만 바로 만들고, 위젯은 화면에 보이는 범위(+ 위아래 여유)만 만든다.
+    # 나머지는 스크롤해서 보이게 될 때, 또는 itemWidget() 으로 그 행을 찾을 때 만든다.
+    LAZY_ROLE = Qt.UserRole + 2
+    HEIGHT_ROLE = Qt.UserRole + 3
+    EAGER_PX = 1600          # 아직 보이지 않는 목록도 위쪽 이만큼은 미리 만든다 (처음 보일 때 바로 그려지게)
+    OVERSCAN_PX = 400        # 보이는 목록은 화면 아래로 이만큼 더
+    DEFAULT_ROW_PX = 56
+
+    @staticmethod
+    def _kind(data):
+        return data[0] if isinstance(data, tuple) and data else type(data).__name__
+
+    def itemWidget(self, item):
+        """행 위젯. 아직 만들지 않은 행이면 지금 만든다"""
+        if item is not None and item.data(self.LAZY_ROLE) is not None:
+            self._build(item)
+        return super().itemWidget(item)
+
+    def built_widget(self, item):
+        """이미 만든 행 위젯만 (없으면 None, 새로 만들지 않는다)"""
+        return super().itemWidget(item) if item is not None else None
+
+    def pending_count(self):
+        return sum(1 for i in range(self.count()) if self.item(i).data(self.LAZY_ROLE) is not None)
+
+    def _build(self, item):
+        factory = item.data(self.LAZY_ROLE)
+        item.setData(self.LAZY_ROLE, None)
+        widget = factory()
+        height = item.data(self.HEIGHT_ROLE) or widget.sizeHint().height()
+        self._height_guess[self._kind(item.data(Qt.UserRole))] = height
+        item.setSizeHint(QSize(1, height))
+        self.setItemWidget(item, widget)
+        width = self.viewport().width()
+        if width > 0 and widget.width() != width:
+            widget.resize(width, widget.height())
+        return widget
+
+    def build_visible(self):
+        """보이는 범위(보이지 않는 목록은 위쪽 EAGER_PX)의 아직 안 만든 행을 만든다 → 만든 수"""
+        count = self.count()
+        if not count:
+            return 0
+        start = self.indexAt(QPoint(1, 1)).row() if self.verticalScrollBar().value() > 0 else 0
+        start = max(0, start - 1)
+        if self.isVisible():
+            budget = self.viewport().height() + self.OVERSCAN_PX
+        else:
+            budget = max(self.viewport().height(), self.EAGER_PX)
+        built, used = 0, 0
+        for i in range(start, count):
+            item = self.item(i)
+            if item.isHidden():
+                continue
+            if item.data(self.LAZY_ROLE) is not None:
+                self._build(item)
+                built += 1
+            used += item.sizeHint().height()
+            if used > budget:
+                break
+        return built
+
+    def _on_scrolled(self, _value):
+        self.build_visible()
 
     def add_row(self, widget, data, selectable=True):
         item = QListWidgetItem()
@@ -171,6 +243,19 @@ class RowList(QListWidget):
         item.setSizeHint(QSize(1, widget.sizeHint().height()))
         self.addItem(item)
         self.setItemWidget(item, widget)
+        return item
+
+    def add_lazy_row(self, factory, data, selectable=True, height=None):
+        """add_row 와 같되 위젯은 보일 때 만든다 (factory() → 행 위젯). 다 넣었으면 build_visible() 을 부른다.
+        height: 행 높이를 고정할 때 (주지 않으면 만든 위젯의 sizeHint 높이)"""
+        item = QListWidgetItem()
+        item.setData(Qt.UserRole, data)
+        if not selectable:
+            item.setFlags(Qt.ItemIsEnabled)
+        if height:
+            item.setData(self.HEIGHT_ROLE, int(height))
+        self.addItem(item)
+        self._place(item, factory, None)
         return item
 
     SIGNATURE_ROLE = Qt.UserRole + 1
@@ -190,12 +275,11 @@ class RowList(QListWidget):
             item = self.item(i)
             existing.setdefault(item.data(Qt.UserRole), item)
         built = 0
-        width = self.viewport().width()
         for index, (data, signature, factory, selectable) in enumerate(rows):
             item = self.item(index) if index < self.count() else None
             if item is not None and item.data(Qt.UserRole) == data:
                 if item.data(self.SIGNATURE_ROLE) != signature:       # 같은 자리, 내용이 달라짐 → 위젯만 새로
-                    self._place(item, factory(), signature, width)
+                    self._place(item, factory, signature)
                     built += 1
                 continue
             current = False
@@ -210,20 +294,24 @@ class RowList(QListWidget):
             if not selectable:
                 item.setFlags(Qt.ItemIsEnabled)
             self.insertItem(index, item)
-            self._place(item, factory(), signature, width)
+            self._place(item, factory, signature)
             built += 1
             if current:
                 self.setCurrentItem(item)
         while self.count() > len(rows):                                # 같은 이름표가 겹쳐 남은 행
             self.takeItem(self.count() - 1)
+        self.build_visible()
         return built
 
-    def _place(self, item, widget, signature, width):
+    def _place(self, item, factory, signature):
+        """행 자리에 만들 위젯을 정해 둔다 (실제로 만드는 것은 보일 때 - build_visible / itemWidget)"""
         item.setData(self.SIGNATURE_ROLE, signature)
-        item.setSizeHint(QSize(1, widget.sizeHint().height()))
-        self.setItemWidget(item, widget)
-        if width > 0 and widget.width() != width:
-            widget.resize(width, widget.height())
+        if self.built_widget(item) is not None:
+            self.removeItemWidget(item)
+        item.setData(self.LAZY_ROLE, factory)
+        guess = item.data(self.HEIGHT_ROLE) or self._height_guess.get(self._kind(item.data(Qt.UserRole)),
+                                                                      self.DEFAULT_ROW_PX)
+        item.setSizeHint(QSize(1, guess))
 
     def items(self):
         return [self.item(i) for i in range(self.count())]
@@ -491,8 +579,12 @@ class RefreshWhenVisible:
     _stale = False
 
     def hidden_behind_another(self):
+        """다른 탭 뒤에 가려졌거나, 한 번 띄웠던 창째 숨어 있으면(X 로 트레이에 내려간 메인 창) True.
+        한 번도 띄우지 않은 창 · 어디에도 들어 있지 않은 목록은 False (바로 그린다)"""
         window = self.window()
-        return not self.isVisible() and window is not self and window.isVisible()
+        if self.isVisible() or window is self:
+            return False
+        return window.isVisible() or window.testAttribute(Qt.WA_WState_ExplicitShowHide)
 
     def refresh_when_visible(self, *_args):
         if self.hidden_behind_another():
@@ -1559,7 +1651,7 @@ class ChatsTab(RefreshWhenVisible, QWidget):
         return False
 
     def show_create_dialog(self):
-        CreateGroupDialog(self.state, self.window()).exec_()
+        exec_and_release(CreateGroupDialog(self.state, self.window()))
 
     def show_open_chat_dialog(self, modal=True):
         dlg = OpenChatDialog(self.state, self.window())

@@ -26,6 +26,7 @@ APP_TITLE = 'KCS Talk'
 ORG_DOCK_WIDTH = 340          # 왼쪽 조직도 패널 폭
 ORG_DOCK_MIN_WINDOW = 860     # 이 폭 이상이면 조직도 패널 자동 표시
 SPLIT_MIN_WINDOW = 1180       # 이 폭 이상이면 목록 옆에 대화창을 붙여 연다 (분할 화면)
+SPLIT_KEEP_ROOMS = 4          # 분할 화면 오른쪽 칸에 남겨 두는 대화창 수 (최근에 본 순서, 나머지는 닫는다)
 LIST_WIDTH = 380              # 분할 화면에서 목록 열의 폭
 IDLE_SECONDS = 10 * 60
 TAB_KEYS = ['friends', 'chats', 'org', 'calendar', 'more']
@@ -546,6 +547,64 @@ class IdleWatcher(QObject):
 
 
 # ================================================================ 메인 창
+class _Tabs(dict):
+    """탭 key → 탭. 아직 만들지 않은 탭은 찾을 때(tabs['org'] · get · in) 만든다.
+    전부 훑으면(for · keys · values · items · len) 남은 탭을 모두 만든 뒤 돌려준다 - 부르는 쪽은 언제나 다섯 탭을 본다"""
+
+    def __init__(self, make):
+        super().__init__()
+        self._make = make
+        self._pending = list(TAB_KEYS)
+
+    def __missing__(self, key):
+        if key not in self._pending:
+            raise KeyError(key)
+        self._pending.remove(key)
+        tab = self._make(key)
+        dict.__setitem__(self, key, tab)
+        return tab
+
+    def is_built(self, key):
+        return dict.__contains__(self, key)
+
+    def all_built(self):
+        return not self._pending
+
+    def built_items(self):
+        """이미 만든 탭만 (만들지 않는다)"""
+        return list(dict.items(self))
+
+    def build_all(self):
+        for key in list(self._pending):
+            self[key]
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key):
+        return key in self._pending or dict.__contains__(self, key)
+
+    def __iter__(self):
+        self.build_all()
+        return iter([key for key in TAB_KEYS if dict.__contains__(self, key)])
+
+    def keys(self):
+        return list(iter(self))
+
+    def values(self):
+        return [self[key] for key in self.keys()]
+
+    def items(self):
+        return [(key, self[key]) for key in self.keys()]
+
+    def __len__(self):
+        self.build_all()
+        return dict.__len__(self)
+
+
 class PlaceholderTab(QWidget):
     def __init__(self, text, parent=None):
         super().__init__(parent)
@@ -636,13 +695,9 @@ class MainWindow(QMainWindow):
         body_row.setSpacing(0)
         row.addWidget(self.body, 1)
         row = body_row
-        # 넓은 창에서는 조직도를 왼쪽에 항상 펼쳐 둔다(현재 탭이 조직도가 아닐 때)
-        from client.kakao.org_tab import OrgTab
-        self.org_dock = OrgTab(state, settings)
-        self.org_dock.setObjectName('orgDock')
-        self.org_dock.setFixedWidth(ORG_DOCK_WIDTH)
-        self.org_dock.hide()
-        row.addWidget(self.org_dock)
+        # 넓은 창에서는 조직도를 왼쪽에 항상 펼쳐 둔다(현재 탭이 조직도가 아닐 때). 처음 펼칠 때 만든다 (org_dock)
+        self._org_dock = None
+        self._dock_row = row
         self.dock_line = QWidget()
         self.dock_line.setFixedWidth(1)
         self.dock_line.hide()
@@ -668,15 +723,21 @@ class MainWindow(QMainWindow):
         self.room_pane.addWidget(self.room_placeholder)
         row.addWidget(self.room_pane, 1)
         self.toast = Toast(central)
-        self.body.columns = [(self.org_dock, lambda: ['bg']), (self.dock_line, lambda: ['border']),
+        self.body.columns = [(self.dock_line, lambda: ['border']),
                              (self.list_column, lambda: ['bg']), (self.split_line, lambda: ['border']),
                              (self.room_pane, self._room_band_colors)]
         self.room_pane.currentChanged.connect(lambda _i: self.body.update())
 
-        self.tabs = {}
+        self.tabs = _Tabs(self._make_tab)
         self._build_tabs()
         self.sidebar.tab_selected.connect(self.set_tab)
         self.set_tab('friends')
+        # 처음 보이는 탭만 지금 만들고, 나머지 탭은 첫 화면을 그린 뒤 이벤트 사이에 하나씩 만든다
+        # (직원 500명 · 방 300개면 탭 다섯 개를 한꺼번에 만드는 데만 0.2초가 넘는다). 그 전에 찾으면 그 자리에서 만든다
+        self._tab_timer = QTimer(self)
+        self._tab_timer.setSingleShot(True)
+        self._tab_timer.timeout.connect(self._build_next_tab)
+        self._tab_timer.start(self.TAB_BUILD_DELAY_MS)
 
         # 상태 시그널
         state.room_opened.connect(self.open_room)
@@ -806,27 +867,51 @@ class MainWindow(QMainWindow):
         return dlg
 
     # ---- 탭 ----
+    TAB_BUILD_DELAY_MS = 60          # 첫 화면을 그린 뒤 나머지 탭을 만들기 시작할 때까지
+    TAB_BUILD_ORDER = ('chats', 'org', 'calendar', 'more', 'friends')
+
     def _build_tabs(self):
-        from client.kakao.friends_tab import FriendsTab
-        from client.kakao.chats_tab import ChatsTab
-        from client.kakao.org_tab import OrgTab
-        from client.kakao.more_tab import MoreTab
-        self.tabs['friends'] = FriendsTab(self.state, self.settings)
-        self.tabs['chats'] = ChatsTab(self.state, self.settings)
-        self.tabs['org'] = OrgTab(self.state, self.settings)
-        try:
-            from client.kakao.calendar_tab import CalendarTab
-            self.tabs['calendar'] = CalendarTab(self.state)
-        except Exception as e:  # 캘린더 모듈이 없거나 오류여도 앱은 동작해야 한다
-            self.tabs['calendar'] = PlaceholderTab(f'캘린더를 불러올 수 없습니다\n({e.__class__.__name__})')
-        self.tabs['more'] = MoreTab(self.state, self.settings, server_address=self.server_address)
-        self.tabs['more'].logout_requested.connect(lambda: self.logout_cb and self.logout_cb())
         # 왼쪽 아래 내 사진 우클릭 → 로그아웃: 메뉴를 고른 것이 확인이라 확인 창 없이 바로 (간편 로그아웃)
         self.sidebar.can_logout = self.logout_cb is not None
         self.sidebar.logout_requested.connect(lambda: self.logout_cb and self.logout_cb())
         self.sidebar.refresh_me()
-        for key in TAB_KEYS:
-            self.stack.addWidget(self.tabs[key])
+
+    def _make_tab(self, key):
+        """탭 하나를 만들어 화면 묶음(stack)에 넣는다 (tabs[key] 를 처음 찾을 때 _Tabs 가 부른다)"""
+        if key == 'friends':
+            from client.kakao.friends_tab import FriendsTab
+            tab = FriendsTab(self.state, self.settings)
+        elif key == 'chats':
+            from client.kakao.chats_tab import ChatsTab
+            tab = ChatsTab(self.state, self.settings)
+        elif key == 'org':
+            from client.kakao.org_tab import OrgTab
+            tab = OrgTab(self.state, self.settings)
+        elif key == 'calendar':
+            try:
+                from client.kakao.calendar_tab import CalendarTab
+                tab = CalendarTab(self.state)
+            except Exception as e:  # 캘린더 모듈이 없거나 오류여도 앱은 동작해야 한다
+                tab = PlaceholderTab(f'캘린더를 불러올 수 없습니다\n({e.__class__.__name__})')
+        else:
+            from client.kakao.more_tab import MoreTab
+            tab = MoreTab(self.state, self.settings, server_address=self.server_address)
+            tab.logout_requested.connect(lambda: self.logout_cb and self.logout_cb())
+        self.stack.addWidget(tab)
+        from client.kakao.widgets import label_buttons_for_accessibility
+        label_buttons_for_accessibility(tab)
+        if self.isVisible():
+            QTimer.singleShot(0, self.update_minimum_size)
+        return tab
+
+    def _build_next_tab(self):
+        """아직 만들지 않은 탭을 하나 만들고, 남았으면 다음 이벤트에 또"""
+        key = next((k for k in self.TAB_BUILD_ORDER if not self.tabs.is_built(k)), None)
+        if key is None:
+            return
+        self.tabs[key]
+        if not self.tabs.all_built():
+            self._tab_timer.start(0)
 
     def set_tab(self, key):
         if key not in self.tabs:
@@ -860,7 +945,8 @@ class MainWindow(QMainWindow):
         def add(seq, fn):
             sc = QShortcut(QKeySequence(seq), self)
             sc.setContext(Qt.ApplicationShortcut)
-            sc.activated.connect(fn)
+            # 잠금 화면 위에서는 단축키가 듣지 않는다 (Ctrl+K 빠른 이동이 방 이름 · 안 읽은 수 · 동료 목록을 보여 줬다)
+            sc.activated.connect(lambda f=fn: None if self.is_locked() else f())
             self.shortcuts.append(sc)
         for i, key in enumerate(TAB_KEYS[:5], start=1):
             add(f'Ctrl+{i}', lambda k=key: self.set_tab(k))
@@ -918,19 +1004,36 @@ class MainWindow(QMainWindow):
             self.list_column.setMinimumWidth(0)
             self.list_column.setMaximumWidth(16777215)
 
+    @property
+    def org_dock(self):
+        """넓은 창 왼쪽의 조직도 패널. 처음 쓸 때 만든다 - 좁은 창으로 시작하면 메인 창을 띄울 때
+        보이지도 않는 조직도(직원 수백 명)를 한 번 더 만들지 않는다"""
+        if self._org_dock is None:
+            from client.kakao.org_tab import OrgTab
+            dock = OrgTab(self.state, self.settings)
+            dock.setObjectName('orgDock')
+            dock.setFixedWidth(ORG_DOCK_WIDTH)
+            dock.hide()
+            self._dock_row.insertWidget(0, dock)
+            self.body.columns.insert(0, (dock, lambda: ['bg']))
+            self._org_dock = dock
+        return self._org_dock
+
     def _update_dock(self):
         """창 폭이 충분하면 왼쪽에 조직도 패널 표시 (조직도 탭을 보고 있을 땐 중복이므로 숨김)"""
-        if not hasattr(self, 'org_dock'):
+        if '_dock_row' not in self.__dict__ or not hasattr(self, 'stack'):
             return
         self._update_split()
         show = self.width() >= ORG_DOCK_MIN_WINDOW and self.current_tab() != 'org'
+        if not show and self._org_dock is None:
+            return
         self.org_dock.setVisible(show)
         self.dock_line.setVisible(show)
         self.dock_line.setStyleSheet(f"background: {theme.c('border')};")
 
     def current_tab(self):
         widget = self.stack.currentWidget()
-        for key, tab in self.tabs.items():
+        for key, tab in self.tabs.built_items():
             if tab is widget:
                 return key
         return ''
@@ -957,6 +1060,7 @@ class MainWindow(QMainWindow):
         if win is not None:
             try:
                 if self.is_split() and win.parent() is self.room_pane:
+                    self.room_windows[room_id] = self.room_windows.pop(room_id)   # 최근에 본 방을 뒤로
                     self.room_pane.setCurrentWidget(win)
                     win.setFocus()
                     return win
@@ -980,6 +1084,7 @@ class MainWindow(QMainWindow):
             self.room_pane.addWidget(win)
             self.room_pane.setCurrentWidget(win)
             win.show()
+            self._trim_split_rooms()
             # 부모가 바뀌면 Qt가 채팅방 자체 스타일시트(말풍선 안쪽 여백 등)를 자식에 바로 다시 적용하지 않는다
             # → 테마를 다시 입혀 스타일을 새로 계산하고, 새 폭으로 말풍선 줄바꿈을 다시 한다
             self._repolish_room(win)
@@ -1001,6 +1106,24 @@ class MainWindow(QMainWindow):
         win.raise_()
         win.activateWindow()
         return win
+
+    def _trim_split_rooms(self):
+        """분할 화면 칸에는 최근에 본 대화창 SPLIT_KEEP_ROOMS 개만 남긴다. 목록에서 방을 오갈 때마다 창이 쌓여
+        (방마다 말풍선 150개 이상 · 시그널 연결 18개) 보이지 않는 창까지 새 메시지 · 구성원 변경을 계속 그렸다"""
+        docked = [(rid, w) for rid, w in list(self.room_windows.items())
+                  if self._is_docked(w) and w is not self.room_pane.currentWidget()]
+        for rid, w in docked[:max(0, len(docked) - (SPLIT_KEEP_ROOMS - 1))]:
+            self.room_windows.pop(rid, None)
+            try:
+                w.close()                 # WA_DeleteOnClose - 입력 중이던 글은 closeEvent 가 임시저장한다
+            except RuntimeError:
+                pass
+
+    def _is_docked(self, win):
+        try:
+            return win.parent() is self.room_pane
+        except RuntimeError:
+            return False
 
     def focus_message(self, room_id, msg_id, hint=None):
         win = self.open_room(room_id)
@@ -1088,6 +1211,8 @@ class MainWindow(QMainWindow):
         if not self.should_notify(room_id):
             return False
         self._last_notify_room = room_id
+        if self.is_locked():           # 잠금 중: 일정 · 예약 메시지 · 파일 요청 알림도 내용을 숨긴다 (새 메시지와 같게)
+            title, body = APP_TITLE, '새 알림이 있습니다'
         if self.tray is not None and self.tray.supportsMessages():
             self.tray.showMessage(title, body, talk_icon(), 4000)
         else:
@@ -1212,7 +1337,8 @@ class MainWindow(QMainWindow):
         self.sidebar.apply_theme()
         self.banner.apply_theme()
         self.lock_screen.apply_theme()
-        self.org_dock.apply_theme()
+        if self._org_dock is not None:
+            self._org_dock.apply_theme()
         self._update_dock()
         for tab in self.tabs.values():
             if hasattr(tab, 'apply_theme'):

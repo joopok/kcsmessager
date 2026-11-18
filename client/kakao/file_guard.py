@@ -408,6 +408,7 @@ class RequestsTab(QWidget):
         except OSError as e:
             self.reason_label.setText(f'파일을 저장하지 못했어요: {e}')
             return
+        osenv.mark_from_network(path)    # 막혔던 파일 - Windows 에서 SmartScreen · Office 제한된 보기가 보게
         self.reason_label.setText(f'저장했어요: {path}')
 
 

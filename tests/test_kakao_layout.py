@@ -107,8 +107,8 @@ class LayoutTest(unittest.TestCase):
         win = MainWindow(self.state, self.state.settings)
         win.show()
         sizes = {}
-        for i in range(win.stack.count()):
-            win.stack.setCurrentIndex(i)
+        for key in win.tabs:                       # 탭을 차례로 (아직 안 만든 탭은 이때 만든다)
+            win.set_tab(key)
             QApplication.processEvents()
             for cls in (MyProfileRow, FriendRow, RoomRow, MemberRow, CompactMemberRow):
                 for row in win.stack.currentWidget().findChildren(cls):
@@ -353,6 +353,36 @@ class StrayWindowAndTrayTest(unittest.TestCase):
         pump()
         self.assertFalse(hidden.isVisible())                                    # 명시적으로 숨긴 것은 부모가 보여도 숨김
         holder.close()
+
+    def test_dialogs_do_not_flash_label_windows(self):
+        """2026-11-18: 로그아웃 확인 창의 소속 줄 · 기능 둘러보기의 '검증' 딱지가 창에 붙기 전에 setVisible(True) 를 불러
+        라벨이 최상위 창으로 떴다 (Windows 번쩍임, macOS 에서 기능 둘러보기가 0.7초 늦게 뜸)"""
+        from client.kakao.main_window import MainWindow, apply_app_theme
+        from client.kakao.logout_dialog import LogoutDialog
+        from client.kakao.feature_tour import FeatureTourDialog
+        from client.kakao import feature_tour
+        from unittest import mock
+        apply_app_theme(self.state.settings)
+        win = MainWindow(self.state, self.state.settings)
+        win.show()
+        pump()
+        self.state.users[self.state.me] = dict(self.state.user(self.state.me), company='케이씨에스', department='개발팀')
+        self.probe.shown.clear()
+        logout = LogoutDialog(self.state, {'login_id': 'hong'}, win)
+        verdicts = {f[2]: 'PASS' for f in feature_tour.FEATURES}
+        with mock.patch.object(feature_tour, 'load_verification', return_value=('', verdicts)):
+            tour = FeatureTourDialog(self.state, self.state.settings, win, win)
+            tour.rows                                # 나눠 만드는 행까지 모두
+        self.assertTrue(logout.org_label.text())
+        self.assertEqual(self.probe.shown, [])
+        for dlg in (logout, tour):
+            dlg.show()
+            pump()
+        self.assertTrue(logout.org_label.isVisible())
+        self.assertTrue(any(row.verdict_label.isVisible() for row in tour.rows.values()))
+        self.assertEqual(sorted(set(self.probe.shown) - {'MainWindow'}), ['FeatureTourDialog', 'LogoutDialog'])
+        for dlg in (logout, tour, win):
+            dlg.close()
 
     def test_close_hides_to_tray_and_quit_really_closes(self):
         from PyQt5.QtWidgets import QSystemTrayIcon

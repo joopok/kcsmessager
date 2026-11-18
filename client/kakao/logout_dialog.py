@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButt
 
 from client.kakao import theme, brand
 from client.kakao.chats_tab import user_pixmap
+from client.kakao.widgets import set_shown
 
 
 def logout_effects(saved):
@@ -99,7 +100,7 @@ class LogoutDialog(QDialog):
         login_id = (saved or {}).get('login_id') or user.get('account') or ''
         self.org_label = QLabel(' · '.join(x for x in (org, login_id if login_id != name else '') if x))
         self.org_label.setObjectName('logoutMeta')
-        self.org_label.setVisible(bool(self.org_label.text()))
+        set_shown(self.org_label, bool(self.org_label.text()))   # 아직 창에 붙기 전이라 setVisible(True) 는 따로 창을 띄운다
         body.addWidget(self.org_label)
 
         body.addSpacing(theme.sp('xl'))

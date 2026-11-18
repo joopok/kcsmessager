@@ -258,7 +258,9 @@ class LocalSettings(QObject):
         tmp = self.path + '.tmp'
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            with open(tmp, 'w', encoding='utf-8') as f:
+            # 본인만 읽게 (0600): 입력 임시저장 · 보내지 못한 글 · 잠금 비밀번호 해시가 들어 있다 (Windows 는 무시)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self.path)
             return True

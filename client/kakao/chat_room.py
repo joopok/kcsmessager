@@ -29,6 +29,7 @@ except ImportError:  # pragma: no cover
     QAccessible = QAccessibleEvent = None
 from client.kakao.state import (parse_dt, URL_RE, PRESENCE_COLORS, PRESENCE_LABELS, BOT_NAME, fmt_day, CALL_MODE_LABELS)
 from client.kakao.widgets import (IconButton, Avatar, avatar_pixmap, paint_icon, user_avatar_pixmap, make_icon, decode_pixmap,
+                                  exec_and_release,
                                   human_size)
 from client.kakao.file_guard import FILE_BLOCKED
 
@@ -3762,7 +3763,7 @@ class ChatRoomWindow(QWidget):
                 row.set_image(data, mw)
         if aid in self._pending_view:
             self._pending_view.discard(aid)
-            ImageViewer(data, name, self).exec_()
+            exec_and_release(ImageViewer(data, name, self))
         if aid in self._pending_open:
             self._pending_open.discard(aid)
             self._open_received(aid, data, name)
@@ -4340,7 +4341,7 @@ class ChatRoomWindow(QWidget):
         aid = att.get('attachment_id')
         cached = self.state.attachments.get(aid)
         if cached:
-            ImageViewer(cached[0], cached[1], self).exec_()
+            exec_and_release(ImageViewer(cached[0], cached[1], self))
         elif aid is not None:
             self._pending_view.add(aid)
             self.state.request_attachment(aid)
@@ -4949,12 +4950,15 @@ class ChatRoomWindow(QWidget):
     def _finish_export(self, path, fmt, messages, truncated, period, files, notes):
         from client.kakao.chat_export import write_export
         self._export_requested = False
-        self._export_collector = None
+        collector, self._export_collector = getattr(self, '_export_collector', None), None
         try:
             write_export(path, fmt, self.state, self.room_id, messages, period=period, files=files, notes=notes)
         except OSError as e:
             self.toast(f'저장하지 못했습니다: {e}')
             return
+        finally:
+            if collector is not None:
+                collector.cleanup()           # 임시로 받아 둔 원본을 지운다
         note = ' (최근 2만 개까지)' if truncated else ''
         extra = f' · 사진·파일 {len(files)}개' if fmt == 'zip' else ''
         missing = f' · 빠진 첨부 {len(notes)}개' if notes else ''

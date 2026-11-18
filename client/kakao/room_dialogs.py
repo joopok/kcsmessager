@@ -137,6 +137,29 @@ class InviteRow(QWidget):
         self.check.setPixmap(pm)
 
 
+class _RowsOnDemand(dict):
+    """이름 → 행 위젯. 아직 만들지 않은 행은 찾을 때 만든다 (rows[이름] · rows.get(이름))"""
+
+    def __init__(self, build):
+        super().__init__()
+        self._build = build
+
+    def __missing__(self, key):
+        row = self._build(key)
+        if row is None:
+            raise KeyError(key)
+        return row
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key):
+        return dict.__contains__(self, key) or self._build(key) is not None
+
+
 class InviteDialog(_Dialog):
     """대화상대 초대: 검색, 선택 칩, 초대 (n) 버튼. exec_() 없이도 select()/selected()/accept()로 사용 가능"""
 
@@ -192,47 +215,63 @@ class InviteDialog(_Dialog):
         self.chip_area.hide()
         v.addWidget(self.chip_area)
         self.chips = {}
-        # 목록
-        self.list = QListWidget(self)
+        # 목록: 직원이 수백 명이면 행 위젯을 다 만드는 데 0.3초가 넘는다 → 보이는 행만 만든다 (RowList).
+        # 고른 사람 · 검색은 행 위젯이 아니라 이름으로 기억하고, rows[이름] 은 찾을 때 그 행을 만든다
+        from client.kakao.chats_tab import RowList
+        self.list = RowList(self)
         self.list.setObjectName('inviteList')
         self.list.setSelectionMode(QAbstractItemView.NoSelection)
-        self.rows = {}
+        self.list.setContextMenuPolicy(Qt.NoContextMenu)
+        self.rows = _RowsOnDemand(self._row_for)
         self._items = {}
+        self._search = {}
+        self._checked = set()
         self._order = []
         for u in state.invitable_users(room_id):
             name = u['username']
-            item = QListWidgetItem()
-            row = InviteRow(state, name, self.list)
-            item.setSizeHint(QSize(10, 52))
-            item.setData(Qt.UserRole, name)
-            self.list.addItem(item)
-            self.list.setItemWidget(item, row)
-            self.rows[name] = row
-            self._items[name] = item
+            self._items[name] = self.list.add_lazy_row(lambda n=name: self._make_row(n), name, height=52)
+            self._search[name] = ' '.join([state.display_name(name), name, state.org_text(name)]).lower()
+        self.list.build_visible()
         self.list.itemClicked.connect(lambda it: self.toggle(it.data(Qt.UserRole)))
         self.empty = _label('초대할 수 있는 대화상대가 없습니다.', 'inviteOrg', self)
         self.empty.setAlignment(Qt.AlignCenter)
-        self.empty.setVisible(not self.rows)
+        self.empty.setVisible(not self._items)
         v.addWidget(self.empty)
         v.addWidget(self.list, 1)
         box, self.ok, _ = _buttons(self, '초대')
         v.addWidget(box)
         self._refresh()
 
+    def _make_row(self, name):
+        row = InviteRow(self.state, name, self.list)
+        if name in self._checked:
+            row.set_checked(True)
+        dict.__setitem__(self.rows, name, row)
+        return row
+
+    def _row_for(self, name):
+        item = self._items.get(name)
+        return self.list.itemWidget(item) if item is not None else None
+
     def toggle(self, username):
-        row = self.rows.get(username)
-        if row is None:
+        if username not in self._items:
             return
-        row.set_checked(not row.checked)
-        if row.checked:
+        on = username not in self._checked
+        if on:
+            self._checked.add(username)
             self._order.append(username)
-        elif username in self._order:
-            self._order.remove(username)
+        else:
+            self._checked.discard(username)
+            if username in self._order:
+                self._order.remove(username)
+        row = dict.get(self.rows, username)          # 아직 만들지 않은 행은 만들 때 표시한다
+        if row is not None:
+            row.set_checked(on)
         self._refresh()
 
     def select(self, usernames):
         for u in usernames:
-            if u in self.rows and not self.rows[u].checked:
+            if u in self._items and u not in self._checked:
                 self.toggle(u)
 
     def selected(self):
@@ -242,9 +281,10 @@ class InviteDialog(_Dialog):
         q = (text or '').strip().lower()
         visible = 0
         for name, item in self._items.items():
-            hidden = bool(q) and q not in self.rows[name].search_text
+            hidden = bool(q) and q not in self._search[name]
             item.setHidden(hidden)
             visible += 0 if hidden else 1
+        self.list.build_visible()
         self.empty.setText('검색 결과가 없습니다.' if q else '초대할 수 있는 대화상대가 없습니다.')
         self.empty.setVisible(visible == 0)
         return visible
@@ -314,6 +354,7 @@ class ImageViewer(_Dialog):
         except OSError as e:          # 쓸 수 없는 폴더 · 디스크 가득 참 → 앱이 꺼지지 않고 알려 준다
             QMessageBox.warning(self, '사진 저장', f'저장하지 못했습니다: {e}')
             return False
+        osenv.mark_from_network(path)        # 받은 파일 표시 (채팅방 저장 · 서랍과 같게)
         return True
 
 

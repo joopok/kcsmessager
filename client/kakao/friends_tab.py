@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel, QMenu, Q
                              QMessageBox, QFrame, QGridLayout, QAbstractButton, QScrollArea, QApplication)
 
 from client.kakao import theme
-from client.kakao.widgets import Avatar, make_icon, ContentScrollArea, fit_dialog_to_screen
+from client.kakao.widgets import Avatar, make_icon, ContentScrollArea, fit_dialog_to_screen, exec_and_release
 from client.kakao.chats_tab import (ElidedLabel, StatusPill, RowList, TabHeader, CreateGroupDialog,
                                     make_search_edit, search_box_qss, user_pixmap, InviteToRoomDialog, presence_of,
                                     set_presence, foreign_company, CompanyChip, connect_avatar_changed, connect_users_changed, RefreshWhenVisible,
@@ -1234,13 +1234,19 @@ class FriendsTab(RefreshWhenVisible, QWidget):
             kind = {'bot': 'bot', 'birthday': 'birthday', 'team': 'team'}.get(key, 'friend')
             for name in members:
                 rows.append((('friend', name, key), self._row_signature(name, kind),
-                             lambda n=name, k=kind: FriendRow(self.state, n, k, on_gift=self.send_gift), True))
+                             lambda n=name, k=kind: self._friend_row(n, k), True))
         self.list.sync_rows(rows)
         self.list.verticalScrollBar().setValue(scroll)
         # 친구가 아니게 된 사람은 고른 목록에서 뺀다 (검색으로 가려진 사람은 그대로 둔다)
         friends_now = {f['username'] for f in friends}
         self.picked = {n: True for n in self.picked if n in friends_now}
         self._apply_picks()
+
+    def _friend_row(self, name, kind):
+        row = FriendRow(self.state, name, kind, on_gift=self.send_gift)
+        if name in self.picked:              # 스크롤해서 나중에 만든 행도 고른 표시를 그대로
+            row.set_picked(True)
+        return row
 
     def _row_signature(self, name, kind):
         """친구 행이 보여 주는 것 전부 (이름 · 상태 · 접속 · 사진 · 소속 · 진행 중인 일정) - 같으면 그 행은 다시 만들지 않는다"""
@@ -1293,7 +1299,7 @@ class FriendsTab(RefreshWhenVisible, QWidget):
 
     def _apply_picks(self):
         for item in self.list.items():
-            widget = self.list.itemWidget(item)
+            widget = self.list.built_widget(item)        # 아직 안 만든 행은 만들 때 _friend_row 가 표시한다
             if isinstance(widget, FriendRow):
                 widget.set_picked(widget.username in self.picked)
         names = list(self.picked)
@@ -1426,13 +1432,13 @@ class FriendsTab(RefreshWhenVisible, QWidget):
         self.state.open_direct(username)
 
     def edit_profile(self):
-        ProfileEditDialog(self.state, self.window()).exec_()
+        exec_and_release(ProfileEditDialog(self.state, self.window()))
 
     def show_profile(self, username):
-        ProfileDialog(self.state, username, self.window()).exec_()
+        exec_and_release(ProfileDialog(self.state, username, self.window()))
 
     def show_create_dialog(self):
-        CreateGroupDialog(self.state, self.window()).exec_()
+        exec_and_release(CreateGroupDialog(self.state, self.window()))
 
     def show_add_friend(self, exec_=True):
         dlg = AddFriendDialog(self.state, self.window())

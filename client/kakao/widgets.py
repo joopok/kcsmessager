@@ -332,6 +332,19 @@ class IconButton(QPushButton):
 
 
 # ---------------------------------------------------------------- 보이기/숨기기
+def exec_and_release(dialog):
+    """모달 대화상자를 띄우고 결과를 돌려준 뒤, 닫힌 대화상자를 지운다 (deleteLater - 지금 함수 안에서는 아직 쓸 수 있다).
+    메인 창 · 채팅방 창을 부모로 만든 대화상자는 닫아도 부모가 지울 때까지 남는다 - 직원 500명 대화상대 선택 창은
+    한 번에 약 20MB, 사진 보기 창은 원본 사진을 쥐고 있어 하루 종일 켜 두면 수백 MB 가 쌓였다"""
+    try:
+        return dialog.exec_()
+    finally:
+        try:
+            dialog.deleteLater()
+        except RuntimeError:          # 그 사이 이미 지워짐
+            pass
+
+
 def set_shown(widget, shown):
     """setVisible() 대신 쓴다 (2026-10-15). 부모가 아직 없는 위젯(레이아웃에 넣기 전, 생성자 안)에 setVisible(True) 를
     부르면 Qt 가 그 위젯을 최상위 창으로 띄워 Windows 에서 작은 창들이 번쩍였다가 사라진다(친구 목록 상태메시지 칩 ·

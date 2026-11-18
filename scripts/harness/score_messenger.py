@@ -2,11 +2,12 @@
 """
 KCS Talk 품질 하네스 — 실제 서버 + 실제 앱 세션(Session: 연결·설정·상태·창)으로 기능과 동작을 채점한다.
 
-12개 영역 × 영역 안 점검 항목. 영역 점수 = 통과 항목 비율, 총점 = 영역 점수 평균 × 10 (10점 만점).
+13개 영역 × 영역 안 점검 항목. 영역 점수 = 통과 항목 비율, 총점 = 영역 점수 평균 × 10 (10점 만점).
   1 기본 대화        2 읽음·안읽음      3 메시지 조작      4 연결 복원력      5 동시성·부하
   6 성능             7 데이터 지속성    8 서버 견고성      9 화면 안정성     10 기능 회귀
   11 디자인 품질 (명암비 · 접근성 이름 · 클릭 영역 · 글자 잘림 100%/200% · 대화상자 그리기 경고)
   12 업무 기능 (스레드 · 방장 · 휴가 · 방해금지 · 안 읽은 사람 · 임시저장 · 멘션 모아보기 · 책갈피)
+  13 화면 반응 (직원 500 · 방 300 · 메시지 1,000개 규모에서 모든 화면이 0.5초 안에 뜨는지 — scripts/harness/screen_probe.py)
 
 사용:
   python3 scripts/harness/score_messenger.py            # 전체 (기능 회귀 포함, 약 4분)
@@ -1030,6 +1031,35 @@ def area_work(sc, srv):
         s.close()
 
 
+# ---------------------------------------------------------------- 13 화면 반응
+def area_screens(sc):
+    """모든 화면을 하나씩 열어 '누른 순간 → 그려지고 입력을 받을 때'까지 잰다 (0.5초 기준).
+    처음 여는 화면은 모듈을 처음 불러오는 시간까지 들어가도록 새 프로세스에서 (서버도 따로 띄운다)"""
+    from scripts.harness.screen_probe import LIMIT_MS, TARGET_MS, summary_lines
+    ar = sc.area('화면 반응')
+    out = os.path.join(HOME, 'screens.json')
+    r = subprocess.run([sys.executable, '-X', 'faulthandler', os.path.join(ROOT, 'scripts', 'harness', 'screen_probe.py'),
+                        '--json', out], cwd=ROOT, capture_output=True, text=True, timeout=900,
+                       env=dict(os.environ, QT_QPA_PLATFORM='offscreen'))
+    if not os.path.exists(out):
+        sc.check(ar, '화면 측정 실행', lambda: (False, (r.stderr or r.stdout)[-300:]))
+        return
+    with open(out, encoding='utf-8') as f:
+        data = json.load(f)
+    for e in data['results']:
+        detail = f"표시 {e['show_ms']}ms · 막힘 {e['block_ms']}ms"
+        if e['server']:
+            detail += ' · 서버 ' + ', '.join(f'{k} {ms}ms' for k, ms in e['server'].items())
+        worst = max(e['show_ms'] or 0, e['block_ms'] or 0)
+        if e['ok'] and worst > TARGET_MS:
+            detail += f' (목표 {TARGET_MS}ms 넘음)'
+        if e['error']:
+            detail += f" · {e['error']}"
+        sc.check(ar, f"{e['label']} < {LIMIT_MS}ms", lambda ok=e['ok'], d=detail: (ok, d))
+    for line in summary_lines(data):
+        print('   ' + line)
+
+
 # ---------------------------------------------------------------- 10 기능 회귀
 def area_regression(sc, quick):
     ar = sc.area('기능 회귀')
@@ -1082,6 +1112,13 @@ def main():
             area['checks'].append({'label': '영역 실행', 'ok': False, 'detail': f'{type(e).__name__}: {e}', 'ms': 0})
             print(f'   ✗ 영역 실행 실패 — {e}')
     srv.stop()
+    print('13. 화면 반응')
+    try:
+        area_screens(sc)
+    except Exception as e:
+        area = sc.area('화면 반응')
+        area['checks'].append({'label': '영역 실행', 'ok': False, 'detail': f'{type(e).__name__}: {e}', 'ms': 0})
+        print(f'   ✗ 영역 실행 실패 — {e}')
     print('10. 기능 회귀')
     area_regression(sc, args.quick)
     del steps

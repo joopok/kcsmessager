@@ -26,12 +26,19 @@ def key_dir():
     return osenv.app_path('keys')
 
 
+def key_file_stem(username):
+    """키 파일 이름 (확장자 빼고). 서버가 알려 준 사용자 이름을 그대로 경로에 쓰지 않는다 - '/' · '..' · 예약 문자는
+    설정 파일과 같은 방식(_XX)으로 바꿔 keys 폴더를 벗어나지 않게. 보통 이름(한글 · 영문 · 숫자)은 예전 이름 그대로"""
+    from client.kakao.settings import settings_file_name
+    return settings_file_name(username)[:-len('.json')]
+
+
 class SecretKeyring:
     """한 사용자의 비밀키 보관 + 방 키 유도 + 암복호화"""
 
     def __init__(self, username, directory=None):
         self.username = username
-        self.path = os.path.join(directory or key_dir(), f'{username}.key')
+        self.path = os.path.join(directory or key_dir(), key_file_stem(username) + '.key')
         self._private = self._load_or_create()
         self._room_keys = {}
 
@@ -91,9 +98,14 @@ class SecretKeyring:
             raw = base64.b64decode(blob)
             key = self.room_key(room_id, peer_public_b64)
             plain = AESGCM(key).decrypt(raw[:12], raw[12:], room_id.encode('utf-8'))
-            return json.loads(plain.decode('utf-8')).get('text', '')
+            obj = json.loads(plain.decode('utf-8'))
         except (InvalidTag, ValueError, TypeError, KeyError):
             return None
+        # 상대(수정한 클라이언트)가 올바르게 암호화했어도 내용이 {'text': 글자} 가 아니면 읽지 못한 메시지로 둔다
+        # (예전에는 [] · 1 이면 AttributeError 로 그 방의 대화 받기가 통째로 멈췄다)
+        if not isinstance(obj, dict) or not isinstance(obj.get('text', ''), str):
+            return None
+        return obj.get('text', '')
 
 
 def fingerprint(key_a_b64, key_b_b64):
@@ -111,7 +123,7 @@ class PeerKeys:
     확인했던 예전 키도 남겨 두어 그 키로 받은 지난 메시지를 계속 읽는다"""
 
     def __init__(self, username, directory=None):
-        self.path = os.path.join(directory or key_dir(), f'{username}.peers.json')
+        self.path = os.path.join(directory or key_dir(), key_file_stem(username) + '.peers.json')
         self._keys = self._load()          # {상대: [예전에 믿은 키 …, 지금 믿는 키]}
 
     def _load(self):

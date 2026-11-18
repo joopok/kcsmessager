@@ -5,7 +5,8 @@
     python scripts/ci_smoke.py source            소스 실행: 서버를 띄우고 접속 · 클라이언트 --self-check
     python scripts/ci_smoke.py built DIST_DIR    빌드한 메신저 --self-check + 빌드한 서버 실행 · 접속 · DB 위치
     python scripts/ci_smoke.py native            그 OS 의 실제 화면 플랫폼(Windows windows · macOS cocoa · Linux xcb)으로
-                                                 창 · 알림 상자 · 받은 파일 · 중복 실행 방지 · 경로 권한 · TLS 를 확인
+                                                 창 · 알림 상자 · 받은 파일 · 중복 실행 방지 · 경로 권한 · TLS 를 확인하고
+                                                 모든 화면이 열리는 시간을 잰다 (화면 반응, 0.5초 넘으면 경고)
                                                  (Linux 는 화면이 없으면 xvfb-run -a 로 감싸서 실행. 창이 잠깐 떴다 닫힌다)
 
 실패하면 종료 코드 1.
@@ -418,9 +419,30 @@ def part_tls():
     return all(results)
 
 
+def part_screens():
+    """화면 반응: 실제 화면 플랫폼에서 모든 화면(메인 창 · 탭 · 채팅방 · 통화 · 대화상자)을 열어 걸린 시간을 남긴다.
+    규모는 축소판(직원 120 · 방 60 · 메시지 300). CI 러너는 회사 PC 보다 느리고 들쭉날쭉해서 0.5초를 넘는 화면은
+    경고(::warning::)로만 알리고, 화면이 열리지 않거나 예외가 나면 실패로 한다. 기준 판정은 품질 하네스(13 화면 반응)가 한다"""
+    from scripts.harness import screen_probe
+    data = screen_probe.run(native=True, small=True, log=lambda line: print(line, flush=True))
+    results = [check('화면 플랫폼', data['platform'] == native_platform(), data['platform'])]
+    for line in screen_probe.summary_lines(data):
+        print(line, flush=True)
+    broken = [e for e in data['results'] if e['error']]
+    slow = [e for e in data['results'] if not e['ok'] and not e['error']]
+    for e in slow:
+        print(f"::warning::[{osenv.os_label()} · {data['platform']}] {e['label']} 표시 {e['show_ms']}ms · "
+              f"막힘 {e['block_ms']}ms (기준 {screen_probe.LIMIT_MS}ms)", flush=True)
+    results.append(check(f"화면 {len(data['results'])}개 모두 열림", not broken,
+                         '; '.join(f"{e['label']}: {e['error']}" for e in broken[:3])))
+    results.append(check(f'0.5초 안에 뜬 화면 (넘으면 경고만)', True,
+                         f"{len(data['results']) - len(slow)}/{len(data['results'])}"))
+    return all(results)
+
+
 NATIVE_PARTS = [('windows', '창 · 알림 상자', part_windows), ('files', '받은 파일', part_files),
                 ('single', '중복 실행 방지', part_single), ('paths', '데이터 폴더 · 파일 권한', part_paths),
-                ('tls', 'TLS', part_tls)]
+                ('tls', 'TLS', part_tls), ('screens', '화면 반응', part_screens)]
 
 
 def native_part(argv):
@@ -443,7 +465,7 @@ def native():
         cmd = [sys.executable, '-X', 'faulthandler', os.path.abspath(__file__), 'native-part', name]
         try:
             r = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True, encoding='utf-8',
-                               errors='replace', timeout=180)
+                               errors='replace', timeout=600 if name == 'screens' else 180)
             code, out, err = r.returncode, r.stdout, r.stderr
         except subprocess.TimeoutExpired as e:
             code = None

@@ -42,7 +42,9 @@ MAPPING = [
     (r'test_kakao_relay_rules', 'platforms'),     # 요청 값 공통 규칙 (명세 §4.5)
     (r'test_kakao_connection_limits', 'platforms'),   # 연결 한도 · 하트비트 · 요청 빈도 (명세 §2)
     (r'test_kakao_send_queue', 'platforms'),      # 연결별 보내기 대기열 (명세 §2)
-    (r'test_kakao_read_connection', 'search'),    # 무거운 조회는 읽기 전용 두 번째 연결에서 (명세 §5)
+    (r'test_kakao_read_connection', 'search'),    # 조회는 읽기 전용 연결에서 · 화면 조회 색인 (명세 §5)
+    (r'test_kakao_bench_requests', 'platforms'),  # 화면을 여는 요청의 서버 처리 시간 측정 (scripts/bench_server_requests.py)
+    (r'test_kakao_user_cache', 'platforms'),      # welcome 사용자 목록 캐시 · 접속 알림 묶기 (명세 §2 · §5)
     (r'test_kakao_room_list\.RoomList', 'room_list'),      # 방 목록 묶음 조회
     (r'test_kakao_room_list\.ReminderScan', 'calendar'),   # 일정 알림 검사 범위 · 색인
     (r'test_kakao_rag_workers', 'ai_chat'),       # AI 비서 작업 처리 (명세 §4.5)
@@ -75,6 +77,16 @@ MAPPING = [
     (r'test_kakao_stability\.ProfileEditSize', 'profile_edit'),
     (r'test_kakao_stability\.LockHides', 'lock'),
     (r'test_kakao_stability\.SafeGarbageCollection', 'platforms'),   # 메모리 정리(GC)는 이벤트 사이에서만
+    (r'test_kakao_screen_catalog', 'platforms'),   # 모든 창이 화면 반응 측정(0.5초) 목록에 있다 (scripts/harness/screen_probe.py)
+    # 클라이언트 보안 · 성능 점검(2026-11-18) 뒤 고친 것 (test_kakao_review_1118)
+    (r'test_kakao_review_1118\.ExportCollector', 'chat_export'),
+    (r'test_kakao_review_1118\.VoiceHeader', 'voice_msg'),
+    (r'test_kakao_review_1118\.SecretPayload', 'secret'),
+    (r'test_kakao_review_1118\.LockedWindow', 'lock'),
+    (r'test_kakao_review_1118\.PresenceOnlyUpdate', 'org_chart'),
+    (r'test_kakao_review_1118\.HiddenWindowRefresh', 'friends'),
+    (r'test_kakao_review_1118\.SplitRooms', 'room_list'),
+    (r'test_kakao_review_1118\.', 'platforms'),
     # 전체 점검(2026-11-17) 뒤 강화한 클라이언트 규칙 (test_kakao_hardening)
     (r'test_kakao_hardening\.ImageDecode', 'attach'),
     (r'test_kakao_hardening\.AudioDecode', 'voice_call'),
