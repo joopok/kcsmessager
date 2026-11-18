@@ -235,8 +235,10 @@ class TimedServer(KakaoServer):
 
 
 class BenchClient:
-    def __init__(self, port):
+    def __init__(self, port, nodelay=False):
         self.sock = socket.create_connection(('127.0.0.1', port), timeout=60)
+        if nodelay:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.buf = b''
         self.counter = 0
 
@@ -505,6 +507,68 @@ def render(result, budget=BUDGET_MS):
     return '\n'.join(lines)
 
 
+class _NagleServer(TimedServer):
+    """예전처럼 받은 연결에 TCP_NODELAY 를 켜지 않는 서버 (--rtt 비교용)"""
+    @staticmethod
+    def _enable_nodelay(sock):
+        return None
+
+
+def measure_rtt(scale='small', rounds=40, cache_dir=None):
+    """작은 요청 · 응답이 이어질 때의 왕복 (Nagle + 지연 ACK 진단, Windows 에서 특히).
+    채팅방을 열 때처럼 history → read → attachment_get 을 차례로 한 묶음, ping 하나를 따로 잰다.
+    서버(받은 연결) TCP_NODELAY 켬/끔 × 클라이언트 TCP_NODELAY 켬/끔 → [행]"""
+    source, info = ensure_db(scale, False, cache_dir)
+    rows = []
+    for server_class, server_label in ((_NagleServer, '끔 (예전)'), (TimedServer, '켬')):
+        work = tempfile.mkdtemp(prefix='kcs_bench_rtt_')
+        try:
+            db = os.path.join(work, 'kakao.db')
+            shutil.copy2(source, db)
+            server = server_class(port=0, db_path=db, tick_seconds=3600, rag_factory=_NoRag, require_password=True)
+            server.serve_in_thread()
+            try:
+                for client_nodelay in (False, True):
+                    client = BenchClient(server.port, nodelay=client_nodelay)
+                    try:
+                        client.call({'type': 'join', 'username': ME, 'token': server.store.issue_login_token(ME)},
+                                    parse=False)
+                        bundles, pings = [], []
+                        for _ in range(rounds):
+                            started = time.perf_counter()
+                            client.call({'type': 'history', 'room_id': info['direct_room'], 'limit': 50}, parse=False)
+                            client.call({'type': 'read', 'room_id': info['direct_room'], 'last_msg_id': 10 ** 9},
+                                        parse=False)
+                            if info.get('photo'):
+                                client.call({'type': 'attachment_get', 'attachment_id': info['photo']}, parse=False)
+                            bundles.append((time.perf_counter() - started) * 1000)
+                            pings.append(client.call({'type': 'ping'}, parse=False)[2] * 1000)
+                    finally:
+                        client.close()
+                    bundles.sort()
+                    pings.sort()
+                    rows.append({'server': server_label, 'client': '켬' if client_nodelay else '끔',
+                                 'bundle_p50': statistics.median(bundles), 'bundle_p95': bundles[int(len(bundles) * 0.95) - 1],
+                                 'bundle_max': bundles[-1], 'ping_p50': statistics.median(pings),
+                                 'ping_p95': pings[int(len(pings) * 0.95) - 1]})
+            finally:
+                server.stop()
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+    return rows
+
+
+def render_rtt(rows):
+    lines = ['작은 요청 · 응답이 이어질 때의 왕복 (채팅방 열기: history → read → attachment_get 한 묶음, ping 따로)', '',
+             '| 서버 TCP_NODELAY | 클라이언트 TCP_NODELAY | 묶음 p50 ms | 묶음 p95 ms | 묶음 최대 ms | ping p50 ms | ping p95 ms |',
+             '|---|---|---|---|---|---|---|']
+    for r in rows:
+        lines.append(f"| {r['server']} | {r['client']} | {r['bundle_p50']:.1f} | {r['bundle_p95']:.1f} | "
+                     f"{r['bundle_max']:.1f} | {r['ping_p50']:.1f} | {r['ping_p95']:.1f} |")
+    lines += ['', '묶음이 수백 ms 이고 ping 이 약 200ms 면 Nagle + 지연 ACK 다 - 어느 쪽(서버 · 클라이언트)을 켰을 때 사라지는지 본다.']
+    return '\n'.join(lines)
+
+
 def storm_client(port):
     """--storm-client: 표준 입력의 {아이디: 토큰} 모두가 한꺼번에 로그인 → 표준 출력에 [[걸린 ms, welcome 받음]]"""
     tokens = json.loads(sys.stdin.read())
@@ -545,7 +609,16 @@ def main(argv=None):
     parser.add_argument('--rebuild', action='store_true', help='측정용 DB 를 다시 만든다')
     parser.add_argument('--cache-dir', help='측정용 DB 를 둘 폴더 (기본: 임시 폴더의 kcs_bench)')
     parser.add_argument('--write', action='store_true', help='claudedocs/SERVER_REQUEST_TIMES.md 에도 쓴다')
+    parser.add_argument('--rtt', action='store_true',
+                        help='작은 요청 · 응답이 이어질 때의 왕복만 잰다 (Nagle 진단 - 서버 · 클라이언트 TCP_NODELAY 켬/끔)')
     args = parser.parse_args(argv)
+    if args.rtt:
+        try:
+            print(render_rtt(measure_rtt(args.scale, cache_dir=args.cache_dir)))
+        except (OSError, ConnectionError, TimeoutError) as exc:
+            print(f'측정 실패: {exc}', file=sys.stderr)
+            return 2
+        return 0
     try:
         result = measure(args.scale, max(1, args.repeat), args.rebuild, args.cache_dir)
     except (OSError, ConnectionError, TimeoutError) as exc:

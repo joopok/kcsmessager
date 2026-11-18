@@ -1068,6 +1068,7 @@ class KakaoServer(AdminHandlers):
                 continue
             sock.settimeout(min(SOCKET_TIMEOUT, self.PRELOGIN_SECONDS))        # 로그인하면 SOCKET_TIMEOUT 으로
             self._enable_keepalive(sock)
+            self._enable_nodelay(sock)
             conn = Connection(sock, address)
             with self._conns_lock:
                 full = len(self._conns) >= self.MAX_CONNECTIONS
@@ -1078,6 +1079,15 @@ class KakaoServer(AdminHandlers):
                 conn.close(force=True)
                 continue
             self._spawn(self._client_loop, conn, name=f'kakao-client-{address}')
+
+    @staticmethod
+    def _enable_nodelay(sock: socket.socket) -> None:
+        """작은 응답을 모으지 않고 바로 보낸다 (Nagle 끔). 응답이 여러 조각으로 나가거나 작은 요청 · 응답이 이어질 때
+        상대의 지연 ACK(Windows 는 약 200ms)를 기다리느라 왕복마다 수백 ms 가 붙는 것을 막는다 (명세 §2, 2026-11-18)"""
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
 
     @staticmethod
     def _enable_keepalive(sock: socket.socket) -> None:

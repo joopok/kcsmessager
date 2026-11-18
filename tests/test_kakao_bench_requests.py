@@ -27,6 +27,16 @@ class BenchRequestsTests(unittest.TestCase):
         self.assertIn('| drawer_query:image |', text)
         self.assertIn('로그인 몰림', text)
 
+    def test_round_trip_check_runs(self):
+        """--rtt (Nagle 진단): 서버 · 클라이언트 TCP_NODELAY 켬/끔 네 가지를 모두 잰다"""
+        cache = tempfile.mkdtemp(prefix='kcs_bench_rtt_test_')
+        self.addCleanup(shutil.rmtree, cache, True)
+        rows = bench.measure_rtt('small', rounds=3, cache_dir=cache)
+        self.assertEqual([(r['server'], r['client']) for r in rows],
+                         [('끔 (예전)', '끔'), ('끔 (예전)', '켬'), ('켬', '끔'), ('켬', '켬')])
+        self.assertTrue(all(r['bundle_p50'] > 0 and r['ping_p50'] > 0 for r in rows))
+        self.assertIn('| 켬 | 끔 |', bench.render_rtt(rows))
+
 
 if __name__ == '__main__':
     unittest.main()

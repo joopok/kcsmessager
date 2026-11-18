@@ -185,3 +185,12 @@ class DeliveryTests(ServerTestBase):
         finally:
             stop.set()
             noisy.join(2)
+
+
+class SocketOptionTests(ServerTestBase):
+    def test_accepted_connections_send_small_replies_at_once(self):
+        """받은 연결은 TCP_NODELAY (2026-11-18): 작은 응답이 상대의 지연 ACK(Windows 약 200ms)를 기다리지 않게"""
+        client = self.connect()
+        conns = [c for c in self.server._all_joined_conns() if c.username == client.username]
+        self.assertEqual(len(conns), 1)
+        self.assertNotEqual(conns[0].sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 0)
